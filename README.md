@@ -40,4 +40,16 @@ Boolean variables that will decide if propermab or cqa features will be included
 
  **weighting_column =**
 
+If you want to run a specific combination of features and subregions you can set the following variables
+
+**RUN_SINGLE_EVAL = True**
+
+**single_eval_regions =**
+
+**single_eval_features =**
  
+To include the media as an input feature you can set USE_MEDIA_FEATURE to true and media_column as a the name of the column that contains the media information for each sequence
+
+**USE_MEDIA_FEATURE =**
+
+**media_column =**
