@@ -314,7 +314,7 @@ def compute_antiberty_embeddings(sequences, prefix=""):
     antiberty_embeddings = np.array(antiberty_embeddings)
     return {f'{prefix}AntiBERTy_{i}': antiberty_embeddings[:, i] for i in range(antiberty_embeddings.shape[1])}
 
-def compute_ablang2_paired_embeddings(heavy_seqs, light_seqs, prefix="Paired_VH_VL_AbLang2_"):
+def compute_ablang2_paired_embeddings(heavy_seqs, light_seqs, prefix="Paired_CD3_VH_VL_AbLang2_"):
     import ablang2
     ablang = ablang2.pretrained(model_to_use="ablang2-paired", random_init=False)
     
@@ -339,7 +339,7 @@ def compute_ablang2_paired_embeddings(heavy_seqs, light_seqs, prefix="Paired_VH_
     
     return {f'{prefix}{i}': final_embeddings[:, i] for i in range(final_embeddings.shape[1])}
 
-def compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_"):
+def compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_CD3"):
     import subprocess
     import sys
     import json
@@ -513,9 +513,9 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
             
         print(f"\nProceeding with {len(seq_cols)} granular building blocks: {seq_cols}\n")
     
-    # 🌟 RESTORED: Stitch global chains from subregions so mutations physically propagate!
-    vh_ordered_cols = ['seq_frh1', 'seq_cdrh1', 'seq_frh2', 'seq_cdrh2', 'seq_frh3', 'seq_cdrh3', 'seq_frh4'] 
-    vl_ordered_cols = ['seq_frl1', 'seq_cdrl1', 'seq_frl2', 'seq_cdrl2', 'seq_frl3', 'seq_cdrl3', 'seq_frl4']
+    # 🌟 RESTORED & UPDATED: Stitch global chains using the new CD3 prefixes!
+    cd3_vh_ordered_cols = ['seq_CD3_frh1', 'seq_CD3_cdrh1', 'seq_CD3_frh2', 'seq_CD3_cdrh2', 'seq_CD3_frh3', 'seq_CD3_cdrh3', 'seq_CD3_frh4'] 
+    cd3_vl_ordered_cols = ['seq_CD3_frl1', 'seq_CD3_cdrl1', 'seq_CD3_frl2', 'seq_CD3_cdrl2', 'seq_CD3_frl3', 'seq_CD3_cdrl3', 'seq_CD3_frl4']
 
     def build_full_seq(row, cols):
         parts = []
@@ -526,20 +526,20 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
                     parts.append(val)
         return "".join(parts) if parts else 'NAN'
 
-    df_feat['Global_VH'] = df_feat.apply(lambda r: build_full_seq(r, vh_ordered_cols), axis=1)
-    df_feat['Global_VL'] = df_feat.apply(lambda r: build_full_seq(r, vl_ordered_cols), axis=1)
+    df_feat['CD3_VH'] = df_feat.apply(lambda r: build_full_seq(r, cd3_vh_ordered_cols), axis=1)
+    df_feat['CD3_VL'] = df_feat.apply(lambda r: build_full_seq(r, cd3_vl_ordered_cols), axis=1)
     
     def build_fv_with_linker(r):
-        if r['Global_VH'] == 'NAN' or r['Global_VL'] == 'NAN': return 'NAN'
+        if r['CD3_VH'] == 'NAN' or r['CD3_VL'] == 'NAN': return 'NAN'
         linker = ''
         if 'G4S Linker2_HCK' in df_feat.columns and pd.notna(r['G4S Linker2_HCK']):
             val = str(r['G4S Linker2_HCK']).strip().upper()
             if val not in ['NAN', 'NONE']: linker = val
-        return r['Global_VH'] + linker + r['Global_VL']
+        return r['CD3_VH'] + linker + r['CD3_VL']
         
-    df_feat['Global_Fv'] = df_feat.apply(build_fv_with_linker, axis=1)
+    df_feat['CD3_Fv'] = df_feat.apply(build_fv_with_linker, axis=1)
     
-    all_seq_cols_to_process = seq_cols + ['Global_VH', 'Global_VL', 'Global_Fv'] if extract_subregions else ['Global_VH', 'Global_VL', 'Global_Fv']
+    all_seq_cols_to_process = seq_cols + ['CD3_VH', 'CD3_VL', 'CD3_Fv'] if extract_subregions else ['CD3_VH', 'CD3_VL', 'CD3_Fv']
 
     # Load AAIndex DB only if requested
     aaindex_db, aaindex_desc = None, None
@@ -682,8 +682,8 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
 
     # 6. AbLang2 PAIRED
     if any(k in active_features for k in ['ablang2', 'ablang2_paired']) and ABLANG2_AVAILABLE:
-        print("\n⚙️  Processing region: Paired [Global_VH + Global_VL]")
-        ablang2_cache = os.path.join(cache_dir, f"Paired_VH_VL_AbLang2_features_N{expected_dataset_len}.npz")
+        print("\n⚙️  Processing region: Paired [CD3_VH + CD3_VL]")
+        ablang2_cache = os.path.join(cache_dir, f"Paired_CD3_VH_VL_AbLang2_features_N{expected_dataset_len}.npz")
         cached_dict = _load_valid_cache(ablang2_cache, expected_dataset_len) if not is_inference else None
         
         if cached_dict:
@@ -691,17 +691,18 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
             for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
         else:
             print("   -> [AbLang2 Paired] Generating Heavy/Light joint embeddings...")
-            heavy_seqs = df_feat['Global_VH'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
-            light_seqs = df_feat['Global_VL'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            heavy_seqs = df_feat['CD3_VH'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            light_seqs = df_feat['CD3_VL'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
             ablang_dict = compute_ablang2_paired_embeddings(heavy_seqs, light_seqs)
             
             if not is_inference: np.savez(ablang2_cache, **ablang_dict)
             for k, v in ablang_dict.items(): new_columns[k] = v; generated_features.append(k)
 
     # 7. PROPERMAB PHYSICS
-    if 'propermab' in active_features and PROPERMAB_AVAILABLE and 'Global_VH' in df_feat.columns and 'Global_VL' in df_feat.columns:
-        print("\n⚙️  Processing region: Propermab 3D Physics [Global_VH + Global_VL]")
-        propermab_cache = os.path.join(cache_dir, f"Propermab_features_N{expected_dataset_len}.npz")
+    if 'propermab' in active_features and PROPERMAB_AVAILABLE and 'CD3_VH' in df_feat.columns and 'CD3_VL' in df_feat.columns:
+        print("\n⚙️  Processing region: Propermab 3D Physics [CD3_VH + CD3_VL]")
+        # 🌟 UPDATED FILENAME
+        propermab_cache = os.path.join(cache_dir, f"Propermab_CD3_features_N{expected_dataset_len}.npz")
         cached_dict = _load_valid_cache(propermab_cache, expected_dataset_len) if not is_inference else None
         
         if cached_dict:
@@ -709,10 +710,11 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
             for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
         else:
             print("   -> [Propermab] Generating 3D Structural Features (This takes ~30s per sequence)...")
-            heavy_seqs = df_feat['Global_VH'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
-            light_seqs = df_feat['Global_VL'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            heavy_seqs = df_feat['CD3_VH'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            light_seqs = df_feat['CD3_VL'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
             
-            propermab_dict = compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_")
+            # 🌟 UPDATED PREFIX
+            propermab_dict = compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_CD3_")
             
             if not is_inference: np.savez(propermab_cache, **propermab_dict)
             for k, v in propermab_dict.items(): new_columns[k] = v; generated_features.append(k)
@@ -1474,9 +1476,9 @@ def filter_active_features(all_features, sub_combo, feat_combo, global_features,
             continue
 
         # 🌟 Paired AbLang2 Bypass
-        if f.startswith('Paired_VH_VL_AbLang2_'):
+        if f.startswith('Paired_CD3_VH_VL_AbLang2_'):
             # Only activate if the user explicitly requested AbLang2 AND they provided both VH and VL!
-            if 'AbLang2_Paired' in feat_combo and 'Global_VH' in sub_combo and 'Global_VL' in sub_combo:
+            if 'AbLang2_Paired' in feat_combo and 'CD3_VH' in sub_combo and 'CD3_VL' in sub_combo:
                 active.append(f)
             continue
         
@@ -1515,12 +1517,12 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
     
     global_features = [
         f for f in generated_features 
-        if not f.startswith('seq_')
-        and not f.startswith('Global_')
+        if not f.startswith('seq_CD3_')
+        and not f.startswith('CD3_')
         and not f.startswith('CQA_')
         and not f.startswith('Propermab_')
         and not f.startswith('Paired_') 
-        and (custom_feature_groups is None or f not in custom_feature_groups) # 🌟 Prevents them from being always-on!
+        and (custom_feature_groups is None or f not in custom_feature_groups)
     ]
     
     available_groups = []
@@ -1571,7 +1573,7 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
         valid_sub_combos = []
         for L in range(1, len(seq_cols) + 1):
             for sub_combo in itertools.combinations(seq_cols, L):
-                if 'Global_Fv' in sub_combo and len(sub_combo) > 1:
+                if 'CD3_Fv' in sub_combo and len(sub_combo) > 1:
                     continue
                 valid_sub_combos.append(sub_combo)
 
@@ -1579,8 +1581,8 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
         for sub_combo in valid_sub_combos:
             for feat_combo in valid_feat_combos:
                 if 'AbLang2_Paired' in feat_combo:
-                    if 'Global_VH' not in sub_combo or 'Global_VL' not in sub_combo: continue
-                    if 'Global_Fv' in sub_combo: continue
+                    if 'CD3_VH' not in sub_combo or 'CD3_VL' not in sub_combo: continue
+                    if 'CD3_Fv' in sub_combo: continue
                         
                 valid_experiments.append((sub_combo, feat_combo))
             
@@ -1761,12 +1763,12 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
     all_cols = df.columns.tolist()
     global_features = [
         f for f in generated_features 
-        if not f.startswith('seq_')
-        and not f.startswith('Global_')
+        if not f.startswith('seq_CD3_')
+        and not f.startswith('CD3_')
         and not f.startswith('CQA_')
         and not f.startswith('Propermab_')
         and not f.startswith('Paired_')
-        and (custom_feature_groups is None or f not in custom_feature_groups) # 🌟 Prevents them from being always-on!
+        and (custom_feature_groups is None or f not in custom_feature_groups)
     ]
     
     # 🌟 Passed custom_feature_groups here
@@ -1873,9 +1875,9 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
     print(f"✅ Targeted Evaluation Complete! Results saved to {results_excel}")
 
 def main():
-    filepath = 'data/tubespin.csv'
-    # When run SVR for ProA_HMW_ActiPro double check the top models in the excel. for CQA the respective model has a lowe rank in the file.
-    targets_to_test = {'ELISA_Polyreactivity_Excell': 15.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
+    # filepath = 'data/tubespin.csv'
+    # # When run SVR for ProA_HMW_ActiPro double check the top models in the excel. for CQA the respective model has a lowe rank in the file.
+    # targets_to_test = {'ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
 
     # filepath = 'data/inhouse_supp_CD3+CD20only_UPDATED.csv'
     # targets_to_test = {
@@ -1901,8 +1903,11 @@ def main():
     #                   # '50-50_HCCF_Titer':750.0,
     #                     'Normalized_50-50_HCCF_Titer':0.5
     #                     }
+
+    filepath = 'data/50-50_sequences_subset.csv'
+    targets_to_test = {'SUBSET_50-50_HMW%':10.0}
     
-    models_to_test = ['SVR']#, 'XGBoost', 'PLSRegression']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
+    models_to_test = ['SVR', 'PLSRegression', 'XGBoost']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
     
     transform_strategy = None
     # 🌟 NEW: Pass a list of models to extract both sets of features!
@@ -1944,7 +1949,7 @@ def main():
             print(f"   -> Added feature: '{media_column}' to ALL models.")
             print(f"   -> 📊 Media Dictionary: {media_mapping}")
 
-        df_features, seq_cols, generated_features, aaindex_desc = extract_sequence_features(
+        df_features, seq_cols, generated_features, aaindex_desc,_ = extract_sequence_features(
             df, dataset_name=dataset_name, esm_model_names=esm_model_selections, cache_tag=outlier_tag
         )
 
@@ -1982,7 +1987,7 @@ def main():
                     print(f"==================================================================")
                     
                     evaluate_exhaustive_combinations(
-                        df_features_run, ['Global_VH', 'Global_VL', 'Global_Fv'], generated_features_run, 
+                        df_features_run, ['CD3_VH', 'CD3_VL', 'CD3_Fv'], generated_features_run, 
                         target_col=target_column, model_name=model_name, output_dir=model_name, 
                         transform_type=transform_strategy, weight_col=weighting_column, prefix="global_",
                         hue_col=antibody_format_column, rank_to_plot=0,# oog_col=out_of_group_split_column,
