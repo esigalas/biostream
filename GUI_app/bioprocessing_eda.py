@@ -1,9 +1,54 @@
 import os
+import glob
+import csv
 import warnings
+import ast 
+import itertools
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import urllib.request
+import joblib
+import math
+import shutil
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.linear_model import ElasticNet
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import KFold, RepeatedKFold, cross_val_predict, LeaveOneOut, cross_validate, LearningCurveDisplay, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, make_scorer
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, average_precision_score
+from matplotlib.colors import ListedColormap 
+from scipy.stats import spearmanr
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.preprocessing import PowerTransformer
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
+from scipy.optimize import minimize_scalar
+from scipy.stats import yeojohnson
+
 # ==========================================
-# 🌟 NEW: GEORGIEV FEATURES DICTIONARY
+# 🌟 NEW: ANTIBERTY & ABLANG2 DEPENDENCY CHECKS
 # ==========================================
-# 19-Dimensional Principal Components (Georgiev 2008)
+try:
+    from antiberty import AntiBERTyRunner
+    ANTIBERTY_AVAILABLE = True
+except ImportError:
+    ANTIBERTY_AVAILABLE = False
+
+try:
+    import ablang2
+    ABLANG2_AVAILABLE = True
+except ImportError:
+    ABLANG2_AVAILABLE = False
+
+# ==========================================
+# 🌟 GEORGIEV FEATURES DICTIONARY
+# ==========================================
 GEORGIEV_DICT = {
     'A': [0.57, 3.37, -3.66, 2.34, -1.07, -0.4, 1.23, -2.32, -2.01, 1.31, -1.14, 0.19, 1.66, 4.39, 0.18, -2.6, 1.49, 0.46, -4.22],
     'C': [2.66, -1.52, -3.29, -3.77, 2.96, -2.23, 0.44, -3.49, 2.22, -3.78, 1.98, -0.43, -1.03, 0.93, 1.43, 1.45, -1.15, -1.64, -1.05],
@@ -26,81 +71,33 @@ GEORGIEV_DICT = {
     'W': [1.89, -0.09, 4.21, -2.77, 0.72, 0.86, -1.07, -1.66, -5.87, -0.66, -2.49, -0.3, -0.5, 1.64, -0.72, 1.75, 2.73, -2.2, 0.9],
     'Y': [0.79, -2.62, 4.11, -0.63, 1.89, -0.53, -1.3, 1.31, -0.56, -0.95, 1.91, -1.26, 1.57, 0.2, -0.76, -5.19, -2.56, 2.87, -3.43]
 }
-# --- NUCLEAR OPTION FOR WARNINGS ---
-# Scikit-learn has an internal bug where it warns itself about parallel processing. 
-# Because joblib workers often bypass standard filters, we physically disable the warn function.
+
+# --- SILENCE WARNINGS ---
 def completely_silence_warnings(*args, **kwargs):
     pass
 warnings.warn = completely_silence_warnings
-
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings('ignore')
 
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import itertools
-import urllib.request
-import joblib
-
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.cross_decomposition import PLSRegression
-from sklearn.linear_model import ElasticNet
-from sklearn.svm import SVR
-from xgboost import XGBRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import RepeatedKFold, train_test_split, cross_val_predict, LeaveOneOut, cross_validate, LearningCurveDisplay, GridSearchCV
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, make_scorer, accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, average_precision_score
-from scipy.stats import spearmanr
-from sklearn.feature_selection import VarianceThreshold
-from sklearn.preprocessing import PowerTransformer
-from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
-from scipy.optimize import minimize_scalar
-from scipy.stats import yeojohnson
-from matplotlib.colors import ListedColormap
-import math
-# --- REMOVED HEAVY IMPORTS FROM HERE ---
-# (They have been moved inside the feature extraction function for faster loading)
 ESM_AVAILABLE = True
-
-# --- NEW: PROPERMAB INTEGRATION ---
-#from propermab import defaults
-#from propermab.features import feature_utils
-#defaults.system_config.update_from_json('./default_config.json') # Often needed depending on user setup
-PROPERMAB_AVAILABLE = False
-
-# Set visualization style
+PROPERMAB_AVAILABLE = True
 sns.set_theme(style="whitegrid")
 
 def custom_spearman(y_true, y_pred):
-    """Custom scoring function to handle NaN spearman correlations."""
     sc, _ = spearmanr(y_true, y_pred)
     return sc if not np.isnan(sc) else 0
 
-# --- NEW: CUSTOM WEIGHTED TRANSFORMER MATH & META-ESTIMATOR ---
 def calculate_weighted_yeojohnson_lambda(y, weights):
-    """Finds the optimal Yeo-Johnson lambda that maximizes the weighted log-likelihood."""
     y_flat = np.asarray(y).flatten()
     w = np.asarray(weights).flatten()
-    
-    # Normalize weights to sum to N to stabilize variance calculations
     w = (w / np.sum(w)) * len(w)
     
     def weighted_nll(lmbda):
-        # 1. Transform data
         y_trans = yeojohnson(y_flat, lmbda)
-        
-        # 2. Weighted Variance
         w_mean = np.average(y_trans, weights=w)
         w_var = np.average((y_trans - w_mean)**2, weights=w)
         if w_var <= 0: return np.inf
-        
-        # 3. Jacobian (Log-derivative of the transformation)
         jacobian = np.sum(w * np.sign(y_flat) * np.log1p(np.abs(y_flat)))
-        
-        # 4. Negative Log-Likelihood
         nll = (len(w) / 2.0) * np.log(w_var) - (lmbda - 1) * jacobian
         return nll
         
@@ -108,44 +105,25 @@ def calculate_weighted_yeojohnson_lambda(y, weights):
     return res.x
 
 class CustomYeoJohnsonTransformer(BaseEstimator, TransformerMixin):
-    """A Scikit-Learn compatible transformer that uses a pre-calculated optimal lambda."""
     def __init__(self, lmbda=1.0):
         self.lmbda = lmbda
-        
-    def fit(self, X, y=None):
-        return self
-        
+    def fit(self, X, y=None): return self
     def transform(self, X):
         X_flat = np.asarray(X).flatten()
-        X_trans = yeojohnson(X_flat, self.lmbda)
-        return X_trans.reshape(-1, 1)
-        
+        return yeojohnson(X_flat, self.lmbda).reshape(-1, 1)
     def inverse_transform(self, X_trans):
         X_trans_flat = np.asarray(X_trans).flatten()
         X_inv = np.zeros_like(X_trans_flat)
+        pos, neg = X_trans_flat >= 0, ~(X_trans_flat >= 0)
         
-        pos = X_trans_flat >= 0
-        neg = ~pos
-        
-        # Inverse mapping for y >= 0
-        if abs(self.lmbda) < 1e-10:
-            X_inv[pos] = np.exp(X_trans_flat[pos]) - 1
-        else:
-            X_inv[pos] = np.maximum(X_trans_flat[pos] * self.lmbda + 1, 0) ** (1 / self.lmbda) - 1
+        if abs(self.lmbda) < 1e-10: X_inv[pos] = np.exp(X_trans_flat[pos]) - 1
+        else: X_inv[pos] = np.maximum(X_trans_flat[pos] * self.lmbda + 1, 0) ** (1 / self.lmbda) - 1
             
-        # Inverse mapping for y < 0
-        if abs(self.lmbda - 2.0) < 1e-10:
-            X_inv[neg] = 1 - np.exp(-X_trans_flat[neg])
-        else:
-            X_inv[neg] = 1 - np.maximum(1 - (2 - self.lmbda) * X_trans_flat[neg], 0) ** (1 / (2 - self.lmbda))
-            
+        if abs(self.lmbda - 2.0) < 1e-10: X_inv[neg] = 1 - np.exp(-X_trans_flat[neg])
+        else: X_inv[neg] = 1 - np.maximum(1 - (2 - self.lmbda) * X_trans_flat[neg], 0) ** (1 / (2 - self.lmbda))
         return X_inv.reshape(-1, 1)
 
 class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
-    """
-    A custom meta-estimator that perfectly handles target transformations (including weighted) 
-    without leaking data across CV folds by unpacking hidden weights from X during fit.
-    """
     def __init__(self, regressor, transform_type=None, weight_col=None):
         self.regressor = regressor
         self.transform_type = transform_type
@@ -153,29 +131,23 @@ class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
         
     def fit(self, X, y):
         self.regressor_ = clone(self.regressor)
-        
-        # Unpack weights and clean X so the ML model never sees the weights as a feature
         if self.weight_col:
             if isinstance(X, pd.DataFrame):
                 weights = X[self.weight_col].values
                 X_clean = X.drop(columns=[self.weight_col])
             else:
-                # If a CV tool converted X to a numpy array, the weight column is appended at the very end
                 weights = X[:, -1]
                 X_clean = X[:, :-1]
         else:
             X_clean = X.copy() if isinstance(X, pd.DataFrame) else np.copy(X)
             weights = None
             
-        # Transform Target securely on this specific CV fold
-        if self.transform_type == 'log1p':
-            y_trans = np.log1p(y)
+        if self.transform_type == 'log1p': y_trans = np.log1p(y)
         elif self.transform_type in ['box-cox', 'yeo-johnson']:
             self.pt_ = PowerTransformer(method=self.transform_type)
             y_trans = self.pt_.fit_transform(np.asarray(y).reshape(-1, 1)).flatten()
         elif self.transform_type == 'weighted-yeo-johnson':
-            if weights is None:
-                weights = np.ones_like(y)
+            if weights is None: weights = np.ones_like(y)
             self.lmbda_ = calculate_weighted_yeojohnson_lambda(y, weights)
             self.pt_ = CustomYeoJohnsonTransformer(lmbda=self.lmbda_)
             y_trans = self.pt_.transform(np.asarray(y).reshape(-1, 1)).flatten()
@@ -186,20 +158,15 @@ class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
         return self
         
     def predict(self, X):
-        # Unpack weights and clean X before predicting
         if self.weight_col:
-            if isinstance(X, pd.DataFrame):
-                X_clean = X.drop(columns=[self.weight_col])
-            else:
-                X_clean = X[:, :-1]
+            if isinstance(X, pd.DataFrame): X_clean = X.drop(columns=[self.weight_col])
+            else: X_clean = X[:, :-1]
         else:
             X_clean = X
             
         y_pred_trans = self.regressor_.predict(X_clean)
         
-        # Inverse Transform
-        if self.transform_type == 'log1p':
-            return np.expm1(y_pred_trans)
+        if self.transform_type == 'log1p': return np.expm1(y_pred_trans)
         elif self.transform_type in ['box-cox', 'yeo-johnson']:
             return self.pt_.inverse_transform(y_pred_trans.reshape(-1, 1)).flatten()
         elif self.transform_type == 'weighted-yeo-johnson':
@@ -207,325 +174,346 @@ class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
         else:
             return np.asarray(y_pred_trans).flatten()
 
-
 def load_and_clean_data(filepath, remove_outlier=False):
-    """Loads the dataset and optionally removes known outliers."""
     print(f"Loading data from {filepath}...")
     df = pd.read_csv(filepath)
-    
-    # Strip whitespace from column names just in case
     df.columns = df.columns.str.strip()
     
-    if remove_outlier:
-        # Check if the column exists to avoid key errors
-        if 'Samples' in df.columns:
-            # Strip string values to ensure a perfect match, then filter
-            initial_len = len(df)
-            
-            # 🌟 NEW: Define a list of all known catastrophic failures
-            outliers_to_remove = ['H57L46', 'H57L38']
-            
-            # Use ~ (NOT) and .isin() to drop any row matching the list
-            df = df[~df['Samples'].str.strip().isin(outliers_to_remove)]
-            
-            # Reset the index (CRITICAL for Leave-One-Out CV to work properly later)
-            df = df.reset_index(drop=True)
-            
-            rows_dropped = initial_len - len(df)
-            if rows_dropped > 0:
-                print(f"  -> SUCCESS: Outliers removed. ({rows_dropped} rows dropped)")
-            else:
-                print("  -> WARNING: Toggle is ON, but specified outliers were not found in the dataset.")
-        else:
-            print("  -> ERROR: 'Samples' column not found. Cannot remove outlier.")
-            
+    if remove_outlier and 'Samples' in df.columns:
+        initial_len = len(df)
+        outliers_to_remove = ['H57L46', 'H57L38']
+        df = df[~df['Samples'].str.strip().isin(outliers_to_remove)].reset_index(drop=True)
+        rows_dropped = initial_len - len(df)
+        if rows_dropped > 0: print(f"  -> SUCCESS: Outliers removed. ({rows_dropped} rows dropped)")
     return df
 
-def determine_preferred_media(df):
-    """Calculates average performance to determine the preferred media."""
-    print("--- Media Performance Summary ---")
-    if 'ProA_Monomer_Excell' in df.columns and 'ProA_Monomer_ActiPro' in df.columns:
-        avg_monomer_ex = df['ProA_Monomer_Excell'].mean()
-        avg_monomer_act = df['ProA_Monomer_ActiPro'].mean()
-        print(f"Average Monomer (Excell):  {avg_monomer_ex:.2f}%")
-        print(f"Average Monomer (ActiPro): {avg_monomer_act:.2f}%")
-        if avg_monomer_act > avg_monomer_ex: print("Winner for Purity (Monomer): ActiPro")
-        else: print("Winner for Purity (Monomer): Excell")
-            
-    if 'ProA_HMW_Excell' in df.columns and 'ProA_HMW_ActiPro' in df.columns:
-        avg_hmw_ex = df['ProA_HMW_Excell'].mean()
-        avg_hmw_act = df['ProA_HMW_ActiPro'].mean()
-        print(f"\nAverage Aggregates HMW (Excell):  {avg_hmw_ex:.2f}%")
-        print(f"Average Aggregates HMW (ActiPro): {avg_hmw_act:.2f}%")
-        if avg_hmw_act < avg_hmw_ex: print("Winner for Lowest Aggregation: ActiPro")
-        else: print("Winner for Lowest Aggregation: Excell")
-    print("---------------------------------\n")
-
-def plot_media_comparison(df):
-    """Compares key metrics between Excell and ActiPro media conditions."""
-    print("Generating Media Comparison Plots (Excell vs ActiPro)...")
-    metrics = [
-        ('ProA_Monomer_Excell', 'ProA_Monomer_ActiPro', 'Protein A Monomer %'),
-        ('ProA_HMW_Excell', 'ProA_HMW_ActiPro', 'Protein A HMW (Aggregates) %'),
-        ('AC-SINS_Excell', 'AC-SINS_ActiPro', 'AC-SINS Score')
-    ]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for i, (ex_col, acti_col, title) in enumerate(metrics):
-        if ex_col in df.columns and acti_col in df.columns:
-            sns.scatterplot(data=df, x=ex_col, y=acti_col, ax=axes[i], alpha=0.7)
-            min_val = min(df[ex_col].min(), df[acti_col].min())
-            max_val = max(df[ex_col].max(), df[acti_col].max())
-            axes[i].plot([min_val, max_val], [min_val, max_val], 'r--', label='y = x (Equal Perf.)')
-            axes[i].set_title(title)
-            axes[i].set_xlabel(f"{title} - Excell")
-            axes[i].set_ylabel(f"{title} - ActiPro")
-            axes[i].legend()
-    plt.tight_layout()
-    plt.savefig('media_comparison.png', dpi=300)
-    plt.close()
-
 def filter_redundant_sequences(df, seq_cols):
-    """Finds the most granular sequence columns by checking if they are substrings of others."""
     parents = set()
     for col_a in seq_cols:
         for col_b in seq_cols:
             if col_a == col_b: continue
-            
-            val_a = df[col_a].dropna()
-            val_b = df[col_b].dropna()
+            val_a, val_b = df[col_a].dropna(), df[col_b].dropna()
             if val_a.empty or val_b.empty: continue
-            
             str_a = ''.join(str(val_a.iloc[0]).split()).replace(',', '').upper()
             str_b = ''.join(str(val_b.iloc[0]).split()).replace(',', '').upper()
-            
             if len(str_a) > 5 and str_a in str_b and len(str_a) < len(str_b):
                 parents.add(col_b)
-                
-    granular_cols = [c for c in seq_cols if c not in parents]
-    return granular_cols, list(parents)
+    return [c for c in seq_cols if c not in parents], list(parents)
 
 def load_aaindex():
-    """Downloads and parses the AAindex1 database of 566 physicochemical properties."""
-    filepath = 'aaindex1.txt'
-    aaindex_dict = {}
-    aaindex_desc = {}
+    filepath, aaindex_dict, aaindex_desc = 'aaindex1.txt', {}, {}
     if not os.path.exists(filepath):
-        print("Downloading AAindex1 database (~566 properties)...")
-        url = "https://www.genome.jp/ftp/db/community/aaindex/aaindex1"
-        try:
-            urllib.request.urlretrieve(url, filepath)
-        except Exception as e:
-            print(f"Failed to download AAindex1: {e}")
-            return aaindex_dict, aaindex_desc
+        try: urllib.request.urlretrieve("https://www.genome.jp/ftp/db/community/aaindex/aaindex1", filepath)
+        except Exception: return aaindex_dict, aaindex_desc
             
-    print("Parsing AAindex1 properties and descriptions...")
     try:
-        with open(filepath, 'r') as f:
-            lines = f.readlines()
-        current_id = None
-        current_desc = None
+        with open(filepath, 'r') as f: lines = f.readlines()
+        current_id, current_desc = None, None
         for i in range(len(lines)):
-            if lines[i].startswith('H '):
-                current_id = lines[i].split()[1]
-            elif lines[i].startswith('D '):
-                current_desc = lines[i][2:].strip()
+            if lines[i].startswith('H '): current_id = lines[i].split()[1]
+            elif lines[i].startswith('D '): current_desc = lines[i][2:].strip()
             elif lines[i].startswith('I '):
-                vals1 = lines[i+1].strip().split()
-                vals2 = lines[i+2].strip().split()
-                
-                def parse_val(x):
-                    try: return float(x)
-                    except ValueError: return np.nan
-                        
-                vals1 = [parse_val(x) for x in vals1]
-                vals2 = [parse_val(x) for x in vals2]
-                
+                vals1 = [float(x) if x != 'NA' else np.nan for x in lines[i+1].strip().split()]
+                vals2 = [float(x) if x != 'NA' else np.nan for x in lines[i+2].strip().split()]
                 if len(vals1) == 10 and len(vals2) == 10:
-                    aa_keys = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I',
-                               'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V']
-                    prop_map = dict(zip(aa_keys, vals1 + vals2))
-                    aaindex_dict[current_id] = prop_map
+                    aa_keys = list('ARNDCQEGHILKMFPSTWYV')
+                    aaindex_dict[current_id] = dict(zip(aa_keys, vals1 + vals2))
                     aaindex_desc[current_id] = current_desc
-    except Exception as e:
-        print(f"Error parsing AAindex1: {e}")
-        
+    except Exception: pass
     return aaindex_dict, aaindex_desc
 
-def calculate_and_plot_variance(filepath, output_filename='subregion_sequence_variance.png'):
-    """
-    Loads antibody sequence data, constructs global chains, calculates 
-    the sequence diversity (unique sequences) for each subregion, 
-    and generates a color-coded horizontal bar chart.
-    """
-    print(f"Loading data from '{filepath}'...")
-    try:
-        df = pd.read_csv(filepath)
-    except FileNotFoundError:
-        print(f"Error: Could not find '{filepath}'. Please check the path.")
-        return
+def compute_aac_features(sequences, prefix=""):
+    standard_aas = list('ARNDCQEGHILKMFPSTWYV')
+    aac_dict = {}
+    for aa in standard_aas:
+        aac_dict[f'{prefix}AAC_{aa}'] = np.array([seq.count(aa) if seq != 'NAN' else 0 for seq in sequences])
+    return aac_dict
 
-    df.columns = df.columns.str.strip()
-    total_samples = len(df)
-    
-    # Define the exact columns that make up the Heavy and Light chains
-    vh_ordered_cols = ['seq_frh1', 'seq_cdrh1', 'seq_frh2', 'seq_cdrh2', 'seq_frh3', 'seq_cdrh3', 'seq_frh4'] 
-    vl_ordered_cols = ['seq_frl1', 'seq_cdrl1', 'seq_frl2', 'seq_cdrl2', 'seq_frl3', 'seq_cdrl3', 'seq_frl4']
-    
-    # All subregions we want to analyze
-    subregion_cols = vh_ordered_cols + vl_ordered_cols
-    
-    # Helper to build the stitched chains
-    def build_full_seq(row, cols):
-        parts = []
-        for c in cols:
-            if c in df.columns and pd.notna(row[c]):
-                val = str(row[c]).strip().upper()
-                if val != 'NAN' and val != 'NONE':
-                    parts.append(val)
-        return "".join(parts) if parts else 'NAN'
+def compute_aaindex_features(sequences, aaindex_db, prefix=""):
+    aaindex_dict = {}
+    if aaindex_db:
+        for code, prop_map in aaindex_db.items():
+            vals_array = []
+            for seq in sequences:
+                if seq == 'NAN' or not seq: 
+                    vals_array.append(0)
+                    continue
+                vals = [prop_map.get(aa) for aa in seq if prop_map.get(aa) is not None and not np.isnan(prop_map.get(aa))]
+                vals_array.append(sum(vals)/len(vals) if vals else 0)
+            aaindex_dict[f'{prefix}AAindex_{code}'] = np.array(vals_array)
+    return aaindex_dict
 
-    # Stitch the global chains
-    df['Global_VH'] = df.apply(lambda r: build_full_seq(r, vh_ordered_cols), axis=1)
-    df['Global_VL'] = df.apply(lambda r: build_full_seq(r, vl_ordered_cols), axis=1)
-    df['Global_Fv'] = df.apply(lambda r: r['Global_VH'] + r['Global_VL'] if r['Global_VH'] != 'NAN' and r['Global_VL'] != 'NAN' else 'NAN', axis=1)
-
-    global_cols = ['Global_VH', 'Global_VL', 'Global_Fv']
-    all_seq_cols = subregion_cols + global_cols
-
-    variance_data = []
-    
-    for col in all_seq_cols:
-        if col in df.columns:
-            # Clean the sequences just like the main pipeline does
-            valid_seqs = df[col].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper()
+def compute_georgiev_features(sequences, georgiev_dict, prefix=""):
+    geo_features = []
+    for seq in sequences:
+        if seq == 'NAN' or len(seq) == 0: 
+            geo_features.append([0.0] * 19)
+        else:
+            seq_geo = [georgiev_dict[aa] for aa in seq if aa in georgiev_dict]
+            geo_features.append(np.mean(seq_geo, axis=0).tolist() if seq_geo else [0.0] * 19)
             
-            # Remove empty strings or string-literals of NAN/NONE
-            valid_seqs = valid_seqs[~valid_seqs.isin(['NAN', 'NONE', ''])]
-            
-            # Count the absolute number of unique sequences in this region
-            num_unique = valid_seqs.nunique()
-            
-            # Determine the Region Type for color coding the plot
-            if col in global_cols:
-                region_type = 'Global Chain (VH, VL, Fv)'
-            elif 'cdr' in col.lower():
-                region_type = 'CDR Loop'
-            elif 'fr' in col.lower():
-                region_type = 'Framework Region'
-            else:
-                region_type = 'Other'
+    geo_features = np.array(geo_features)
+    return {f"{prefix}Georgiev_PC{i+1}": geo_features[:, i] for i in range(19)}
+
+def compute_esm_embeddings(sequences, esm_model_name, prefix="", esm_tag=""):
+    import torch
+    from transformers import EsmModel, EsmTokenizer, logging
+    logging.set_verbosity_error()
+    
+    tokenizer = EsmTokenizer.from_pretrained(esm_model_name)
+    model = EsmModel.from_pretrained(esm_model_name)
+    model.eval()
+    
+    embeddings = []
+    for seq in sequences:
+        if seq == 'NAN' or len(seq) < 2: 
+            embeddings.append(np.zeros(model.config.hidden_size))
+        else:
+            inputs = tokenizer(seq, return_tensors="pt", add_special_tokens=True)
+            with torch.no_grad():
+                hidden = model(**inputs).last_hidden_state[0]
+                embeddings.append(hidden[1:-1].mean(dim=0).cpu().numpy() if hidden.shape[0] > 2 else hidden.mean(dim=0).cpu().numpy())
                 
-            variance_data.append({
-                'Subregion': col,
-                'Unique Sequences': num_unique,
-                'Region Type': region_type
-            })
+    embeddings = np.array(embeddings)
+    return {f'{prefix}{esm_tag}_{i}': embeddings[:, i] for i in range(embeddings.shape[1])}, embeddings
 
-    # Convert to DataFrame and sort from highest variance to lowest
-    var_df = pd.DataFrame(variance_data)
-    var_df = var_df.sort_values(by='Unique Sequences', ascending=False)
+def compress_embeddings_svd(embeddings_matrix, prefix="", esm_tag="", svd_model=None):
+    from sklearn.decomposition import TruncatedSVD
     
-    print("\nSequence Diversity (Unique Sequences out of Total Samples):")
-    print(var_df.to_string(index=False))
+    if svd_model is not None:
+        # 🌟 INFERENCE MODE: Project into the existing mathematical space
+        embeddings_svd = svd_model.transform(embeddings_matrix)
+        return {f'{prefix}{esm_tag}_SVD50_{i}': embeddings_svd[:, i] for i in range(embeddings_svd.shape[1])}, svd_model
+        
+    # 🌟 TRAINING MODE: Fit a brand new SVD model
+    n_comps = min(50, embeddings_matrix.shape[0] - 1, embeddings_matrix.shape[1] - 1)
+    if n_comps > 0:
+        svd = TruncatedSVD(n_components=n_comps, random_state=42)
+        embeddings_svd = svd.fit_transform(embeddings_matrix)
+        return {f'{prefix}{esm_tag}_SVD50_{i}': embeddings_svd[:, i] for i in range(embeddings_svd.shape[1])}, svd
+        
+    return None, None
 
-    plt.figure(figsize=(12, 10))
+def compute_antiberty_embeddings(sequences, prefix=""):
+    import torch
+    from antiberty import AntiBERTyRunner
+    antiberty = AntiBERTyRunner()
+    antiberty.model.eval()
     
-    # Define a custom color palette for high readability
-    custom_palette = {
-        'Global Chain (VH, VL, Fv)': '#2ca02c', # Green
-        'CDR Loop': '#1f77b4',                  # Blue
-        'Framework Region': '#ff7f0e'           # Orange
-    }
-    
-    # Create the horizontal bar plot
-    ax = sns.barplot(
-        data=var_df, 
-        x='Unique Sequences', 
-        y='Subregion', 
-        hue='Region Type', 
-        dodge=False, 
-        palette=custom_palette,
-        edgecolor='black'
-    )
-    
-    # Add a vertical dotted line showing the theoretical maximum variance (Total Samples)
-    plt.axvline(total_samples, color='red', linestyle='--', linewidth=2, 
-                label=f'Max Possible Variance (N={total_samples})')
-    
-    # Labels and Titles
-    plt.title('Sequence Diversity by Subregion\n(Higher Variance = More Learning Signal for ML Models)', fontsize=16, pad=20)
-    plt.xlabel('Number of Unique Sequences in Library', fontsize=14)
-    plt.ylabel('Antibody Region', fontsize=14)
-    
-    # Adjust legend
-    plt.legend(title='Region Type', loc='lower right', fontsize=12, title_fontsize=12)
-    
-    # Add data labels to the end of each bar for easy reading
-    for i, p in enumerate(ax.patches):
-        width = p.get_width()
-        if not pd.isna(width) and width > 0:
-            ax.text(width + 0.5, p.get_y() + p.get_height() / 2, f'{int(width)}', 
-                    ha='left', va='center', fontsize=10, fontweight='bold')
+    antiberty_embeddings = []
+    for seq in sequences:
+        if seq == 'NAN' or len(seq) < 2:
+            antiberty_embeddings.append(np.zeros(512))
+        else:
+            with torch.no_grad():
+                emb = antiberty.embed([seq])[0]
+                if emb.shape[0] > 2: emb_mean = emb[1:-1].mean(dim=0).cpu().numpy()
+                else: emb_mean = emb.mean(dim=0).cpu().numpy()
+                antiberty_embeddings.append(emb_mean)
+                
+    antiberty_embeddings = np.array(antiberty_embeddings)
+    return {f'{prefix}AntiBERTy_{i}': antiberty_embeddings[:, i] for i in range(antiberty_embeddings.shape[1])}
 
-    plt.xlim(0, total_samples + 5)
-    plt.tight_layout()
+def compute_ablang2_paired_embeddings(heavy_seqs, light_seqs, prefix="Paired_VH_VL_AbLang2_"):
+    import ablang2
+    ablang = ablang2.pretrained(model_to_use="ablang2-paired", random_init=False)
     
-    # Save the plot
-    plt.savefig(output_filename, dpi=300, facecolor='white', bbox_inches='tight')
-    plt.close()
+    ablang_embeddings = []
+    emb_dim = None
     
-    print(f"\n✅ Success! Variance plot saved as '{output_filename}'.")
+    for h_seq, l_seq in zip(heavy_seqs, light_seqs):
+        if h_seq in ['NAN', 'NONE', ''] or l_seq in ['NAN', 'NONE', ''] or len(h_seq) < 2 or len(l_seq) < 2:
+            ablang_embeddings.append(None) 
+        else:
+            res = ablang([[h_seq, l_seq]], mode='seqcoding')
+            emb = res[0]
+            if hasattr(emb, 'cpu'): emb = emb.cpu()
+            if hasattr(emb, 'numpy'): emb = emb.numpy()
+            ablang_embeddings.append(emb)
+            if emb_dim is None: emb_dim = emb.shape[0]
+            
+    if emb_dim is None: emb_dim = 480 
+    
+    final_embeddings = [emb if emb is not None else np.zeros(emb_dim) for emb in ablang_embeddings]
+    final_embeddings = np.array(final_embeddings)
+    
+    return {f'{prefix}{i}': final_embeddings[:, i] for i in range(final_embeddings.shape[1])}
 
-def extract_sequence_features(df, is_inference=False, dataset_name="default_dataset", esm_model_name="facebook/esm2_t6_8M_UR50D", cache_tag=""):
-    """Extracts physiochemical features from antibody subregions."""
-    if not is_inference:
-        print("Extracting sequence features from subregions...")
+def compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_"):
+    import subprocess
+    import sys
+    import json
+    from ImmuneBuilder import ABodyBuilder2
+    
+    propermab_features_list = []
+    safe_tmp_dir = os.path.join(os.getcwd(), "propermab_pipeline_tmp")
+    os.makedirs(safe_tmp_dir, exist_ok=True)
+    raw_pdb_dir = os.path.join(safe_tmp_dir, "raw_pdbs").replace('\\', '/')
+    cleaned_pdb_dir = os.path.join(safe_tmp_dir, "cleaned_pdbs").replace('\\', '/')
+    os.makedirs(raw_pdb_dir, exist_ok=True)
+    os.makedirs(cleaned_pdb_dir, exist_ok=True)
+    
+    worker_code = f"""
+import os
+import sys
+import json
+import math
+import warnings
+from Bio.PDB.PDBExceptions import PDBConstructionWarning
+warnings.simplefilter('ignore', PDBConstructionWarning)
+os.environ['OPENMM_DEFAULT_PLATFORM'] = 'CPU'
+os.environ['OPENMM_CPU_THREADS'] = '1'
+try:
+    import propermab
+    from propermab import defaults
+    if os.path.exists('default_config.json'): defaults.system_config.update_from_json('default_config.json')
+    try: from propermab.preprocess_structures import preprocess_directory
+    except ImportError:
+        try: from propermab.scripts.preprocess_structures import preprocess_directory
+        except ImportError: from preprocess_structures import preprocess_directory
+            
+    preprocess_directory(input_dir='{raw_pdb_dir}', output_dir='{cleaned_pdb_dir}', heavy_chain_id="H", light_chain_id="L", ph=7.4, remove_water=True)
+    
+    pdb_name = sys.argv[1]
+    cleaned_pdb_path = os.path.join('{cleaned_pdb_dir}', pdb_name)
+    try: from propermab.features import feature_utils_mod as feature_utils
+    except ImportError: from propermab.features import feature_utils
+        
+    mol_features = feature_utils.calculate_features_from_pdb(cleaned_pdb_path)
+    clean_dict = {{}}
+    for k, v in mol_features.items():
+        if isinstance(v, float) and math.isnan(v): clean_dict[k] = None
+        elif hasattr(v, 'item'): clean_dict[k] = v.item()
+        else: clean_dict[k] = v
+            
+    print("---JSON_PAYLOAD_START---")
+    print(json.dumps(clean_dict))
+    print("---JSON_PAYLOAD_END---")
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+"""
+    worker_path = os.path.join(safe_tmp_dir, "pipeline_worker.py")
+    with open(worker_path, "w") as f: f.write(worker_code)
+        
+    predictor = ABodyBuilder2()
+    
+    for i, (h_seq, l_seq) in enumerate(zip(heavy_seqs, light_seqs)):
+        if h_seq in ['NAN', 'NONE', ''] or l_seq in ['NAN', 'NONE', ''] or len(h_seq) < 2 or len(l_seq) < 2:
+            print(f"      [{i+1}/{len(heavy_seqs)}] Skipping invalid sequences...")
+            propermab_features_list.append(None)
+            continue
+            
+        print(f"      [{i+1}/{len(heavy_seqs)}] Predicting and featurizing...")
+        pdb_name = f"seq_{i}.pdb"
+        raw_pdb_path = os.path.join(raw_pdb_dir, pdb_name)
+        
+        try:
+            struct = predictor.predict({'H': h_seq, 'L': l_seq})
+            struct.save(raw_pdb_path)
+            result = subprocess.run([sys.executable, worker_path, pdb_name], capture_output=True, text=True)
+            
+            if result.returncode == 0 and "---JSON_PAYLOAD_START---" in result.stdout:
+                json_str = result.stdout.split("---JSON_PAYLOAD_START---")[1].split("---JSON_PAYLOAD_END---")[0].strip()
+                propermab_features_list.append(json.loads(json_str))
+            else:
+                print(f"      -> ⚠️ Error extracting features: \n{result.stderr}")
+                propermab_features_list.append(None)
+                
+            if os.path.exists(raw_pdb_path): os.remove(raw_pdb_path)
+            cleaned_out = os.path.join(cleaned_pdb_dir, pdb_name)
+            if os.path.exists(cleaned_out): os.remove(cleaned_out)
+        except Exception as e:
+            print(f"      -> ⚠️ Exception on sequence {i}: {e}")
+            propermab_features_list.append(None)
+
+    if os.path.exists(safe_tmp_dir): shutil.rmtree(safe_tmp_dir)
+    
+    all_keys = set()
+    for feat_dict in propermab_features_list:
+        if feat_dict: all_keys.update(feat_dict.keys())
+    all_keys.discard('antibody_format') 
+    
+    propermab_dict = {}
+    for k in all_keys:
+        arr = []
+        for feat_dict in propermab_features_list:
+            if feat_dict and k in feat_dict and feat_dict[k] is not None: arr.append(feat_dict[k])
+            else: arr.append(0.0) 
+        propermab_dict[f"{prefix}{k}"] = np.array(arr)
+        
+    for trash_file in glob.glob("*_apbs.csv") + glob.glob("*_vertices.csv") + glob.glob("io.mc"):
+        try: os.remove(trash_file)
+        except OSError: pass
+
+    return propermab_dict
+
+def extract_sequence_features(df, is_inference=False, dataset_name="default_dataset", esm_model_names=["facebook/esm2_t6_8M_UR50D"], cache_tag="", extract_subregions=False, feature_types=None, svd_models_dict=None):
+    """
+    Orchestrator for sequence-level and structural feature generation.
+    
+    feature_types: List of feature groups to extract.
+      Supported options: ['AAC', 'AAindex', 'Georgiev', 'ESM', 'AntiBERTy', 'AbLang2_Paired', 'Propermab']
+      If None, extracts all available features.
+    """
+    if svd_models_dict is None: 
+        svd_models_dict = {}
+
+    ALL_FEATURE_FAMILIES = ['AAC', 'AAindex', 'Georgiev', 'ESM', 'AntiBERTy', 'AbLang2_Paired', 'Propermab']
+    
+    if feature_types is None:
+        active_features = [f.lower() for f in ALL_FEATURE_FAMILIES]
+    else:
+        active_features = [str(f).strip().lower() for f in feature_types]
+        
+    print(f"\n🎯 Active Feature Pipelines: {[f for f in ALL_FEATURE_FAMILIES if f.lower() in active_features]}")
+
+    # Protect against single-string ESM model name
+    if isinstance(esm_model_names, str):
+        esm_model_names = [esm_model_names]
+        
     df_feat = df.copy()
-    
     standard_aas = list('ARNDCQEGHILKMFPSTWYV')
     
-    seq_cols = []
+    initial_seq_cols = []
     for col in df_feat.columns:
         valid_data = df_feat[col].dropna()
         if not valid_data.empty:
-            sample = str(valid_data.iloc[0])
-            clean_sample = ''.join(sample.split()).replace(',', '').upper()
-            if len(clean_sample) > 5:
-                aa_ratio = sum(c in standard_aas for c in clean_sample) / len(clean_sample)
-                if aa_ratio > 0.8:
-                    seq_cols.append(col)
-                
-    if not is_inference:
-        print(f"Detected {len(seq_cols)} potential sequence columns.")
-    
-    if not is_inference:
-        variable_seq_cols = []
+            clean_sample = ''.join(str(valid_data.iloc[0]).split()).replace(',', '').upper()
+            if len(clean_sample) > 3 and sum(c in standard_aas for c in clean_sample) / len(clean_sample) > 0.8:
+                initial_seq_cols.append(col)
+
+    seq_cols = initial_seq_cols
+
+    if not extract_subregions:
+        print("\n🛑 [extract_subregions=False]: Skipping subregion feature extraction.")
+        seq_cols = [] 
+
+    if extract_subregions and not is_inference:
+        print(f"\n==================================================================")
+        print(f"🧬 EVALUATING SUBREGION DIVERSITY & SUITABILITY")
+        print(f"==================================================================")
+        valid_seq_cols = []
         for col in seq_cols:
             valid_seqs = df_feat[col].dropna().astype(str).str.replace(r'\s+|,', '', regex=True).str.upper()
-            num_unique = valid_seqs.nunique()
+            valid_seqs = valid_seqs[~valid_seqs.isin(['NAN', 'NONE', ''])]
             
-            if num_unique > 1:
-                variable_seq_cols.append(col)
-                if num_unique <= 5: 
-                    counts_dict = valid_seqs.value_counts().to_dict()
-                    counts_str = ", ".join([f"'{k}' ({v} samples)" for k, v in counts_dict.items()])
-                    print(f"  -> Kept '{col}' (Low variance: {num_unique} unique seqs). Breakdown: {counts_str}")
-            else:
-                print(f"  -> Dropping '{col}' (constant sequence across all samples)")
+            if valid_seqs.empty: continue
+            if len(valid_seqs.iloc[0]) <= 3: continue
                 
-        seq_cols = variable_seq_cols
-        print(f"Retained {len(seq_cols)} sequence columns with variance.\n")
+            num_unique = valid_seqs.nunique()
+            if num_unique <= 1: continue
+            else: valid_seq_cols.append(col)
         
-        granular_seq_cols, composite_cols = filter_redundant_sequences(df_feat, seq_cols)
-        print(f"Filtered out {len(composite_cols)} composite/redundant regions.")
-        seq_cols = granular_seq_cols
+        seq_cols, redundant_parents = filter_redundant_sequences(df_feat, valid_seq_cols)
         
-        if 'G4S Linker1_HCK' in seq_cols:
-            print("  -> Dropping 'G4S Linker1_HCK' (manual override: near-zero variance).")
-            seq_cols.remove('G4S Linker1_HCK')
-        print(f"Proceeding with {len(seq_cols)} granular building blocks: {seq_cols}\n")
+        for override in ['G4S Linker1_HCK', 'Media_Type', 'HCH', 'Method', 'Manual_Split_Group']:
+            if override in seq_cols: seq_cols.remove(override)
+            
+        print(f"\nProceeding with {len(seq_cols)} granular building blocks: {seq_cols}\n")
     
-    # --- 🌟 NEW: CONSTRUCT GLOBAL CHAINS FOR CONTEXTUAL EXTRACTION ---
+    # 🌟 RESTORED: Stitch global chains from subregions so mutations physically propagate!
     vh_ordered_cols = ['seq_frh1', 'seq_cdrh1', 'seq_frh2', 'seq_cdrh2', 'seq_frh3', 'seq_cdrh3', 'seq_frh4'] 
     vl_ordered_cols = ['seq_frl1', 'seq_cdrl1', 'seq_frl2', 'seq_cdrl2', 'seq_frl3', 'seq_cdrl3', 'seq_frl4']
 
@@ -534,536 +522,480 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
         for c in cols:
             if c in df_feat.columns and pd.notna(row[c]):
                 val = str(row[c]).strip().upper()
-                if val != 'NAN' and val != 'NONE':
+                if val not in ['NAN', 'NONE', '']:
                     parts.append(val)
         return "".join(parts) if parts else 'NAN'
 
-    if not is_inference: print("Stitching together global sequences (VH, VL, Fv)...")
     df_feat['Global_VH'] = df_feat.apply(lambda r: build_full_seq(r, vh_ordered_cols), axis=1)
     df_feat['Global_VL'] = df_feat.apply(lambda r: build_full_seq(r, vl_ordered_cols), axis=1)
-    df_feat['Global_Fv'] = df_feat.apply(lambda r: r['Global_VH'] + r['Global_VL'] if r['Global_VH'] != 'NAN' and r['Global_VL'] != 'NAN' else 'NAN', axis=1)
+    
+    def build_fv_with_linker(r):
+        if r['Global_VH'] == 'NAN' or r['Global_VL'] == 'NAN': return 'NAN'
+        linker = ''
+        if 'G4S Linker2_HCK' in df_feat.columns and pd.notna(r['G4S Linker2_HCK']):
+            val = str(r['G4S Linker2_HCK']).strip().upper()
+            if val not in ['NAN', 'NONE']: linker = val
+        return r['Global_VH'] + linker + r['Global_VL']
+        
+    df_feat['Global_Fv'] = df_feat.apply(build_fv_with_linker, axis=1)
+    
+    all_seq_cols_to_process = seq_cols + ['Global_VH', 'Global_VL', 'Global_Fv'] if extract_subregions else ['Global_VH', 'Global_VL', 'Global_Fv']
 
-    global_seq_cols = ['Global_VH', 'Global_VL', 'Global_Fv']
-    all_seq_cols_to_process = seq_cols + global_seq_cols
-
-    aaindex_db, aaindex_desc = load_aaindex()
+    # Load AAIndex DB only if requested
+    aaindex_db, aaindex_desc = None, None
+    if 'aaindex' in active_features:
+        aaindex_db, aaindex_desc = load_aaindex()
+    
     generated_features = []
     new_columns = {}
+    expected_dataset_len = len(df_feat)
     
-    # --- NEW: Dynamic Cache Folders ---
-    # Appending the row count and custom tag prevents cache invalidation loops
-    cache_folder = f"{dataset_name}_{len(df_feat)}samples"
-    if cache_tag:
-        cache_folder += f"_{cache_tag}"
-        
-    cache_dir = os.path.join("feature_cache", cache_folder)
+    cache_dir = os.path.join("feature_cache", f"{dataset_name}_{expected_dataset_len}samples" + (f"_{cache_tag}" if cache_tag else ""))
     os.makedirs(cache_dir, exist_ok=True)
-    if not is_inference: print(f"Using cache directory: '{cache_dir}'")
     
     def _load_valid_cache(cache_path, expected_len):
         if os.path.exists(cache_path):
             try:
                 with np.load(cache_path) as cached_data:
-                    if len(cached_data.files) > 0:
-                        cached_len = len(cached_data[cached_data.files[0]])
-                        
-                        # The cache matches your current dataset size
-                        if cached_len == expected_len:
-                            return {k: cached_data[k] for k in cached_data.files}
-                        
-                        # 🌟 NEW: The cache exists, but the size changed!
-                        else:
-                            filename = os.path.basename(cache_path)
-                            print(f"  -> ⚠️ Cache mismatch ({filename}): Cached={cached_len}, Dataset={expected_len}. Re-extracting...")
-                            
-            except Exception as e:
-                print(f"  -> ⚠️ Cache corrupted or unreadable ({os.path.basename(cache_path)}). Re-extracting...")
-        
-        # File doesn't exist, or it failed the checks above
+                    if len(cached_data.files) > 0 and len(cached_data[cached_data.files[0]]) == expected_len:
+                        return {k: cached_data[k] for k in cached_data.files}
+            except Exception: pass
         return None
         
-    expected_dataset_len = len(df_feat)
-    
-    # 🌟 NEW: Extract AAC, AAIndex, and ESM for BOTH subregions and the new global chains!
+    print("\n==================================================================")
+    print("🧬 STARTING FEATURE EXTRACTION & LOADING")
+    print("==================================================================")
+
     for col in all_seq_cols_to_process:
+        print(f"\n⚙️  Processing region: {col}")
         seqs = df_feat[col].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper()
 
-        # # 1. Length Feature Cache
-        # len_cache_file = os.path.join(cache_dir, f"{col}_length_features.npz")
-        # cached_dict = _load_valid_cache(len_cache_file, expected_dataset_len) if not is_inference else None
-        
-        # if cached_dict:
-        #     for k, v in cached_dict.items():
-        #         new_columns[k] = v
-        #         generated_features.append(k)
-        # else:
-        #     len_features = {}
-        #     len_col = f'{col}_Length'
-        #     len_features[len_col] = seqs.apply(lambda x: len(x) if x != 'NAN' else 0).to_numpy()
-        #     if not is_inference: np.savez(len_cache_file, **len_features)
-        #     for k, v in len_features.items():
-        #         new_columns[k] = v
-        #         generated_features.append(k)
-                
-        # 2. Amino Acid Composition (AAC) Cache
-        aac_cache_file = os.path.join(cache_dir, f"{col}_aac_features.npz")
-        cached_dict = _load_valid_cache(aac_cache_file, expected_dataset_len) if not is_inference else None
-        
-        if cached_dict:
-            for k, v in cached_dict.items():
-                new_columns[k] = v
-                generated_features.append(k)
-        else:
-            aac_features = {}
-            for aa in standard_aas:
-                aa_col = f'{col}_AAC_{aa}'
-                aac_features[aa_col] = seqs.apply(lambda x: x.count(aa) if x != 'NAN' else 0).to_numpy()
-            if not is_inference: np.savez(aac_cache_file, **aac_features)
-            for k, v in aac_features.items():
-                new_columns[k] = v
-                generated_features.append(k)
-                
-        # 3. AAindex Physiological Properties Cache
-        aaindex_cache_file = os.path.join(cache_dir, f"{col}_aaindex_features.npz")
-        cached_dict = _load_valid_cache(aaindex_cache_file, expected_dataset_len) if not is_inference else None
-        
-        if cached_dict:
-            for k, v in cached_dict.items():
-                new_columns[k] = v
-                generated_features.append(k)
-        else:
-            aaindex_features = {}
-            if aaindex_db:
-                for code, prop_map in aaindex_db.items():
-                    col_name = f'{col}_AAindex_{code}'
-                    
-                    def calc_prop(seq, pmap=prop_map):
-                        if seq == 'NAN' or not seq: return 0
-                        vals = [pmap.get(aa) for aa in seq]
-                        vals = [v for v in vals if v is not None and not np.isnan(v)]
-                        return sum(vals)/len(vals) if vals else 0
-                        
-                    aaindex_features[col_name] = seqs.apply(calc_prop).to_numpy()
-            
-            if aaindex_features:
-                if not is_inference: np.savez(aaindex_cache_file, **aaindex_features)
-                for k, v in aaindex_features.items():
-                    new_columns[k] = v
-                    generated_features.append(k)
-                    
-        # 4. ESM-2 Protein Language Model (PLM) Cache
-        if ESM_AVAILABLE:
-            # Generate a distinct tag based on the chosen ESM model string to prevent cache collisions
-            if "8M" in esm_model_name: esm_tag = "ESM_Small_8M"
-            elif "35M" in esm_model_name: esm_tag = "ESM_Medium_35M"
-            elif "150M" in esm_model_name: esm_tag = "ESM_Large_150M"
-            elif "650M" in esm_model_name: esm_tag = "ESM_Big_650M"
-            elif "3B" in esm_model_name: esm_tag = "ESM_Massive_3B"
-            else: esm_tag = "ESM_Custom"
-            
-            esm_cache_file = os.path.join(cache_dir, f"{col}_{esm_tag}_features.npz")
-            cached_dict = _load_valid_cache(esm_cache_file, expected_dataset_len) if not is_inference else None
-            
+        # 1. AAC
+        if 'aac' in active_features:
+            aac_cache = os.path.join(cache_dir, f"{col}_aac_features_N{expected_dataset_len}.npz")
+            cached_dict = _load_valid_cache(aac_cache, expected_dataset_len) if not is_inference else None
             if cached_dict:
-                for k, v in cached_dict.items():
-                    new_columns[k] = v
-                    generated_features.append(k)
+                print("   -> [AAC] Loaded from cache")
+                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
             else:
-                if is_inference:
-                    print(f"  -> Extracting ESM-2 for modified sequence '{col}'...")
-                else:
-                    print(f"  -> Extracting ESM-2 Embeddings for '{col}' using {esm_model_name} (This may take a moment)...")
+                print("   -> [AAC] Calculating new features...")
+                aac_dict = compute_aac_features(seqs, prefix=f"{col}_")
+                if not is_inference: np.savez(aac_cache, **aac_dict)
+                for k, v in aac_dict.items(): new_columns[k] = v; generated_features.append(k)
                 
-                import torch
-                from transformers import EsmModel, EsmTokenizer
-                
-                tokenizer = EsmTokenizer.from_pretrained(esm_model_name)
-                model = EsmModel.from_pretrained(esm_model_name)
-                model.eval()
-                
-                esm_features_dict = {}
-                embeddings = []
-                
-                for seq in seqs:
-                    if seq == 'NAN' or not seq or len(seq) < 2:
-                        embeddings.append(np.zeros(model.config.hidden_size))
-                        continue
-                        
-                    inputs = tokenizer(seq, return_tensors="pt", add_special_tokens=True)
-                    with torch.no_grad():
-                        outputs = model(**inputs)
-                        
-                    hidden_states = outputs.last_hidden_state[0]
-                    if hidden_states.shape[0] > 2:
-                        repr_vector = hidden_states[1:-1].mean(dim=0).numpy()
-                    else:
-                        repr_vector = hidden_states.mean(dim=0).numpy()
-                        
-                    embeddings.append(repr_vector)
+        # 2. AAindex
+        if 'aaindex' in active_features:
+            aaindex_cache = os.path.join(cache_dir, f"{col}_aaindex_features_N{expected_dataset_len}.npz")
+            cached_dict = _load_valid_cache(aaindex_cache, expected_dataset_len) if not is_inference else None
+            if cached_dict:
+                print("   -> [AAindex] Loaded from cache")
+                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+            else:
+                print("   -> [AAindex] Calculating new features...")
+                aaindex_dict = compute_aaindex_features(seqs, aaindex_db, prefix=f"{col}_")
+                if aaindex_dict:
+                    if not is_inference: np.savez(aaindex_cache, **aaindex_dict)
+                    for k, v in aaindex_dict.items(): new_columns[k] = v; generated_features.append(k)
                     
-                embeddings = np.array(embeddings)
-                
-                for i in range(embeddings.shape[1]):
-                    feat_name = f'{col}_{esm_tag}_{i}'
-                    esm_features_dict[feat_name] = embeddings[:, i]
-                    
-                if not is_inference: np.savez(esm_cache_file, **esm_features_dict)
-                for k, v in esm_features_dict.items():
-                    new_columns[k] = v
-                    generated_features.append(k)
-                    
-        # 5. NEW: PROPERMAB 3D Structural Features Cache
-        if PROPERMAB_AVAILABLE:
-            # 🌟 NEW: Use the global sequences we stitched at the very top!
-            hc_col = 'Global_VH'
-            lc_col = 'Global_VL'
-            
-            if hc_col in df_feat.columns and lc_col in df_feat.columns:
-                propermab_cache_file = os.path.join(cache_dir, f"propermab_features.npz")
-                cached_dict = _load_valid_cache(propermab_cache_file, expected_dataset_len) if not is_inference else None
+        # 3. Georgiev
+        if 'georgiev' in active_features:
+            geo_cache = os.path.join(cache_dir, f"{col}_georgiev_features_N{expected_dataset_len}.npz")
+            cached_dict = _load_valid_cache(geo_cache, expected_dataset_len) if not is_inference else None
+            if cached_dict:
+                print("   -> [Georgiev] Loaded from cache")
+                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+            else:
+                print("   -> [Georgiev] Calculating new features...")
+                geo_dict = compute_georgiev_features(seqs, GEORGIEV_DICT, prefix=f"{col}_")
+                if not is_inference: np.savez(geo_cache, **geo_dict)
+                for k, v in geo_dict.items(): new_columns[k] = v; generated_features.append(k)
+
+        # 4. ESM-2
+        if 'esm' in active_features and ESM_AVAILABLE:
+            for esm_model_name in esm_model_names:
+                esm_tag = "ESM_Small_8M" if "8M" in esm_model_name else ("ESM_Medium_35M" if "35M" in esm_model_name else ("ESM_Big_650M" if "650M" in esm_model_name else "ESM_Custom"))
+                esm_cache = os.path.join(cache_dir, f"{col}_{esm_tag}_features_N{expected_dataset_len}.npz")
+                cached_dict = _load_valid_cache(esm_cache, expected_dataset_len) if not is_inference else None
                 
                 if cached_dict:
-                    for k, v in cached_dict.items():
-                        new_columns[k] = v
-                        generated_features.append(k)
+                    print(f"   -> [{esm_tag}] Loaded from cache")
+                    for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
                 else:
+                    print(f"   -> [{esm_tag}] Generating neural embeddings...")
+                    esm_dict, raw_embeddings_matrix = compute_esm_embeddings(seqs, esm_model_name, prefix=f"{col}_", esm_tag=esm_tag)
+                    if not is_inference: np.savez(esm_cache, **esm_dict)
+                    for k, v in esm_dict.items(): new_columns[k] = v; generated_features.append(k)
+                    
+                # ESM SVD50 Compression
+                if esm_tag == "ESM_Big_650M":
+                    svd_cache = os.path.join(cache_dir, f"{col}_{esm_tag}_SVD50_features_N{expected_dataset_len}.npz")
+                    svd_model_path = os.path.join(cache_dir, f"{col}_{esm_tag}_SVD50_model.joblib")
+                    
+                    cached_svd = _load_valid_cache(svd_cache, expected_dataset_len) if not is_inference else None
+                    
                     if is_inference:
-                        print(f"  -> Extracting 3D Propermab features...")
+                        # 🌟 INFERENCE: Must use pre-fitted model!
+                        svd_obj = svd_models_dict.get(f"{col}_{esm_tag}")
+                        if svd_obj:
+                            print(f"   -> [{esm_tag}_SVD50] Projecting new sequences using pre-fitted SVD...")
+                            svd_dict, _ = compress_embeddings_svd(raw_embeddings_matrix, prefix=f"{col}_", esm_tag=esm_tag, svd_model=svd_obj)
+                            for k, v in svd_dict.items(): new_columns[k] = v; generated_features.append(k)
+                        else:
+                            print(f"   -> ⚠️ [{esm_tag}_SVD50] ERROR: No fitted SVD model provided for inference!")
+                            
+                    elif cached_svd and os.path.exists(svd_model_path):
+                        # 🌟 CACHE HIT: Load features AND the model
+                        print(f"   -> [{esm_tag}_SVD50] Loaded features and SVD model from cache")
+                        svd_models_dict[f"{col}_{esm_tag}"] = joblib.load(svd_model_path)
+                        for k, v in cached_svd.items(): new_columns[k] = v; generated_features.append(k)
+                        
                     else:
-                        print(f"  -> Extracting 3D Structural Features using PROPERMAB (This takes time due to ABodyBuilder2 folding)...")
-                    
-                    pm_features_dict = {}
-                    all_pm_results = []
-                    total_samples = len(df_feat)
-                    
-                    for i, (idx, row) in enumerate(df_feat.iterrows()):
-                        print(f"     -> [Sample {i + 1}/{total_samples}] Predicting 3D structure and extracting features...")
-                        
-                        h_seq = str(row[hc_col]).strip()
-                        l_seq = str(row[lc_col]).strip()
-                        
-                        if h_seq == 'NAN' or l_seq == 'NAN' or not h_seq or not l_seq:
-                            print(f"        -> Skipped (Missing full Heavy or Light sequence)")
-                            all_pm_results.append({})
-                            continue
-                            
-                        try:
-                            # get_all_mol_features runs ABodyBuilder2 and calculates features like hyd_asa, pos_ann_index, etc.
-                            mol_feat = feature_utils.get_all_mol_features(h_seq, l_seq, num_runs=1)
-                            # mol_feat is a dict of lists. Take the first run [0]
-                            flat_feat = {f"Propermab_{k}": v[0] for k, v in mol_feat.items()}
-                            all_pm_results.append(flat_feat)
-                        except Exception as e:
-                            print(f"        -> Warning: Propermab structural prediction failed on row {idx}: {e}")
-                            all_pm_results.append({})
-                            
-                    # Convert list of dicts to a dict of arrays
-                    if all_pm_results:
-                        all_keys = set().union(*(d.keys() for d in all_pm_results))
-                        for k in all_keys:
-                            # Extract the feature for each row, defaulting to NaN if it failed
-                            arr = np.array([d.get(k, np.nan) for d in all_pm_results], dtype=float)
-                            # Fill NaNs with column mean for robustness
-                            if np.isnan(arr).any():
-                                arr[np.isnan(arr)] = np.nanmean(arr)
-                            pm_features_dict[k] = arr
-                    
-                    if not is_inference and pm_features_dict:
-                        np.savez(propermab_cache_file, **pm_features_dict)
-                    for k, v in pm_features_dict.items():
-                        new_columns[k] = v
-                        generated_features.append(k)
-            else:
-                if not is_inference:
-                    print(f"  -> PROPERMAB is installed, but sequence construction failed.")
+                        # 🌟 CACHE MISS: Fit new model, save features AND the model
+                        print(f"   -> [{esm_tag}_SVD50] Compressing 1280D to 50 dimensions using SVD...")
+                        if cached_dict:
+                            num_dims = len(cached_dict)
+                            raw_embeddings_matrix = np.zeros((expected_dataset_len, num_dims))
+                            for i in range(num_dims): raw_embeddings_matrix[:, i] = cached_dict[f'{col}_{esm_tag}_{i}']
+                                
+                        svd_dict, fitted_svd = compress_embeddings_svd(raw_embeddings_matrix, prefix=f"{col}_", esm_tag=esm_tag)
+                        if svd_dict and fitted_svd:
+                            np.savez(svd_cache, **svd_dict)
+                            joblib.dump(fitted_svd, svd_model_path)
+                            svd_models_dict[f"{col}_{esm_tag}"] = fitted_svd
+                            for k, v in svd_dict.items(): new_columns[k] = v; generated_features.append(k)
+                        else:
+                            print(f"   -> ⚠️ Dataset too small for SVD compression. Skipping.")
 
-        # # ==========================================
-        # # 🌟 NEW: GEORGIEV FEATURES EXTRACTION
-        # # ==========================================
-        # georgiev_cache_file = os.path.join(cache_dir, f"{col}_georgiev_features.npz")
-        # cached_dict = _load_valid_cache(georgiev_cache_file, expected_dataset_len)
-        
-        # if cached_dict:
-        #     print(f"  -> Loading Georgiev from cache: {col}")
-        #     for k, v in cached_dict.items():
-        #         new_columns[k] = v
-        #         if k not in generated_features:
-        #             generated_features.append(k)
-        # else:
-        #     print(f"  -> Calculating Georgiev for: {col}")
-        #     georgiev_features = []
-        #     for seq in df_feat[col]:
-        #         seq_str = str(seq).strip().upper()
-        #         if seq_str == 'NAN' or seq_str == 'NONE' or len(seq_str) == 0:
-        #             georgiev_features.append([0.0] * 19)
-        #         else:
-        #             seq_georgiev = []
-        #             for aa in seq_str:
-        #                 if aa in GEORGIEV_DICT:
-        #                     seq_georgiev.append(GEORGIEV_DICT[aa])
-                    
-        #             if len(seq_georgiev) > 0:
-        #                 # Average the 19 dimensions across the sequence length
-        #                 avg_georgiev = np.mean(seq_georgiev, axis=0).tolist()
-        #                 georgiev_features.append(avg_georgiev)
-        #             else:
-        #                 georgiev_features.append([0.0] * 19)
+        # 5. AntiBERTy
+        if 'antiberty' in active_features and ANTIBERTY_AVAILABLE:
+            antiberty_cache = os.path.join(cache_dir, f"{col}_AntiBERTy_features_N{expected_dataset_len}.npz")
+            cached_dict = _load_valid_cache(antiberty_cache, expected_dataset_len) if not is_inference else None
             
-        #     georgiev_features = np.array(georgiev_features)
-        #     new_features = {}
-        #     for i in range(19):
-        #         feat_name = f"{col}_Georgiev_PC{i+1}"
-        #         new_features[feat_name] = georgiev_features[:, i]
-                
-        #     if not is_inference: np.savez(georgiev_cache_file, **new_features)
-        #     for k, v in new_features.items():
-        #         new_columns[k] = v
-        #         if k not in generated_features:
-        #             generated_features.append(k)
+            if cached_dict:
+                print("   -> [AntiBERTy] Loaded from cache")
+                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+            else:
+                print("   -> [AntiBERTy] Generating antibody-specific embeddings...")
+                antiberty_dict = compute_antiberty_embeddings(seqs, prefix=f"{col}_")
+                if not is_inference: np.savez(antiberty_cache, **antiberty_dict)
+                for k, v in antiberty_dict.items(): new_columns[k] = v; generated_features.append(k)
+
+    # 6. AbLang2 PAIRED
+    if any(k in active_features for k in ['ablang2', 'ablang2_paired']) and ABLANG2_AVAILABLE:
+        print("\n⚙️  Processing region: Paired [Global_VH + Global_VL]")
+        ablang2_cache = os.path.join(cache_dir, f"Paired_VH_VL_AbLang2_features_N{expected_dataset_len}.npz")
+        cached_dict = _load_valid_cache(ablang2_cache, expected_dataset_len) if not is_inference else None
+        
+        if cached_dict:
+            print("   -> [AbLang2 Paired] Loaded from cache")
+            for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+        else:
+            print("   -> [AbLang2 Paired] Generating Heavy/Light joint embeddings...")
+            heavy_seqs = df_feat['Global_VH'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            light_seqs = df_feat['Global_VL'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            ablang_dict = compute_ablang2_paired_embeddings(heavy_seqs, light_seqs)
+            
+            if not is_inference: np.savez(ablang2_cache, **ablang_dict)
+            for k, v in ablang_dict.items(): new_columns[k] = v; generated_features.append(k)
+
+    # 7. PROPERMAB PHYSICS
+    if 'propermab' in active_features and PROPERMAB_AVAILABLE and 'Global_VH' in df_feat.columns and 'Global_VL' in df_feat.columns:
+        print("\n⚙️  Processing region: Propermab 3D Physics [Global_VH + Global_VL]")
+        propermab_cache = os.path.join(cache_dir, f"Propermab_features_N{expected_dataset_len}.npz")
+        cached_dict = _load_valid_cache(propermab_cache, expected_dataset_len) if not is_inference else None
+        
+        if cached_dict:
+            print("   -> [Propermab] Loaded from cache")
+            for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+        else:
+            print("   -> [Propermab] Generating 3D Structural Features (This takes ~30s per sequence)...")
+            heavy_seqs = df_feat['Global_VH'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            light_seqs = df_feat['Global_VL'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
+            
+            propermab_dict = compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_")
+            
+            if not is_inference: np.savez(propermab_cache, **propermab_dict)
+            for k, v in propermab_dict.items(): new_columns[k] = v; generated_features.append(k)
 
     if new_columns:
-        new_features_df = pd.DataFrame(new_columns)
-        df_feat = pd.concat([df_feat, new_features_df], axis=1)
+        df_feat = pd.concat([df_feat, pd.DataFrame(new_columns)], axis=1)
         
-    return df_feat, seq_cols, generated_features, aaindex_desc
+    print("\n✅ FEATURE EXTRACTION COMPLETE!")
+    return df_feat, seq_cols, generated_features, aaindex_desc, svd_models_dict
 
 def get_model(model_name, n_features, transform_type=None, weight_col=None):
-    """Returns a scikit-learn model/pipeline based on the requested name."""
-    scoring_dict = {
-        'rmse': 'neg_root_mean_squared_error',
-        'mae': 'neg_mean_absolute_error',
-        'r2': 'r2',
-        'spearman': make_scorer(custom_spearman)
-    }
+    scoring = {'rmse': 'neg_root_mean_squared_error', 'mae': 'neg_mean_absolute_error', 'r2': 'r2', 'spearman': make_scorer(custom_spearman)}
     
     if model_name == 'RandomForest':
-        base_model = RandomForestRegressor(n_estimators=100, random_state=42)
-        param_grid = {}
-        
+        base = RandomForestRegressor(n_estimators=100, random_state=42)
+        grid = {}
     elif model_name == 'PLSRegression':
-        base_model = Pipeline([
-            ('vt', VarianceThreshold()), 
-            ('scaler', StandardScaler()),
-            ('pls', PLSRegression())
-        ])
+        base = Pipeline([('vt', VarianceThreshold()), ('scaler', StandardScaler()), ('pls', PLSRegression())])
         max_comp = min(10, n_features)
-        if max_comp >= 2:
-            param_grid = {'pls__n_components': range(2, max_comp + 1)}
-        else:
-            base_model.set_params(pls__n_components=1)
-            param_grid = {}
-            
+        grid = {'pls__n_components': range(2, max_comp + 1)} if max_comp >= 2 else {}
+        if max_comp < 2: base.set_params(pls__n_components=1)
     elif model_name == 'ElasticNet':
-        base_model = Pipeline([
-            ('vt', VarianceThreshold()), 
-            ('scaler', StandardScaler()),
-            ('enet', ElasticNet(max_iter=10000, random_state=42))
-        ])
-        param_grid = {
-            'enet__alpha': [0.01, 0.1, 1.0, 10.0],
-            'enet__l1_ratio': [0.1, 0.5, 0.9]
-        }
-
+        base = Pipeline([('vt', VarianceThreshold()), ('scaler', StandardScaler()), ('enet', ElasticNet(max_iter=10000, random_state=42))])
+        grid = {'enet__alpha': [0.01, 0.1, 1.0, 10.0], 'enet__l1_ratio': [0.1, 0.5, 0.9]}
     elif model_name == 'SVR':
-        base_model = Pipeline([
-            ('vt', VarianceThreshold()), 
-            ('scaler', StandardScaler()),
-            ('svr', SVR())
-        ])
-        param_grid = {
-            'svr__kernel': ['linear', 'rbf'],
-            'svr__C': [0.001, 0.01, 0.1, 1.0]
-        }
-
+        base = Pipeline([('vt', VarianceThreshold()), ('scaler', StandardScaler()), ('svr', SVR())])
+        grid = {'svr__kernel': ['linear'], 'svr__C': [0.001, 0.01, 0.1, 1.0], 'svr__epsilon':[0.01, 0.1, 0.5, 1.0]}
     elif model_name == 'XGBoost':
-        base_model = Pipeline([
-            ('vt', VarianceThreshold()), 
+        base = Pipeline(steps=[
+            ('vt', VarianceThreshold()),
             ('scaler', StandardScaler()),
-            ('xgboost', XGBRegressor(random_state=42, objective='reg:squarederror'))
+            # n_jobs=1 inside the model prevents clashes with GridSearchCV's n_jobs=-1
+            ('model', XGBRegressor(random_state=42, n_jobs=1, objective='reg:squarederror'))
         ])
-        # Use the same prefix ('model__') as your other algorithms
-        param_grid = {
-            'xgboost__max_depth': [2, 3],
-            'xgboost__learning_rate': [0.05, 0.1],
-            'xgboost__n_estimators': [50, 100],
-            'xgboost__colsample_bytree': [0.3, 0.8]
-        }   
+        
+        # 🌟 STRICT REGULARIZATION GRID: Designed specifically to prevent scaffold memorization
+        grid = {
+            'model__n_estimators': [200],#[200],    
+            'model__max_depth': [3],#[6],               # VERY shallow trees (prevents complex memorization rules)
+            'model__learning_rate': [0.1],#[0.3],
+            'model__subsample': [0.8], #[1],          # Forces the model to ignore 20-40% of the sequences per tree
+            'model__colsample_bytree': [0.8], # [1]   # Forces the model to ignore 20-50% of the ESM features per tree
+            'model__reg_alpha': [0.1, 1.0],#[0]           # L1 (Lasso) Penalty to crush useless features to 0
+            'model__reg_lambda': [1.0, 5.0, 10.0] #[1.0]#    # L2 (Ridge) Penalty to keep feature weights small and stable
+        }
+        
     else:
-        raise ValueError(f"Model '{model_name}' is not supported.")
+        raise ValueError(f"Unsupported model_name: {model_name}")
 
-    # Wrap the base model using our new Custom Meta-Estimator!
-    model = SelfContainedTargetTransformRegressor(
-        regressor=base_model, 
-        transform_type=transform_type, 
-        weight_col=weight_col
-    )
+    model = SelfContainedTargetTransformRegressor(regressor=base, transform_type=transform_type, weight_col=weight_col)
+    grid = {f'regressor__{k}': v for k, v in grid.items()}
     
-    # Update param grid to point to the nested regressor
-    param_grid = {f'regressor__{k}': v for k, v in param_grid.items()}
+    return GridSearchCV(model, grid, cv=3, scoring=scoring, refit='spearman', n_jobs=1) if grid else model
 
-    if param_grid:
-        return GridSearchCV(model, param_grid, cv=3, scoring=scoring_dict, refit='spearman', n_jobs=1)
-    else:
-        return model
+def plot_enrichment_comparison(y_true, y_pred, target_col, ax=None, top_quantile=0.2):
+    if ax is None: fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Flatten arrays to prevent multi-dimensional Pandas errors
+    y_true_flat = np.asarray(y_true).flatten()
+    y_pred_flat = np.asarray(y_pred).flatten()
+    
+    df = pd.DataFrame({'Actual': y_true_flat, 'Predicted': y_pred_flat})
+    total_library = len(df)
+    target_lower = target_col.lower()
+    lower_is_better = any(t in target_lower for t in ['hmw', 'agg', 'viscosity', 'lmw', 'hcp', 'clearance'])
+    
+    df_sorted = df.sort_values(by='Predicted', ascending=lower_is_better).reset_index(drop=True)
+    total_samples = len(df)
+    
+    true_top_threshold = df['Actual'].quantile(top_quantile) if lower_is_better else df['Actual'].quantile(1 - top_quantile)
+    
+    enrichment_counts = []
+    x_abs_counts = list(range(1, total_samples + 1))
+    
+    for k in x_abs_counts:
+        top_k = df_sorted.head(k)
+        if lower_is_better: hits = (top_k['Actual'] <= true_top_threshold).sum()
+        else: hits = (top_k['Actual'] >= true_top_threshold).sum()
+        enrichment_counts.append(hits)
+    total_top_performers = enrichment_counts[-1]    
+    random_expected = [k * top_quantile for k in x_abs_counts]
+    
+    ax.plot(x_abs_counts, enrichment_counts, label=f'Model Selection Hits', color='blue', lw=2.5)
+    ax.plot(x_abs_counts, random_expected, 'k--', label='Random Selection (Expected)', lw=2)
+    
+    # 🌟 NEW: Shade the area between the model and random expectation to highlight the Enrichment Gain!
+    ax.fill_between(x_abs_counts, enrichment_counts, random_expected, color='dodgerblue', alpha=0.15)
 
-def plot_target_distribution(y, target_col, transform_type, output_dir, optimal_lambda=None, feature_tag=""):
-    """Plots the target distribution with enhanced statistical overlays and percentiles."""
-    transform_suffix = f"_{transform_type}" if transform_type else ""
+    # 🌟 NEW: Set strict boundaries to frame the plot perfectly
+    
+    ax.set_xlim(0, total_library+1)
+    ax.set_ylim(0, total_top_performers+1)
+    
+    # 🌟 NEW: Force the exact max integers on the X-axis (preventing text overlap)
+    x_ticks = [int(t) for t in ax.get_xticks() if 0 <= t < total_library * 0.95]
+    x_ticks.append(total_library)
+    ax.set_xticks(x_ticks)
+    
+    # 🌟 NEW: Force the exact max integers on the Y-axis
+    y_ticks = [int(t) for t in ax.get_yticks() if 0 <= t < total_top_performers * 0.95]
+    y_ticks.append(total_top_performers)
+    ax.set_yticks(y_ticks)
+    
+    ax.set_title(f'Enrichment of Top {int(top_quantile*100)}% Hits\n({target_col})', fontsize=14)
+    ax.set_xlabel('Number of Antibodies Synthesized / Tested', fontsize=12)
+    ax.set_ylabel('Absolute Number of True Hits Discovered', fontsize=12)
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+
+def plot_best_model_diagnostics(X, y, subregions_name, features_name, model_name, target_col, output_dir, final_estimator, 
+                                best_params=None, feature_tag="", prefix="", top_quantile=0.2, hue_data=None, hue_name=None):
+    """Clean 2x2 Grid: Scatter + Enrichment Plot + PR-AUC Sweep + ROC-AUC Sweep."""
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    print(f"\nGenerating 2x2 diagnostic grid for {subregions_name} + {features_name}...")
+    
+    # 🌟 EXPANDED: 2x2 Grid
+    fig, axes = plt.subplots(2, 2, figsize=(18, 16))
+    ax_scatter, ax_enrich = axes[0, 0], axes[0, 1]
+    ax_pr, ax_roc = axes[1, 0], axes[1, 1]
+    
+    title_text = f"Diagnostic Analysis: {target_col}\nModel: {model_name}  |  Regions: [{subregions_name}]  | Features: [{features_name}]"
+    fig.suptitle(title_text, fontsize=18, y=1.02, fontweight='bold')
+    
+    try:
+        # Cross-validation for the plots
+        loo = 5
+        cv_preds = cross_val_predict(final_estimator, X, y, cv=loo, n_jobs=-1)
+        
+        y_flat = np.asarray(y).flatten()
+        cv_preds_flat = np.asarray(cv_preds).flatten()
+        
+        # ==========================================
+        # PANEL 1 (Top Left): PREDICTED VS ACTUAL
+        # ==========================================
+        c_r2 = r2_score(y_flat, cv_preds_flat)
+        c_rmse = np.sqrt(mean_squared_error(y_flat, cv_preds_flat))
+        c_mae = mean_absolute_error(y_flat, cv_preds_flat)
+        c_spear = custom_spearman(y_flat, cv_preds_flat)
+        
+        metrics_text = f"Spearman: {c_spear:.3f}\nR² Score: {c_r2:.3f}\nRMSE: {c_rmse:.2f}\nMAE: {c_mae:.2f}"
+        if best_params: metrics_text += "\n\nHyperparameters:\n" + "\n".join([f"{k.split('__')[-1]}: {v}" for k, v in best_params.items()])
+            
+        plot_df = pd.DataFrame({'Actual': y_flat, 'Predicted': cv_preds_flat})
+            
+        if hue_data is not None and hue_name is not None:
+            plot_df[hue_name] = np.asarray(hue_data).flatten()
+            sns.scatterplot(data=plot_df, x='Actual', y='Predicted', hue=hue_name, palette='tab10', ax=ax_scatter, alpha=0.8, edgecolor='k', s=80)
+        else:
+            sns.scatterplot(data=plot_df, x='Actual', y='Predicted', ax=ax_scatter, alpha=0.8, edgecolor='k', s=80, color='dodgerblue')
+        
+        min_val, max_val = min(y_flat.min(), cv_preds_flat.min()), max(y_flat.max(), cv_preds_flat.max())
+        ax_scatter.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, label="Perfect Prediction")
+        
+        props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9, edgecolor='gray')
+        ax_scatter.text(0.05, 0.95, metrics_text, transform=ax_scatter.transAxes, fontsize=11, verticalalignment='top', bbox=props)
+        ax_scatter.set_title('Predicted vs Actual (5-Fold CV)')
+        ax_scatter.legend(loc='lower right')
+
+        # ==========================================
+        # PANEL 2 (Top Right): ENRICHMENT PLOT
+        # ==========================================
+        plot_enrichment_comparison(y_flat, cv_preds_flat, target_col, ax=ax_enrich, top_quantile=top_quantile)
+        
+        # ==========================================
+        # PANELS 3 & 4 (Bottom): PR-AUC & ROC-AUC SWEEPS
+        # ==========================================
+        target_lower = target_col.lower()
+        lower_is_better = any(t in target_lower for t in ['hmw', 'agg', 'viscosity', 'lmw', 'hcp', 'clearance', 'poly'])
+        
+        thresholds = np.linspace(np.percentile(y_flat, 10), np.percentile(y_flat, 90), 40)
+        pr_aucs, roc_aucs, baselines, valid_t = [], [], [], []
+        
+        for t in thresholds:
+            if lower_is_better:
+                y_bin = (y_flat <= t).astype(int)
+                y_score = -cv_preds_flat 
+            else:
+                y_bin = (y_flat >= t).astype(int)
+                y_score = cv_preds_flat
+                
+            if len(np.unique(y_bin)) == 2:
+                prauc = average_precision_score(y_bin, y_score)
+                rocauc = roc_auc_score(y_bin, y_score)
+                baseline = y_bin.mean() 
+                
+                pr_aucs.append(prauc)
+                roc_aucs.append(rocauc)
+                baselines.append(baseline)
+                valid_t.append(t)
+        
+        if valid_t:
+            # PR-AUC Plot
+            ax_pr.plot(valid_t, pr_aucs, label='Model PR-AUC', color='darkviolet', lw=2.5)
+            ax_pr.plot(valid_t, baselines, 'k--', label='Random Baseline (Prevalence)', lw=2)
+            ax_pr.fill_between(valid_t, pr_aucs, baselines, color='darkviolet', alpha=0.15)
+            ax_pr.set_title(f'Robustness: PR-AUC vs Cutoff\n({target_col})', fontsize=14)
+            ax_pr.set_xlabel(f'{target_col} Cutoff', fontsize=12)
+            ax_pr.set_ylabel('Precision-Recall AUC', fontsize=12)
+            ax_pr.legend(loc='best')
+            ax_pr.grid(True, alpha=0.3)
+            
+            # ROC-AUC Plot
+            ax_roc.plot(valid_t, roc_aucs, label='Model ROC-AUC', color='forestgreen', lw=2.5)
+            ax_roc.plot(valid_t, [0.5]*len(valid_t), 'k--', label='Random Baseline (0.5)', lw=2)
+            ax_roc.fill_between(valid_t, roc_aucs, [0.5]*len(valid_t), color='forestgreen', alpha=0.15)
+            ax_roc.set_title(f'Robustness: ROC-AUC vs Cutoff\n({target_col})', fontsize=14)
+            ax_roc.set_xlabel(f'{target_col} Cutoff', fontsize=12)
+            ax_roc.set_ylabel('ROC AUC', fontsize=12)
+            ax_roc.legend(loc='lower right')
+            ax_roc.grid(True, alpha=0.3)
+        else:
+            for ax in [ax_pr, ax_roc]:
+                ax.text(0.5, 0.5, "Insufficient variance\nfor Threshold Sweeps", ha='center', va='center')
+                ax.set_title("AUC Sweeps")
+            
+    except Exception as e: print(f"Warning: Plot failed: {e}")
+        
+    plt.tight_layout()
     feat_suffix = f"_{feature_tag}" if feature_tag else ""
-    
-    if transform_type == 'log1p':
-        y_transformed = np.log1p(y)
-        transform_title = "Log1p"
-    elif transform_type == 'weighted-yeo-johnson' and optimal_lambda is not None:
-        pt = CustomYeoJohnsonTransformer(lmbda=optimal_lambda)
-        y_transformed = pt.transform(y.values.reshape(-1, 1)).flatten()
-        y_transformed = pd.Series(y_transformed) # Keep as series for easy pandas stats
-        transform_title = f"Weighted Yeo-Johnson (λ={optimal_lambda:.2f})"
-    elif transform_type in ['box-cox', 'yeo-johnson']:
-        pt = PowerTransformer(method=transform_type)
-        y_transformed = pt.fit_transform(y.values.reshape(-1, 1)).flatten()
-        y_transformed = pd.Series(y_transformed)
-        transform_title = transform_type.title()
-    else:
-        y_transformed = y
-
-    fig, axes = plt.subplots(1, 2 if transform_type else 1, figsize=(16 if transform_type else 8, 7))
-    
-    ax_orig = axes[0] if transform_type else axes
-    ax_trans = axes[1] if transform_type else None
-
-    # --- Plot 1: Original Data ---
-    sns.histplot(y, kde=True, ax=ax_orig, color='royalblue', bins=15, alpha=0.6)
-    
-    # Calculate key statistics
-    mean_val = y.mean()
-    median_val = y.median()
-    p20 = np.percentile(y, 20)
-    p80 = np.percentile(y, 80)
-    
-    # Overlay lines for Mean, Median, and our Enrichment Percentiles
-    ax_orig.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_val:.2f}')
-    ax_orig.axvline(median_val, color='darkorange', linestyle='-', linewidth=2, label=f'Median: {median_val:.2f}')
-    ax_orig.axvline(p20, color='gray', linestyle=':', linewidth=2, label=f'20th Pctl: {p20:.2f}')
-    ax_orig.axvline(p80, color='gray', linestyle=':', linewidth=2, label=f'80th Pctl: {p80:.2f}')
-    
-    ax_orig.set_title(f'Original Distribution\n{target_col}', fontsize=14)
-    ax_orig.set_xlabel(target_col, fontsize=12)
-    ax_orig.set_ylabel('Frequency', fontsize=12)
-    ax_orig.legend(loc='upper right')
-
-    # Add a clean statistics text box
-    stats_text = (
-        f"N = {len(y)}\n"
-        f"Std Dev = {y.std():.2f}\n"
-        f"Skewness = {y.skew():.2f}\n"
-        f"Min = {y.min():.2f}\n"
-        f"Max = {y.max():.2f}"
-    )
-    props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='gray')
-    ax_orig.text(0.05, 0.95, stats_text, transform=ax_orig.transAxes, 
-                 fontsize=11, verticalalignment='top', bbox=props)
-
-    # --- Plot 2: Transformed Data (If Applicable) ---
-    if transform_type:
-        sns.histplot(y_transformed, kde=True, ax=ax_trans, color='seagreen', bins=15, alpha=0.6)
-        
-        t_mean = y_transformed.mean()
-        t_median = y_transformed.median()
-        t_p20 = np.percentile(y_transformed, 20)
-        t_p80 = np.percentile(y_transformed, 80)
-        
-        ax_trans.axvline(t_mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {t_mean:.2f}')
-        ax_trans.axvline(t_median, color='darkorange', linestyle='-', linewidth=2, label=f'Median: {t_median:.2f}')
-        ax_trans.axvline(t_p20, color='gray', linestyle=':', linewidth=2, label=f'20th Pctl: {t_p20:.2f}')
-        ax_trans.axvline(t_p80, color='gray', linestyle=':', linewidth=2, label=f'80th Pctl: {t_p80:.2f}')
-        
-        ax_trans.set_title(f'{transform_title} Transformed Distribution\n{target_col}', fontsize=14)
-        ax_trans.set_xlabel(f'Transformed {target_col}', fontsize=12)
-        ax_trans.set_ylabel('Frequency', fontsize=12)
-        ax_trans.legend(loc='upper right')
-        
-        t_stats_text = (
-            f"N = {len(y_transformed)}\n"
-            f"Std Dev = {y_transformed.std():.2f}\n"
-            f"Skewness = {pd.Series(y_transformed).skew():.2f}\n"
-            f"Min = {y_transformed.min():.2f}\n"
-            f"Max = {y_transformed.max():.2f}"
-        )
-        ax_trans.text(0.05, 0.95, t_stats_text, transform=ax_trans.transAxes, 
-                      fontsize=11, verticalalignment='top', bbox=props)
-                      
-        fig.suptitle(f'Target Distribution Comparison: Original vs. {transform_title}', fontsize=16, y=0.98)
-    else:
-        fig.suptitle(f'Target Distribution Analysis: {target_col}', fontsize=16, y=0.98)
-        
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
-    plot_filename = os.path.join(output_dir, f'target_dist_{target_col}{transform_suffix}{feat_suffix}.png')
-    plt.savefig(plot_filename, dpi=300, facecolor='white')
+    plt.savefig(os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{feat_suffix}_diagnostics.png'), dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
-    print(f"Saved target distribution plot to '{plot_filename}'")
 
-def plot_best_model_diagnostics(X, y, combo_name, model_name, target_col, output_dir, final_estimator, best_params=None, threshold=None, transform_type=None, feature_tag="", type_labels=None, type_col_name=None, prefix="", top_quantile=0.2):
-    """Generates diagnostic and learning curve plots for the best model."""
+def plot_best_model_diagnostics_old(X, y, subregions_name, features_name, model_name, target_col, output_dir, final_estimator, best_params=None, threshold=None, transform_type=None, feature_tag="", hue_data=None, hue_name=None, prefix="", top_quantile=0.2):
+    """Generates the massive 3x3 diagnostic and learning curve plots for the best model."""
     transform_suffix = f"_{transform_type}" if transform_type else ""
     feat_suffix = f"_{feature_tag}" if feature_tag else ""
     title_tag = f" ({transform_type.title()} Transformed)" if transform_type else ""
     
-    print(f"\nGenerating diagnostic plots for the best model ({combo_name}) using {model_name} on {target_col}{title_tag}...")
+    combo_name = f"{subregions_name} | {features_name}"
+    print(f"\nGenerating EXTENDED diagnostic plots for ({combo_name}) using {model_name} on {target_col}{title_tag}...")
     
     # 🌟 EXPANDED: 3x3 Grid (9 slots total)
     fig, axes = plt.subplots(2, 3, figsize=(24, 12))
     fig.suptitle(f'Diagnostic Plots: Best Model ({combo_name} | {model_name} | {target_col}){title_tag}', fontsize=18, y=0.98)
-    
+
     try:
         loo = LeaveOneOut()
         cv_preds = cross_val_predict(final_estimator, X, y, cv=loo, n_jobs=-1)
-        residuals = y - cv_preds
-        
-        calc_r2 = r2_score(y, cv_preds)
-        calc_rmse = np.sqrt(mean_squared_error(y, cv_preds))
-        calc_mae = mean_absolute_error(y, cv_preds)
-        calc_spearman = custom_spearman(y, cv_preds)
-        
+
+        # 🌟 NEW: Safely flatten arrays before scikit-learn metrics
+        y_flat = np.asarray(y).flatten()
+        cv_preds_flat = np.asarray(cv_preds).flatten()
+        residuals = y_flat - cv_preds_flat
+        calc_r2 = r2_score(y_flat, cv_preds_flat)
+        calc_rmse = np.sqrt(mean_squared_error(y_flat, cv_preds_flat))
+        calc_mae = mean_absolute_error(y_flat, cv_preds_flat)
+        calc_spearman = custom_spearman(y_flat, cv_preds_flat)
         if threshold is None:
-            threshold = np.median(y)
+            threshold = np.median(y_flat)
             
-        y_binary = (y >= threshold).astype(int)
-        cv_preds_binary = (cv_preds >= threshold).astype(int)
-        
+        y_binary = (y_flat >= threshold).astype(int)
+        cv_preds_binary = (cv_preds_flat >= threshold).astype(int)
         acc = accuracy_score(y_binary, cv_preds_binary)
         prec = precision_score(y_binary, cv_preds_binary, zero_division=0)
         rec = recall_score(y_binary, cv_preds_binary, zero_division=0)
         f1 = f1_score(y_binary, cv_preds_binary, zero_division=0)
         cm = confusion_matrix(y_binary, cv_preds_binary)
-        
+
         try:
-            roc_auc = roc_auc_score(y_binary, cv_preds)
-            pr_auc = average_precision_score(y_binary, cv_preds)
+            roc_auc = roc_auc_score(y_binary, cv_preds_flat)
+            pr_auc = average_precision_score(y_binary, cv_preds_flat)
             auc_text = f"ROC-AUC: {roc_auc:.2f} | PR-AUC: {pr_auc:.2f}\n"
         except ValueError:
             auc_text = "ROC/PR-AUC: N/A (Single Class)\n"
-        
+            
         metrics_text = (
             f"Spearman: {calc_spearman:.3f}\n"
             f"R²: {calc_r2:.3f}\n"
             f"RMSE: {calc_rmse:.2f}\n"
             f"MAE: {calc_mae:.2f}"
         )
-        
+
         metrics_text += f"\n\nBinary Eval (Cutoff: {threshold:.2f}):\n{auc_text}Acc: {acc:.2f} | F1: {f1:.2f} | P: {prec:.2f} | R: {rec:.2f}"
-        
         if best_params:
             params_str = "\n".join([f"{k.split('__')[-1]}: {v}" for k, v in best_params.items()])
             metrics_text += f"\n\nOptimal Params:\n{params_str}"
-        
+            
         # ==========================================
         # ROW 1: REGRESSION ACCURACY & ERROR
         # ==========================================
-        
+
         classification_labels = []
-        for actual, pred in zip(y, cv_preds):
+        for actual, pred in zip(y_flat, cv_preds_flat):
             if actual >= threshold and pred >= threshold:
                 classification_labels.append('True Positive (TP)')
             elif actual < threshold and pred < threshold:
@@ -1072,37 +1004,36 @@ def plot_best_model_diagnostics(X, y, combo_name, model_name, target_col, output
                 classification_labels.append('False Positive (FP)')
             else:
                 classification_labels.append('False Negative (FN)')
-                
-        plot_df = pd.DataFrame({'Actual': y, 'Predicted': cv_preds, 'Classification': classification_labels})
-        
+        plot_df = pd.DataFrame({'Actual': y_flat, 'Predicted': cv_preds_flat, 'Classification': classification_labels})
+        plot_df_res = pd.DataFrame({'Predicted': cv_preds_flat, 'Residuals': residuals})
+
         style_col = None
-        if type_labels is not None:
-            style_col = type_col_name if type_col_name else 'Antibody Type'
-            plot_df[style_col] = type_labels
-        
+
+        if hue_data is not None and hue_name is not None:
+            style_col = hue_name
+            plot_df[style_col] = np.asarray(hue_data).flatten()
+            plot_df_res[style_col] = np.asarray(hue_data).flatten()
+
         custom_palette = {
             'True Negative (TN)': '#2ca02c', 'True Positive (TP)': '#d62728',
             'False Positive (FP)': '#ff7f0e', 'False Negative (FN)': '#1f77b4'
         }
-        
+
         # --- Plot 1: Predicted vs Actual ---
-        sns.scatterplot(data=plot_df, x='Actual', y='Predicted', hue='Classification', 
+        sns.scatterplot(data=plot_df, x='Actual', y='Predicted', hue='Classification',
                         style=style_col, palette=custom_palette, ax=axes[0, 0], alpha=0.8, edgecolor='k', s=60)
         axes[0, 0].axvline(threshold, color='gray', linestyle=':', linewidth=1.5, label=f'Threshold ({threshold:.1f})')
         axes[0, 0].axhline(threshold, color='gray', linestyle=':', linewidth=1.5)
-        min_val = min(y.min(), cv_preds.min())
-        max_val = max(y.max(), cv_preds.max())
+        min_val = min(y_flat.min(), cv_preds_flat.min())
+        max_val = max(y_flat.max(), cv_preds_flat.max())
         axes[0, 0].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5)
         axes[0, 0].set_title(f'Predicted vs Actual {target_col} (LOO CV)')
         axes[0, 0].set_xlabel(f'Actual {target_col}')
         axes[0, 0].set_ylabel(f'Predicted {target_col} (Out-of-Fold)')
         axes[0, 0].legend(loc='lower right', fontsize=9)
-        
+
         # --- Plot 2: Residuals vs Predicted ---
-        plot_df_res = pd.DataFrame({'Predicted': cv_preds, 'Residuals': residuals})
-        if style_col:
-            plot_df_res[style_col] = type_labels
-        sns.scatterplot(data=plot_df_res, x='Predicted', y='Residuals', 
+        sns.scatterplot(data=plot_df_res, x='Predicted', y='Residuals',
                         style=style_col, color='purple', ax=axes[0, 1], alpha=0.7, edgecolor='k', s=60)
         axes[0, 1].axhline(0, color='r', linestyle='--')
         axes[0, 1].set_title('Residuals vs Predicted')
@@ -1110,18 +1041,15 @@ def plot_best_model_diagnostics(X, y, combo_name, model_name, target_col, output
         axes[0, 1].set_ylabel('Residuals (Actual - Predicted)')
         if style_col:
             axes[0, 1].legend(loc='lower right', fontsize=9)
-            
         # --- Plot 3: Distribution of Residuals ---
         sns.histplot(residuals, kde=True, ax=axes[0, 2], color='purple', bins=15)
         axes[0, 2].axvline(0, color='r', linestyle='--')
         axes[0, 2].set_title('Distribution of Residuals')
         axes[0, 2].set_xlabel(f'Residual Error {target_col}')
         axes[0, 2].set_ylabel('Frequency')
-
         # ==========================================
         # ROW 2: TRANSLATIONAL VALUE & RANKING
         # ==========================================
-
         # --- Plot 4: Confusion Matrix ---
         dummy_matrix = np.array([[0, 1], [2, 3]])
         cm_cmap = ListedColormap(['#2ca02c', '#ff7f0e', '#1f77b4', '#d62728'])
@@ -1132,1004 +1060,935 @@ def plot_best_model_diagnostics(X, y, combo_name, model_name, target_col, output
         axes[1, 0].set_title(f'Classification Confusion Matrix\n(Threshold = {threshold:.2f})')
         axes[1, 0].set_xlabel('Predicted Class')
         axes[1, 0].set_ylabel('Actual Class')
-
-        # --- Plot 5: 🌟 CALLING THE ENRICHMENT HELPER FUNCTION ---
-        # plot_enrichment_comparison(y, cv_preds, target_col, ax=axes[1, 1], top_quantile=top_quantile)
-
-        # --- Plot 6: 🌟 CALLING THE HIT RATE HELPER FUNCTION ---
-        # plot_hit_rate_curve(y, cv_preds, target_col, ax=axes[1, 1], top_quantile=top_quantile)
-        plot_enrichment_comparison(y, cv_preds, target_col, ax=axes[1, 1], top_quantile=top_quantile)
+        # --- Plot 5: Enrichment Comparison ---
+        plot_enrichment_comparison(y_flat, cv_preds_flat, target_col, ax=axes[1, 1], top_quantile=top_quantile)
         # ==========================================
         # ROW 3: SUMMARY & METRICS DASHBOARD
         # ==========================================
-        
-        # axes[2, 0].axis('off')
-        # axes[2, 2].axis('off')
-        
         axes[1, 2].axis('off')  
         props = dict(boxstyle='round,pad=1', facecolor='#f8f9fa', alpha=1.0, edgecolor='gray', linewidth=2)
         axes[1, 2].text(0.5, 0.5, metrics_text, transform=axes[1, 2].transAxes,
                         fontsize=14, verticalalignment='center', horizontalalignment='center', bbox=props)
         axes[1, 2].set_title("Model Performance Summary", fontsize=16, pad=20)
-        
     except Exception as e:
         print(f"Warning: Could not generate LOO predictions due to mathematical failure: {e}")
         for row in range(2):
             for col in range(3):
                 axes[row, col].set_title("Plot Failed")
                 axes[row, col].text(0.5, 0.5, f"Error: {e}", ha='center', va='center', wrap=True)
-    
     plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-    plot_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_diagnostics.png')
+    plot_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_EXTENDED_diagnostics.png')
+
     plt.savefig(plot_filename, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
-    print(f"Saved '{plot_filename}'")
+    print(f"Saved Extended Plot '{plot_filename}'")
+    
+    # print("Generating comprehensive learning curves (this takes a moment)...")
+    # fig_lc, axes_lc = plt.subplots(2, 2, figsize=(16, 12))
+    # fig_lc.suptitle(f'Learning Curves: Best Model ({combo_name} | {model_name} | {target_col}){title_tag}', fontsize=16)
+    # metrics_to_plot = {
+    #     'Negative RMSE': 'neg_root_mean_squared_error',
+    #     'Negative MAE': 'neg_mean_absolute_error',
+    #     'R2 Score': 'r2',
+    #     'Spearman Correlation': make_scorer(custom_spearman)
+    # }
+    # try:
+    #     for ax, (name, scorer) in zip(axes_lc.flatten(), metrics_to_plot.items()):
+    #         LearningCurveDisplay.from_estimator(
+    #             final_estimator, X, y, cv=5, n_jobs=-1,
+    #             train_sizes=np.linspace(0.2, 1.0, 10),
+    #             scoring=scorer,
+    #             error_score=np.nan,
+    #             ax=ax
+    #         )
+    #         ax.set_title(f'Learning Curve ({name})')
+    #         ax.legend(loc='best')
+    # except Exception as e:
+    #     print(f"    -> Warning: Learning curves failed due to math error: {e}")
+    #     for ax in axes_lc.flatten():
+    #         ax.set_title("Learning Curve Failed")
+    # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    # lc_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_learning_curves.png')
+    # plt.savefig(lc_filename, dpi=300, facecolor='white')
+    # plt.close()
+    # print(f"Saved Learning Curves '{lc_filename}'") 
 
-    print("Generating comprehensive learning curves (this takes a moment)...")
-    fig_lc, axes_lc = plt.subplots(2, 2, figsize=(16, 12))
-    fig_lc.suptitle(f'Learning Curves: Best Model ({combo_name} | {model_name} | {target_col}){title_tag}', fontsize=16)
+def plot_out_of_group_diagnostics(X, y, group_labels, subregions_name, features_name, model_name, target_col, output_dir, final_estimator, feature_tag="", prefix="", split_col_name=""):
+    """Trains on Group A -> Tests on all other Groups. Plots the out-of-group generalization in consolidated subplots."""
     
-    metrics_to_plot = {
-        'Negative RMSE': 'neg_root_mean_squared_error',
-        'Negative MAE': 'neg_mean_absolute_error',
-        'R2 Score': 'r2',
-        'Spearman Correlation': make_scorer(custom_spearman)
-    }
+    print(f"\nGenerating Out-of-Group (OOG) diagnostic plots for {target_col}...")
     
-    try:
-        for ax, (name, scorer) in zip(axes_lc.flatten(), metrics_to_plot.items()):
-            LearningCurveDisplay.from_estimator(
-                final_estimator, X, y, cv=5, n_jobs=-1,
-                train_sizes=np.linspace(0.2, 1.0, 10),
-                scoring=scorer,
-                score_name=name,
-                error_score=np.nan,
-                ax=ax
-            )
-            ax.set_title(f'Learning Curve ({name})')
-            ax.legend(loc='best')
-    except Exception as e:
-        print(f"    -> Warning: Learning curves failed due to math error: {e}")
-        for ax in axes_lc.flatten():
-            ax.set_title("Learning Curve Failed")
-            
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    lc_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_learning_curves.png')
-    plt.savefig(lc_filename, dpi=300, facecolor='white')
-    plt.close()
-    print(f"Saved '{lc_filename}'")
-
-def plot_best_model_diagnostics2(X, y, combo_name, model_name, target_col, output_dir, final_estimator, best_params=None, threshold=None, transform_type=None, feature_tag="", type_labels=None, type_col_name=None, prefix="", top_quantile=0.2):
-    """Generates diagnostic and learning curve plots for the best model."""
-    transform_suffix = f"_{transform_type}" if transform_type else ""
-    feat_suffix = f"_{feature_tag}" if feature_tag else ""
-    title_tag = f" ({transform_type.title()} Transformed)" if transform_type else ""
+    group_labels = np.asarray(group_labels).flatten()
+    y_flat = np.asarray(y).flatten()
     
-    print(f"\nGenerating diagnostic plots for the best model ({combo_name}) using {model_name} on {target_col}{title_tag}...")
+    # --- NEW: Filter out ignored/empty groups ---
+    # Catch explicit ignore tags, as well as Pandas NaNs and empty strings
+    ignore_values = ['IGNORE', 'EXCLUDE']#, 'NA', 'NAN', 'NONE', '']
     
-    # 🌟 NEW: Clean 1x2 Grid with performance summary overlaid on the scatter plot
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-    fig.suptitle(f'Diagnostic Plots: Best Model ({combo_name} | {model_name} | {target_col}){title_tag}', fontsize=18, y=1.05)
-    
-    try:
-        loo = LeaveOneOut()
-        cv_preds = cross_val_predict(final_estimator, X, y, cv=loo, n_jobs=-1)
-        
-        calc_r2 = r2_score(y, cv_preds)
-        calc_rmse = np.sqrt(mean_squared_error(y, cv_preds))
-        calc_mae = mean_absolute_error(y, cv_preds)
-        calc_spearman = custom_spearman(y, cv_preds)
-        
-        metrics_text = (
-            f"Spearman Correlation: {calc_spearman:.3f}\n"
-            f"R² Score: {calc_r2:.3f}\n"
-            f"RMSE: {calc_rmse:.2f}\n"
-            f"MAE: {calc_mae:.2f}"
-        )
-        
-        if best_params:
-            params_str = "\n".join([f"{k.split('__')[-1]}: {v}" for k, v in best_params.items()])
-            metrics_text += f"\n\nOptimal Hyperparameters:\n{params_str}"
-        
-        # ==========================================
-        # REGRESSION ACCURACY, SUMMARY & ENRICHMENT
-        # ==========================================
-        
-        # --- Plot 1: Predicted vs Actual (Color-Coded by CSV Column) ---
-        plot_df = pd.DataFrame({'Actual': y, 'Predicted': cv_preds})
-        
-        hue_col = None
-        if type_labels is not None and type_col_name is not None:
-            hue_col = type_col_name
-            plot_df[hue_col] = type_labels
-            
-        sns.scatterplot(data=plot_df, x='Actual', y='Predicted', hue=hue_col, 
-                        palette='tab10' if hue_col else None, ax=axes[0], alpha=0.8, edgecolor='k', s=80)
-        
-        min_val = min(y.min(), cv_preds.min())
-        max_val = max(y.max(), cv_preds.max())
-        axes[0].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, label="Perfect Prediction (y=x)")
-        axes[0].set_title(f'Predicted vs Actual {target_col} (LOO CV)')
-        axes[0].set_xlabel(f'Actual {target_col}')
-        axes[0].set_ylabel(f'Predicted {target_col} (Out-of-Fold)')
-        
-        # Overlay the performance summary text box inside the upper left of the scatter plot
-        props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9, edgecolor='gray')
-        axes[0].text(0.05, 0.95, metrics_text, transform=axes[0].transAxes,
-                     fontsize=10, verticalalignment='top', bbox=props)
-
-        # Move legend to lower right to avoid colliding with the text box
-        if hue_col:
-            axes[0].legend(loc='lower right', fontsize=10, title=hue_col)
+    valid_mask = []
+    for val in group_labels:
+        if pd.isna(val):
+            valid_mask.append(False)
+        elif str(val).strip().upper() in ignore_values:
+            valid_mask.append(False)
         else:
-            axes[0].legend(loc='lower right', fontsize=10)
-
-        # --- Plot 2: Enrichment Curve ---
-        plot_enrichment_comparison(y, cv_preds, target_col, ax=axes[1], top_quantile=top_quantile)
-        
-    except Exception as e:
-        print(f"Warning: Could not generate LOO predictions due to mathematical failure: {e}")
-        for col in range(2):
-            axes[col].set_title("Plot Failed")
-            axes[col].text(0.5, 0.5, f"Error: {e}", ha='center', va='center', wrap=True)
-    
-    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-    plot_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_diagnostics.png')
-    plt.savefig(plot_filename, dpi=300, bbox_inches='tight', facecolor='white')
-    plt.close()
-    print(f"Saved '{plot_filename}'")
-
-    print("Generating comprehensive learning curves (this takes a moment)...")
-    fig_lc, axes_lc = plt.subplots(2, 2, figsize=(16, 12))
-    fig_lc.suptitle(f'Learning Curves: Best Model ({combo_name} | {model_name} | {target_col}){title_tag}', fontsize=16)
-    
-    metrics_to_plot = {
-        'Negative RMSE': 'neg_root_mean_squared_error',
-        'Negative MAE': 'neg_mean_absolute_error',
-        'R2 Score': 'r2',
-        'Spearman Correlation': make_scorer(custom_spearman)
-    }
-    
-    try:
-        for ax, (name, scorer) in zip(axes_lc.flatten(), metrics_to_plot.items()):
-            LearningCurveDisplay.from_estimator(
-                final_estimator, X, y, cv=5, n_jobs=-1,
-                train_sizes=np.linspace(0.2, 1.0, 10),
-                scoring=scorer,
-                score_name=name,
-                error_score=np.nan,
-                ax=ax
-            )
-            ax.set_title(f'Learning Curve ({name})')
-            ax.legend(loc='best')
-    except Exception as e:
-        print(f"    -> Warning: Learning curves failed due to math error: {e}")
-        for ax in axes_lc.flatten():
-            ax.set_title("Learning Curve Failed")
+            valid_mask.append(True)
             
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    lc_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_learning_curves.png')
-    plt.savefig(lc_filename, dpi=300, facecolor='white')
-    plt.close()
-    print(f"Saved '{lc_filename}'")
-
-
-def plot_enrichment_comparison(y_true, y_pred, target_col, ax=None, top_quantile=0.2):
-    """Plots a cumulative gain / enrichment curve vs random baseline using absolute numbers."""
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        
-    df_eval = pd.DataFrame({'true': y_true, 'pred': y_pred})
-    target_str = target_col.lower()
-    lower_is_better = any(term in target_str for term in ['hmw', 'agg', 'viscosity', 'lmw', 'hcp', 'clearance', 'polyreactivity'])
+    valid_mask = np.array(valid_mask)
     
-    if lower_is_better:
-        df_eval = df_eval.sort_values(by='pred', ascending=True).reset_index(drop=True)
-        top_quantile_threshold = np.percentile(y_true, 100 * top_quantile)
-        df_eval['is_top_performer'] = df_eval['true'] <= top_quantile_threshold
-        direction_label = f"Lowest {int(top_quantile*100)}%"
+    # Apply the filter to X, y, and the group labels before doing any math
+    group_labels = group_labels[valid_mask]
+    y_flat = y_flat[valid_mask]
+    
+    if hasattr(X, 'iloc'):
+        X = X.iloc[valid_mask]
     else:
-        df_eval = df_eval.sort_values(by='pred', ascending=False).reset_index(drop=True)
-        top_quantile_threshold = np.percentile(y_true, 100 * (1 - top_quantile))
-        df_eval['is_top_performer'] = df_eval['true'] >= top_quantile_threshold
-        direction_label = f"Highest {int(top_quantile*100)}%"
+        X = X[valid_mask]
         
-    total_top_performers = df_eval['is_top_performer'].sum()
-    total_samples = len(df_eval)
+    unique_groups = np.unique(group_labels)
+    num_groups = len(unique_groups)
     
-    if total_top_performers > 0:
-        # Convert to absolute counts
-        df_eval['hits_found'] = df_eval['is_top_performer'].cumsum()
-        df_eval['samples_screened'] = df_eval.index + 1
-        
-        # Random baseline is a straight line from (0,0) to (Total Samples, Total Hits)
-        ax.plot([0, total_samples], [0, total_top_performers], 'k--', label='Random Selection', alpha=0.6, linewidth=2)
-        
-        # Model performance curve
-        ax.plot(df_eval['samples_screened'], df_eval['hits_found'], 'b-', label='ML Model Ranking', linewidth=2.5)
-        
-        # Shade the area where the model outperforms random guessing
-        baseline_y = df_eval['samples_screened'] * (total_top_performers / total_samples)
-        ax.fill_between(df_eval['samples_screened'], baseline_y, df_eval['hits_found'], 
-                        where=(df_eval['hits_found'] > baseline_y), color='blue', alpha=0.1)
-        
-        ax.set_title(f'Enrichment: Finding the {direction_label}', fontsize=12)
-        ax.set_xlabel('Total Antibodies Screened (Model Ranked)')
-        ax.set_ylabel('Number of Hits Found(Expected)')
-        ax.legend(loc='lower right')
-        ax.grid(True, linestyle=':', alpha=0.6)
-    else:
-        ax.set_title('Virtual Screening Enrichment')
-        ax.text(0.5, 0.5, 'Not enough variance to calculate enrichment', ha='center', va='center')
-        
-    return ax
-
-def plot_hit_rate_curve(y_true, y_pred, target_col, ax=None, top_quantile=0.2):
-    """Plots a Hit Rate (Precision) curve using absolute numbers on the X-axis."""
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        
-    df_eval = pd.DataFrame({'true': y_true, 'pred': y_pred})
-    target_str = target_col.lower()
-    lower_is_better = any(term in target_str for term in ['hmw', 'agg', 'viscosity', 'lmw', 'hcp', 'clearance', 'polyreactivity'])
+    print(f"🔍 Detected {num_groups} valid unique groups in split column '{split_col_name}': {list(unique_groups)}")
     
-    if lower_is_better:
-        df_eval = df_eval.sort_values(by='pred', ascending=True).reset_index(drop=True)
-        threshold_val = np.percentile(y_true, 100 * top_quantile)
-        df_eval['is_hit'] = df_eval['true'] <= threshold_val
-    else:
-        df_eval = df_eval.sort_values(by='pred', ascending=False).reset_index(drop=True)
-        threshold_val = np.percentile(y_true, 100 * (1 - top_quantile))
-        df_eval['is_hit'] = df_eval['true'] >= threshold_val
-
-    total_hits = df_eval['is_hit'].sum()
-    total_samples = len(df_eval)
-    
-    if total_hits > 0:
-        # Keep hit rate as a percentage, but change X-axis to absolute count
-        df_eval['hit_rate'] = df_eval['is_hit'].cumsum() / (df_eval.index + 1)
-        df_eval['samples_screened'] = df_eval.index + 1
-        baseline_hit_rate = df_eval['is_hit'].mean()
-        
-        ax.plot([0, total_samples], [baseline_hit_rate, baseline_hit_rate], 'k--', label=f'Random Base Rate ({baseline_hit_rate*100:.0f}%)', alpha=0.6, linewidth=2)
-        ax.plot(df_eval['samples_screened'], df_eval['hit_rate'], 'g-', label='Model Hit Rate', linewidth=2.5)
-        ax.fill_between(df_eval['samples_screened'], baseline_hit_rate, df_eval['hit_rate'], 
-                        where=(df_eval['hit_rate'] > baseline_hit_rate), color='green', alpha=0.1, interpolate=True)
-        
-        ax.set_title('Hit Rate: Are the Top Ranks Actually Hits?', fontsize=12)
-        ax.set_xlabel('Total Antibodies Screened (Model Ranked)')
-        ax.set_ylabel('Hit Rate (% of screened that are True Hits)')
-        ax.set_ylim(-0.05, 1.05)
-        ax.legend(loc='upper right')
-        ax.grid(True, linestyle=':', alpha=0.6)
-    else:
-        ax.set_title('Hit Rate (Precision)')
-        ax.text(0.5, 0.5, 'Not enough variance to calculate hit rate', ha='center', va='center')
-        
-    return ax
-
-def generate_shap_analysis(final_model, X, feature_names, model_name, target_col, output_dir, prefix="", transform_suffix="", feat_suffix=""):
-    """Generates and saves a SHAP summary plot for the final trained model."""
-    shap_filename = os.path.join(output_dir, f'shap_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}.png')
-    
-    if os.path.exists(shap_filename):
-        print(f"\n⏭️ SHAP plot '{os.path.basename(shap_filename)}' already exists. Skipping recalculation to save time.")
+    if num_groups < 2:
+        print("  -> ⚠️ Not enough groups to perform out-of-group testing.")
         return
         
+    if num_groups > 10:
+        print(f"  -> ⚠️ Skipping out-of-group combinations: {num_groups} groups is too many (Limit is 10 to prevent plot explosion).")
+        return
+
+    # Determine Grid Size for Subplots (Max 3 columns wide)
+    cols = min(3, num_groups)
+    rows = math.ceil(num_groups / cols)
+    
+    fig_scatter, axes = plt.subplots(rows, cols, figsize=(7 * cols, 6 * rows))
+    # Ensure axes is always a flat array for easy iteration, even if it's 1x1 or 1xN
+    axes = np.array(axes).flatten()
+    
+    title_text = f"Generalization: {target_col}\nModel: {model_name}  |  Regions: [{subregions_name}]"
+    fig_scatter.suptitle(title_text, fontsize=18, y=1.02 + (0.02 if rows==1 else 0), fontweight='bold')
+    
+    results = []
+    feat_suffix = f"_{feature_tag}" if feature_tag else ""
+    split_name_tag = f"split_by_{split_col_name}_" if split_col_name else ""
+    
+    for idx, train_grp in enumerate(unique_groups):
+        ax = axes[idx]
+        mask_train = (group_labels == train_grp)
+        
+        # Safely index X
+        if hasattr(X, 'iloc'):
+            X_train = X.iloc[mask_train]
+        else:
+            X_train = X[mask_train]
+            
+        y_train = y_flat[mask_train]
+        
+        if len(y_train) < 5:
+            print(f"     ⚠️ Skipping Train [{train_grp}] (Insufficient data: N={len(y_train)})")
+            ax.set_visible(False)
+            continue
+            
+        # 🌟 THE FIX: Wrap the fitting step in a Try/Except block to catch Zero Variance errors!
+        model = clone(final_estimator)
+        try:
+            model.fit(X_train, y_train)
+            train_preds = model.predict(X_train).flatten()
+        except ValueError as e:
+            print(f"     ⚠️ Skipping Train [{train_grp}] (Zero variance in this specific split: {e})")
+            ax.set_visible(False)
+            continue
+        except Exception as e:
+            print(f"     ⚠️ Skipping Train [{train_grp}] (Model fit failed: {e})")
+            ax.set_visible(False)
+            continue
+        
+        # Prepare data for this specific subplot
+        plot_df_list = []
+        plot_df_list.append(pd.DataFrame({
+            'Actual': y_train, 
+            'Predicted': train_preds, 
+            'Dataset': f'Train ({train_grp})'
+        }))
+        
+        metrics_lines = ["Unseen Test Metrics:"]
+        palette = {f'Train ({train_grp})': 'lightgray'}
+        
+        # Generate a distinct color palette for the test groups
+        test_colors = sns.color_palette("husl", num_groups - 1)
+        color_idx = 0
+        
+        # Test on every OTHER group
+        for test_grp in unique_groups:
+            if test_grp == train_grp:
+                continue
+                
+            mask_test = (group_labels == test_grp)
+            if hasattr(X, 'iloc'):
+                X_test = X.iloc[mask_test]
+            else:
+                X_test = X[mask_test]
+                
+            y_test = y_flat[mask_test]
+            
+            if len(y_test) < 5:
+                continue
+                
+            test_preds = model.predict(X_test).flatten()
+            
+            # Calculate strictly on unseen test data
+            c_r2 = r2_score(y_test, test_preds)
+            try:
+                c_spear = custom_spearman(y_test, test_preds)
+            except Exception:
+                c_spear = 0.0
+                
+            results.append({
+                'Train_Group': train_grp,
+                'Test_Group': test_grp,
+                'Spearman': c_spear,
+                'R2': c_r2,
+                'N_Train': len(y_train),
+                'N_Test': len(y_test)
+            })
+            
+            print(f"     ✅ Train [{str(train_grp):^10}] ➔ Test [{str(test_grp):^10}] | Spearman: {c_spear:^6.3f} | R²: {c_r2:^6.3f}")
+            
+            dataset_label = f'Test ({test_grp})'
+            plot_df_list.append(pd.DataFrame({
+                'Actual': y_test, 
+                'Predicted': test_preds, 
+                'Dataset': dataset_label
+            }))
+            
+            palette[dataset_label] = test_colors[color_idx]
+            color_idx += 1
+            metrics_lines.append(f"[{test_grp}] Sp: {c_spear:.2f} | R²: {c_r2:.2f}")
+
+        # Plot the combined scatter
+        plot_df = pd.concat(plot_df_list, ignore_index=True)
+        sns.scatterplot(data=plot_df, x='Actual', y='Predicted', hue='Dataset', 
+                        palette=palette, ax=ax, alpha=0.8, edgecolor='k', s=70)
+        
+        # Perfect prediction diagonal line
+        min_val = plot_df[['Actual', 'Predicted']].min().min()
+        max_val = plot_df[['Actual', 'Predicted']].max().max()
+        ax.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, label="Perfect Line")
+        
+        # Add metrics text box
+        props = dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9, edgecolor='gray')
+        ax.text(0.05, 0.95, "\n".join(metrics_lines), transform=ax.transAxes, 
+                fontsize=9.5, verticalalignment='top', bbox=props)
+        
+        ax.set_title(f'Trained strictly on Group: {train_grp}', fontsize=14, pad=10)
+        ax.set_xlabel(f'Actual {target_col}')
+        ax.set_ylabel(f'Predicted {target_col}')
+        ax.legend(loc='lower right', fontsize=9)
+        
+    # Hide any unused subplots (if num_groups doesn't perfectly fill the grid)
+    for idx in range(num_groups, len(axes)):
+        axes[idx].set_visible(False)
+        
+    fig_scatter.tight_layout()
+    scatter_file = os.path.join(output_dir, f"oog_{split_name_tag}{prefix}{model_name}_{target_col}{feat_suffix}_Combined_Scatter.png")
+    fig_scatter.savefig(scatter_file, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close(fig_scatter)
+
+    if len(results) > 0:
+        res_df = pd.DataFrame(results)
+        pivot_spearman = res_df.pivot(index='Train_Group', columns='Test_Group', values='Spearman')
+        
+        # Dynamic figure sizing for heatmap
+        fig_width = max(8, num_groups * 1.5)
+        fig_height = max(6, num_groups * 1.2)
+        
+        plt.figure(figsize=(fig_width, fig_height))
+        
+        sns.heatmap(pivot_spearman, annot=True, cmap='coolwarm', center=0, fmt=".2f", 
+                    linewidths=1, linecolor='white',
+                    cbar_kws={'label': 'Spearman Correlation Score'})
+                    
+        plt.title(f"OOG Generalization Heatmap (Spearman Rank)\nTarget: {target_col} | Model: {model_name}", fontsize=14, pad=20)
+        plt.ylabel(f"Model Trained On ({split_col_name})", fontsize=12, fontweight='bold')
+        plt.xlabel(f"Model Tested On ({split_col_name})", fontsize=12, fontweight='bold')
+        
+        heatmap_file = os.path.join(output_dir, f"oog_{split_name_tag}{prefix}{model_name}_{target_col}{feat_suffix}_Summary_Heatmap.png")
+        plt.savefig(heatmap_file, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"\n  -> 📊 Saved 1 Combined OOG Scatter Plot and 1 Summary Heatmap to '{output_dir}/'")
+
+def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, target_col, prefix="", feature_tag="", aaindex_desc=None):
+    print(f"\nExtracting SHAP feature importances for {model_name}...")
     try:
         import shap
-        print("\nGenerating SHAP Summary Plot for deep feature insights...")
+        import re
         
-        # Extract the core scikit-learn pipeline/estimator from our custom meta-estimator
-        base_pipeline = final_model.regressor_ if hasattr(final_model, 'regressor_') else final_model
+        # --- NEW: Sanitize Feature Names for XGBoost & SHAP ---
+        # Strip accented characters (like 'É') and XGBoost-forbidden brackets
+        clean_features = []
+        for f in feature_names:
+            f_clean = str(f).encode('ascii', 'ignore').decode('ascii')
+            f_clean = re.sub(r'[\[\]<>]', '_', f_clean)
+            clean_features.append(f_clean)
+        feature_names = clean_features
         
-        # Preprocess the data exactly as the model sees it
-        if isinstance(base_pipeline, Pipeline):
-            # Transform data through VarianceThreshold and Scaler, stopping before the final predictor
-            X_shap = base_pipeline[:-1].transform(X)
-            predictor = base_pipeline[-1]
+        # 🌟 CRITICAL CRASH FIX: Actually rename the DataFrame columns!
+        if isinstance(X, pd.DataFrame):
+            X.columns = feature_names
+        # ------------------------------------------------------
+        
+        # 🌟 CRITICAL SPEED FIX: Extract the winner BEFORE fitting!
+        # This prevents running a massive GridSearch all over again.
+        if hasattr(model, 'best_estimator_'):
+            model = model.best_estimator_
             
-            # 🌟 Filter feature names based on VarianceThreshold so they align perfectly
-            support = base_pipeline.named_steps['vt'].get_support()
-            active_feature_names = pd.Index(feature_names)[support]
-        else:
-            X_shap = X.values if isinstance(X, pd.DataFrame) else X
-            predictor = base_pipeline
-            active_feature_names = feature_names
-            
-        # Select the right mathematical explainer
-        if model_name in ['RandomForest', 'XGBoost']:
-            explainer = shap.TreeExplainer(predictor)
-            shap_values = explainer.shap_values(X_shap)
-        else:
-            # Use KernelExplainer for PLS, SVR, and ElasticNet. 
-            # We use shap.sample to summarize the background dataset down to 20 samples for speed.
-            # background = shap.sample(X_shap, min(20, len(X_shap)))
-            # explainer = shap.KernelExplainer(predictor.predict, background)
-            # # 🌟 FIXED: Added l1_reg parameter and nsamples to fix Big Data memory crash
-            # shap_values = explainer.shap_values(X_shap, nsamples=200, l1_reg="num_features(20)", silent=True)
-            background = shap.kmeans(X_shap, min(20, len(X_shap)))
-            explainer = shap.KernelExplainer(predictor.predict, background)
-            shap_values = explainer.shap_values(X_shap, silent=True)
-        # Plot and save
-        plt.figure(figsize=(12, 8))
+        # Fit the single winning pipeline on 100% of data (Takes 1-2 seconds)
+        model.fit(X, y)
         
-        # SHAP returns a list of arrays for multi-class/binary classification. We just need one.
-        if isinstance(shap_values, list):
-            shap_vals_to_plot = shap_values[1]
+        # Safely extract the base pipeline
+        base_pipe = model.regressor_ if hasattr(model, 'regressor_') else model
+        
+        if hasattr(base_pipe, 'named_steps') and 'vt' in base_pipe.named_steps:
+            X_trans = base_pipe.named_steps['vt'].transform(X)
+            if 'scaler' in base_pipe.named_steps: X_trans = base_pipe.named_steps['scaler'].transform(X_trans)
+            active_feats = np.array(feature_names)[base_pipe.named_steps['vt'].get_support()]
+            predictor = base_pipe.named_steps[list(base_pipe.named_steps.keys())[-1]]
         else:
-            shap_vals_to_plot = shap_values
-            
-        shap.summary_plot(shap_vals_to_plot, X_shap, feature_names=active_feature_names, show=False)
-        plt.title(f"SHAP Value Impact: {model_name} on {target_col}", fontsize=14)
-        plt.tight_layout()
-        
-        plt.savefig(shap_filename, dpi=300, facecolor='white', bbox_inches='tight')
-        plt.close()
-        print(f"✅ SHAP Summary Plot successfully saved to '{shap_filename}'!")
-        
-    except ImportError:
-        print("\n⚠️ SHAP library not found. Run 'pip install shap' in your terminal to enable advanced feature analysis.")
-    except Exception as e:
-        print(f"\n⚠️ SHAP analysis failed: {e}")
+            X_trans, active_feats, predictor = X.values if isinstance(X, pd.DataFrame) else X, feature_names, base_pipe
 
-def evaluate_subregion_combinations(df, seq_cols, generated_features, aaindex_desc, target_col='ProA_HMW_Excell', model_name='PLSRegression', force_retrain=False,
-                                    classification_threshold=None, transform_type=None, weight_target_col=None, feature_tag="", antibody_type_col=None, test_mode="exhaustive",
-                                    fixed_combos=None, prefix="", top_quantile=0.2):
-    """Iterates through combinations of subregions OR tests specific fixed combinations."""
-    target = target_col
-    
-    if target not in df.columns:
-        print(f"Skipping ML model: Missing target column '{target}'.")
-        return
-    
-    output_dir = model_name
-    os.makedirs(output_dir, exist_ok=True)
-    
-    transform_suffix = f"_{transform_type}" if transform_type else ""
-    feat_suffix = f"_{feature_tag}" if feature_tag else ""
-    # 🌟 NEW: Apply prefix to isolate results!
-    results_filename = os.path.join(output_dir, f'{prefix}combinations_results_{model_name}_{target}{transform_suffix}{feat_suffix}.xlsx')
-    
-    # 🌟 FIXED: Identify true "External" features (like Propermab CSV). 
-    # We must explicitly exclude the 'Global_' prefix so the stitched chains don't leak into the subregion combos!
-    global_features = [
-        f for f in generated_features 
-        if not any(f.startswith(sc + '_') for sc in seq_cols) 
-        and not f.startswith('Global_')
-    ]
-    print(f"\n--- Model Setup: {model_name} for target {target} ---")
-    
-    best_combo_name = None
-    best_features = None
-    
-    # --- SMART RESUME LOGIC ---
-    if not force_retrain and os.path.exists(results_filename):
-        print(f"✅ Found existing CV results at '{results_filename}'.")
-        print("⏭️ SKIPPING exhaustive Cross-Validation search and proceeding directly to final model training!")
-        
-        # Load the best result directly from the Excel file
-        results_df = pd.read_excel(results_filename)
-        best_run = results_df.iloc[0]
-        best_combo_name = best_run['Subregions_Used']
-        
-        # Reconstruct the optimal feature list based on the saved best combination
-        combo = best_combo_name.split(' + ')
-        best_features = [f for f in generated_features if any(f.startswith(sc + '_') for sc in combo)]
-        
-        # 🌟 FIXED: Re-append the global CQA and Propermab features during smart resume!
-        best_features.extend(global_features)
-        
-    else:
-        # --- FALLBACK: RUN EXHAUSTIVE CROSS VALIDATION LOOP ---
-        print(f"Total samples in full dataset: {len(df)}")
-        results = []
-        # 🌟 NEW: Support Fixed Combo Testing
-        if test_mode == "exhaustive":
-            max_r = len(seq_cols)
-            import math
-            total_combos = sum(math.comb(len(seq_cols), i) for i in range(1, max_r + 1))
-            print(f"Testing all exhaustive combinations up to {max_r} subregions at once.")
-            
-            combos_to_test = []
-            for r in range(1, max_r + 1):
-                combos_to_test.extend(list(itertools.combinations(seq_cols, r)))
+        # --- Robust Tree Model Check ---
+        is_tree = model_name in ['RandomForest', 'XGBoost'] or type(predictor).__name__ in ['RandomForestRegressor', 'XGBRegressor']
+
+        if is_tree:
+            print("  -> Using lightning-fast TreeExplainer...")
+            explainer = shap.TreeExplainer(predictor)
+            shap_values = explainer.shap_values(X_trans)[1] if isinstance(explainer.shap_values(X_trans), list) else explainer.shap_values(X_trans)
+        elif model_name in ['PLSRegression', 'ElasticNet'] or (model_name == 'SVR' and getattr(predictor, 'kernel', '') == 'linear'):
+            print("  -> Using exact linear math explainer...")
+            coef = predictor.coef_.flatten()
+            bg_mean = X_trans.mean(axis=0)
+            shap_values = (X_trans - bg_mean) * coef
         else:
-            total_combos = len(fixed_combos)
-            combos_to_test = fixed_combos
-            print(f"Testing {total_combos} fixed global combinations.")
-            
-        current_combo = 0
-        print(f"Evaluation Strategy: Parallel Repeated 5-Fold Cross Validation (3 repeats = 15 models per combo)\n")
-        
-        rkf = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
-        
-        scoring = {
-            'rmse': 'neg_root_mean_squared_error',
-            'mae': 'neg_mean_absolute_error',
-            'r2': 'r2',
-            'spearman': make_scorer(custom_spearman)
+            print("  -> Non-linear model detected. Compressing background to 5 centroids to prevent RAM crash...")
+            background = shap.kmeans(X_trans, 5)
+            explainer = shap.KernelExplainer(predictor.predict, background)
+            shap_values = explainer.shap_values(X_trans, nsamples=100, silent=True)
+
+        # 🌟 NEW: Clean Y-axis + Side Dictionary Text Box 
+        aac_desc = {
+            'A': 'Alanine', 'R': 'Arginine', 'N': 'Asparagine', 'D': 'Aspartic Acid',
+            'C': 'Cysteine', 'Q': 'Glutamine', 'E': 'Glutamic Acid', 'G': 'Glycine',
+            'H': 'Histidine', 'I': 'Isoleucine', 'L': 'Leucine', 'K': 'Lysine',
+            'M': 'Methionine', 'F': 'Phenylalanine', 'P': 'Proline', 'S': 'Serine',
+            'T': 'Threonine', 'W': 'Tryptophan', 'Y': 'Tyrosine', 'V': 'Valine'
         }
         
-        for combo in combos_to_test:
-            r = len(combo)
-            current_combo += 1
-            combo_name = ' + '.join(combo)
-            
-            # Fetch subregion features AND append the global/external features to every model!
-            combo_features = [f for f in generated_features if any(f.startswith(sc + '_') for sc in combo)]
-            combo_features.extend(global_features)
-            
-            cols_to_check = [target] + combo_features
-
-            if weight_target_col and weight_target_col in df.columns:
-                cols_to_check.append(weight_target_col)
-                
-            model_df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=cols_to_check)
-            
-            print(f"[{current_combo}/{total_combos}] Evaluating: {combo_name}")
-            
-            if len(model_df) < 15:
-                print(f"    -> Skipped (Only {len(model_df)} valid samples; need >=15 for 5-Fold CV)\n")
-                continue
-                
-            # Assemble X with the hidden weights column at the end!
-            X_cols = list(combo_features)
-            if weight_target_col and weight_target_col in df.columns:
-                X_cols.append(weight_target_col)
-                
-            X = model_df[X_cols].reset_index(drop=True)
-            y = model_df[target].reset_index(drop=True)
-            
-            model = get_model(model_name, len(combo_features), transform_type, weight_target_col)
-            
-            cv_results = cross_vFValidate(
-                model, X, y, cv=rkf, scoring=scoring, 
-                n_jobs=-1, error_score=np.nan, return_estimator=True
-            )
-            
-            valid_folds = ~np.isnan(cv_results['test_r2'])
-            failed_folds = len(valid_folds) - valid_folds.sum()
-            
-            if failed_folds == len(valid_folds):
-                print("    -> Skipped (All CV folds failed due to zero variance or math errors)")
-                continue
-                
-            if failed_folds > 0:
-                print(f"    -> Warning: {failed_folds} fold(s) failed math checks and were skipped.")
-            
-            mean_rmse = -np.mean(cv_results['test_rmse'][valid_folds])
-            var_rmse = np.var(cv_results['test_rmse'][valid_folds])
-            
-            mean_mae = -np.mean(cv_results['test_mae'][valid_folds])
-            var_mae = np.var(cv_results['test_mae'][valid_folds])
-            
-            mean_r2 = np.mean(cv_results['test_r2'][valid_folds])
-            var_r2 = np.var(cv_results['test_r2'][valid_folds])
-            
-            mean_spearman = np.mean(cv_results['test_spearman'][valid_folds])
-            var_spearman = np.var(cv_results['test_spearman'][valid_folds])
-            
-            fold_hyperparams = []
-            for est in np.array(cv_results['estimator'])[valid_folds]:
-                if hasattr(est, 'best_params_'):
-                    # 🌟 NEW: Detect if this is an XGBoost model by checking the parameter keys
-                    is_xgb = any('xgb' in key.lower() or 'max_depth' in key.lower() for key in est.best_params_.keys())
-                    
-                    if is_xgb:
-                        # For XGBoost, save the ENTIRE parameter dictionary as a string 
-                        fold_hyperparams.append(str(est.best_params_))
-                    else:
-                        # For PLS, SVR, and ElasticNet, keep the original single-value logic
-                        for key, val in est.best_params_.items():
-                            if key.endswith('pls__n_components') or key.endswith('enet__alpha') or key.endswith('svr__C'):
-                                fold_hyperparams.append(val)
-                                break
-            
-            if fold_hyperparams:
-                # 🌟 FIXED: Gracefully handle multiple hyperparameters for XGBoost
+        display_features = []
+        legend_dict = {} 
+        for f in active_feats:
+            if '_AAindex_' in f and aaindex_desc:
                 try:
-                    # Works for SVR/PLS (single numeric parameters)
-                    optimal_hyperparam = float(pd.Series(fold_hyperparams).mode()[0])
-                except (ValueError, TypeError):
-                    # Works for XGBoost (dictionary of multiple parameters)
-                    # Converts dicts to strings to find the most common combination safely
-                    optimal_hyperparam = str(pd.Series([str(p) for p in fold_hyperparams]).mode()[0])
+                    base_col, code = f.split('_AAindex_')
+                    clean_name = f"{code}"
+                    display_features.append(clean_name)
+                    # ALSO sanitize the dictionary description to be 100% safe
+                    raw_desc = aaindex_desc.get(code, "Unknown property").split('(')[0].strip()
+                    legend_dict[code] = raw_desc.encode('ascii', 'ignore').decode('ascii')
+                except ValueError:
+                    display_features.append(f)
+            elif '_AAC_' in f:
+                try:
+                    base_col, aa = f.split('_AAC_')
+                    clean_name = f"{base_col} | AAC_{aa}"
+                    display_features.append(clean_name)
+                    legend_dict[f"AAC_{aa}"] = f"{aac_desc.get(aa, 'Unknown')} Frequency"
+                except ValueError:
+                    display_features.append(f)
             else:
-                optimal_hyperparam = np.nan
+                display_features.append(f)
+
+        # Calculate mean absolute SHAP values to find top 20 features
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        top_indices = np.argsort(mean_abs_shap)[-20:]
+        top_features = [display_features[i] for i in top_indices]
+        
+        # Build the legend text strictly for the visible features
+        legend_lines = ["Feature Dictionary:"]
+        import textwrap
+        for feat in reversed(top_features): # Top-to-bottom plot order
+            # 1. Exact match (for AAindex codes like 'KRIW790101')
+            if feat in legend_dict and feat not in str(legend_lines):
+                wrapped_desc = textwrap.fill(legend_dict[feat], width=65)
+                legend_lines.append(f"• {feat}: {wrapped_desc}")
+            # 2. Substring match (for AAC like 'seq_cdrh3 | AAC_W')
+            else:
+                for key in legend_dict:
+                    if key in feat and key not in str(legend_lines):
+                        wrapped_desc = textwrap.fill(legend_dict[key], width=65)
+                        legend_lines.append(f"• {key}: {wrapped_desc}")
+                        break
+                        
+        legend_text = "\n".join(legend_lines)
+        # 🌟 Make the figure wider (22 inches) to accommodate the horizontal text
+        fig = plt.figure(figsize=(22, 8))
+        # 🌟 Give the text box slightly more of the horizontal layout ratio
+        gs = fig.add_gridspec(1, 2, width_ratios=[2, 1.2])
+        ax_shap = fig.add_subplot(gs[0])
+        ax_text = fig.add_subplot(gs[1])
+        # Draw the SHAP plot on the left axis
+        plt.sca(ax_shap) 
+        shap.summary_plot(shap_values, X_trans, feature_names=display_features, show=False)
+        ax_shap.set_title(f"SHAP Value Impact: {model_name} on {target_col}", fontsize=14)
+        # Draw the Dictionary Text Box on the right axis
+        ax_text.axis('off')
+        if len(legend_lines) > 1:
+            props = dict(boxstyle='round,pad=0.5', facecolor='#f8f9fa', alpha=0.9, edgecolor='gray')
+            ax_text.text(0.0, 0.95, legend_text, transform=ax_text.transAxes, fontsize=10,
+                         verticalalignment='top', bbox=props, family='monospace') 
+        feat_suffix = f"_{feature_tag}" if feature_tag else ""
+        plt.savefig(os.path.join(output_dir, f'shap_{prefix}{model_name}_{target_col}{feat_suffix}.png'), dpi=300, facecolor='white', bbox_inches='tight')
+        plt.close()
+        print(f"✅ SHAP Summary Plot successfully saved!")
+    except MemoryError: print("⚠️ SHAP Memory Error: The KernelExplainer ran out of RAM. Skipping plot.")
+    except Exception as e: print(f"⚠️ SHAP failed: {e}")
+
+def filter_active_features(all_features, sub_combo, feat_combo, global_features, custom_feature_groups=None):
+    if custom_feature_groups is None: custom_feature_groups = []
+    active = list(global_features)
+    for f in all_features:
+        if f in active: continue
+
+        # 🌟 NEW: Combinatorial CSV Columns Bypass
+        if f in custom_feature_groups:
+            if f in feat_combo: active.append(f)
+            continue # Skip it if it is a custom group but NOT in the current feat_combo
+
+        # 🌟 Safely grant CQA and Propermab VIP access, bypassing subregion checks
+        if f.startswith('CQA_'):
+            if 'CQA' in feat_combo: active.append(f)
+            continue
+        if f.startswith('Propermab_'):
+            if 'Propermab' in feat_combo: active.append(f)
+            continue
+
+        # 🌟 Paired AbLang2 Bypass
+        if f.startswith('Paired_VH_VL_AbLang2_'):
+            # Only activate if the user explicitly requested AbLang2 AND they provided both VH and VL!
+            if 'AbLang2_Paired' in feat_combo and 'Global_VH' in sub_combo and 'Global_VL' in sub_combo:
+                active.append(f)
+            continue
+        
+        # Must belong to one of the active subregions
+        has_sub = any(f.startswith(sub + '_') for sub in sub_combo)
+        if not has_sub: continue
             
-            # 🌟 FEATURE COUNTING LOGIC (Must happen BEFORE the print statement)
-            num_pm = sum(1 for f in combo_features if f.startswith('Propermab_'))
-            num_cqa = sum(1 for f in combo_features if f.startswith('CQA_'))
-            num_aac = sum(1 for f in combo_features if '_AAC_' in f)
-            num_aaindex = sum(1 for f in combo_features if '_AAindex_' in f)
-            num_esm = sum(1 for f in combo_features if '_ESM_' in f)
+        # Must belong to one of the active feature types
+        markers = {'AAC': '_AAC_', 'AAindex': '_AAindex_', 'Georgiev': '_Georgiev_'}
+        has_feat = False
+        for ft in feat_combo:
+            if ft in markers and markers[ft] in f: has_feat = True; break
+            elif ft.startswith('ESM_'):
+                # Stop the SVD compressed features from accidentally leaking into the raw 650M test!
+                if ft == 'ESM_Big_650M':
+                    if '_ESM_Big_650M_' in f and '_SVD50_' not in f: has_feat = True; break
+                elif f"_{ft}_" in f: has_feat = True; break
+            elif ft == 'AntiBERTy' and '_AntiBERTy_' in f: has_feat = True; break
+            elif ft == 'Propermab' and f.startswith('Propermab_'): has_feat = True; break
+            elif ft == 'CQA' and f.startswith('CQA_'): has_feat = True; break
+                
+        # Always include base features like Length that lack a marker
+        is_untyped = not any(m in f for m in ['_AAC_', '_AAindex_', '_ESM_', '_Georgiev_', 'Propermab_', 'CQA_', '_AntiBERTy_', '_AbLang2_'])
+        if has_feat or is_untyped: active.append(f)
             
-            num_other = len(combo_features) - (num_pm + num_cqa + num_aac + num_aaindex + num_esm)
+    # CRITICAL FIX: Alphabetically sort the features to completely defeat Python's set randomization!
+    return sorted(list(set(active)))
+
+def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_col, model_name, output_dir, 
+                                     transform_type=None, weight_col=None, prefix="", hue_col=None, rank_to_plot=0,
+                                     oog_col=None, aaindex_desc=None, extended_plots=False, manual_threshold=None,
+                                     custom_feature_groups=None): # <--- NEW ARGUMENT
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint_csv = os.path.join(output_dir, f"{prefix}exhaustive_search_checkpoint_{model_name}_{target_col}.csv")
+    final_excel = os.path.join(output_dir, f"{prefix}exhaustive_search_results_{model_name}_{target_col}.xlsx")
+    
+    global_features = [
+        f for f in generated_features 
+        if not f.startswith('seq_')
+        and not f.startswith('Global_')
+        and not f.startswith('CQA_')
+        and not f.startswith('Propermab_')
+        and not f.startswith('Paired_') 
+        and (custom_feature_groups is None or f not in custom_feature_groups) # 🌟 Prevents them from being always-on!
+    ]
+    
+    available_groups = []
+    if any('_AAC_' in f for f in generated_features): available_groups.append('AAC')
+    if any('_AAindex_' in f for f in generated_features): available_groups.append('AAindex')
+    if any('_ESM_Small_8M_' in f for f in generated_features): available_groups.append('ESM_Small_8M')
+    if any('_ESM_Medium_35M_' in f for f in generated_features): available_groups.append('ESM_Medium_35M')
+    
+    if any(('_ESM_Big_650M_' in f and '_SVD50_' not in f) for f in generated_features): available_groups.append('ESM_Big_650M')
+    if any('_ESM_Big_650M_SVD50_' in f for f in generated_features): available_groups.append('ESM_Big_650M_SVD50')
+    if any('_AntiBERTy_' in f for f in generated_features): available_groups.append('AntiBERTy')
+    if any('Paired_VH_VL_AbLang2_' in f for f in generated_features): available_groups.append('AbLang2_Paired')
+    if any('_Georgiev_' in f for f in generated_features): available_groups.append('Georgiev')
+    if any(f.startswith('Propermab_') for f in generated_features): available_groups.append('Propermab')
+    if any(f.startswith('CQA_') for f in generated_features): available_groups.append('CQA')
+    
+    # 🌟 NEW: Add Custom CSV Columns to the permutation list
+    if custom_feature_groups:
+        for grp in custom_feature_groups:
+            if grp in generated_features:
+                available_groups.append(grp)
+    
+    completed_combos = set()
+    file_exists = os.path.isfile(checkpoint_csv)
+    if file_exists:
+        try:
+            df_check = pd.read_csv(checkpoint_csv)
+            for _, row in df_check.iterrows(): completed_combos.add(f"{row['Subregions']}|{row['Features']}")
+            print(f"✅ Found Checkpoint! Resuming search. {len(completed_combos)} combinations already completed.")
+        except Exception: file_exists = False
+
+    with open(checkpoint_csv, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists: writer.writerow(['Subregions', 'Features', 'Num_Features', 'Spearman', 'Spearman_Std', 'RMSE', 'RMSE_Std', 'MAE', 'MAE_Std', 'R2', 'R2_Std'])
             
-            feat_info = f"{len(combo_features)} total ({num_esm} ESM, {num_pm} 3D-PM, {num_cqa} CQA, {num_aaindex} AAidx, {num_aac} AAC, {num_other} Other)"           
-            print(f"    -> Mean Spearman: {mean_spearman:.3f} | Mean MAE: {mean_mae:.3f} | Valid Samples: {len(model_df)} | Features: {feat_info}")
+        scorer = {'spearman': make_scorer(custom_spearman), 'r2': 'r2', 'rmse': 'neg_root_mean_squared_error', 'mae': 'neg_mean_absolute_error'}
+        cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
         
-            results.append({
-                'Subregions_Used': combo_name,
-                'Num_Subregions': r,
-                'Optimal_Hyperparam': optimal_hyperparam,
-                'Mean_Spearman': mean_spearman,
-                'Var_Spearman': var_spearman,
-                'Mean_MAE': mean_mae,
-                'Var_MAE': var_mae,
-                'Mean_RMSE': mean_rmse,
-                'Var_RMSE': var_rmse,
-                'Mean_R2': mean_r2,
-                'Var_R2': var_r2,
-                'Features': combo_features
-            })
+        all_cols = df.columns.tolist()
+        
+        valid_feat_combos = []
+        for FL in range(1, len(available_groups) + 1):
+            for feat_combo in itertools.combinations(available_groups, FL):
+                lm_count = sum(1 for g in feat_combo if g.startswith('ESM_') or g in ['AntiBERTy', 'AbLang2_Paired'])
+                if lm_count <= 1:
+                    valid_feat_combos.append(feat_combo)
+                    
+        valid_sub_combos = []
+        for L in range(1, len(seq_cols) + 1):
+            for sub_combo in itertools.combinations(seq_cols, L):
+                if 'Global_Fv' in sub_combo and len(sub_combo) > 1:
+                    continue
+                valid_sub_combos.append(sub_combo)
 
-        if not results:
-            print("Not enough data to train models.")
-            return
+        valid_experiments = []
+        for sub_combo in valid_sub_combos:
+            for feat_combo in valid_feat_combos:
+                if 'AbLang2_Paired' in feat_combo:
+                    if 'Global_VH' not in sub_combo or 'Global_VL' not in sub_combo: continue
+                    if 'Global_Fv' in sub_combo: continue
+                        
+                valid_experiments.append((sub_combo, feat_combo))
+            
+        total_runs = len(valid_experiments)
+        current_run = 0
 
-        results_df = pd.DataFrame(results).sort_values(by='Mean_Spearman', ascending=False)
-        
-        print(f"\nSaving complete results for all {len(results_df)} combinations to '{results_filename}'...")
-        csv_cols = [
-            'Subregions_Used', 'Num_Subregions', 'Optimal_Hyperparam',
-            'Mean_Spearman', 'Var_Spearman', 'Mean_MAE', 'Var_MAE', 
-            'Mean_RMSE', 'Var_RMSE', 'Mean_R2', 'Var_R2'
-        ]
-        results_df[csv_cols].to_excel(results_filename, index=False)
-        
-        print("\n🏆 Top 5 Subregion Combinations by Mean CV Spearman Correlation:")
-        display_cols = ['Subregions_Used', 'Mean_Spearman', 'Mean_MAE', 'Mean_RMSE', 'Mean_R2']
-        print(results_df[display_cols].head(5).to_string(index=False))
-        
-        best_run = results_df.iloc[0]
-        best_combo_name = best_run['Subregions_Used']
-        best_features = best_run['Features']
+        print(f"\n🚀 Starting Exhaustive Search: {total_runs} Total Valid Combinations...")
+        for sub_combo, feat_combo in valid_experiments:
+            sub_name = " + ".join(sub_combo)
+            feat_name = " + ".join(feat_combo)
+            combo_id = f"{sub_name}|{feat_name}"
+            current_run += 1
 
-    # --- DEEP DIVE: FINALIZE BEST MODEL (Runs instantly if CV was skipped) ---
-    print(f"\n--- Deep Dive: Finalizing Best Model ({best_combo_name}) ---")
-    print("Retraining on 100% of available data to extract definitive feature importances...")
-    
-    cols_to_check_final = [target] + best_features
-    if weight_target_col and weight_target_col in df.columns:
-        cols_to_check_final.append(weight_target_col)
-    if antibody_type_col and antibody_type_col in df.columns:
-        cols_to_check_final.append(antibody_type_col)
-        
-    final_df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=cols_to_check_final)
-    
-    # Extract the shape labels for the plot (if they exist) before they are left out of X
-    type_labels = final_df[antibody_type_col].values if (antibody_type_col and antibody_type_col in final_df.columns) else None
-    
-    # Assemble X_final with the hidden weights column at the end!
-    X_cols_final = list(best_features)
-    if weight_target_col and weight_target_col in df.columns:
-        X_cols_final.append(weight_target_col)
-        
-    X_final = final_df[X_cols_final]
-    y_final = final_df[target]
-    
-    final_model = get_model(model_name, len(best_features), transform_type, weight_target_col)
-    
-    try:
-        final_model.fit(X_final, y_final)
-    except Exception as e:
-        print(f"CRITICAL ERROR: Failed to finalize best model on full dataset: {e}")
-        return
-        
-    best_estimator = final_model.best_estimator_ if hasattr(final_model, 'best_estimator_') else final_model
-    base_pipeline = best_estimator.regressor_ if hasattr(best_estimator, 'regressor_') else best_estimator
-    
-    # Now that the final model is trained on 100% of the data, we can extract the true global optimal lambda for the plot!
-    optimal_lambda_final = None
-    if transform_type == 'weighted-yeo-johnson' and hasattr(best_estimator, 'lmbda_'):
-        optimal_lambda_final = best_estimator.lmbda_
-        print(f"\nCustom Weighted Yeo-Johnson lambda calculated for final model: {optimal_lambda_final:.3f}")
-        
-    # 🌟 UPDATED: Pass feature_tag instead of esm_tag
-    plot_target_distribution(y_final, target, transform_type, output_dir, optimal_lambda=optimal_lambda_final, feature_tag=feature_tag)
+            if combo_id in completed_combos: continue
 
-    if hasattr(final_model, 'best_params_'):
-        print(f"\nOptimal Hyperparameters Discovered: {final_model.best_params_}")
-        
-    # Safely extract feature names by making sure we don't accidentally grab the hidden weight column!
-    if model_name == 'RandomForest':
-        imp_vals = base_pipeline.feature_importances_
-        feature_names = best_features
-    elif model_name == 'PLSRegression':
-        imp_vals = np.abs(base_pipeline.named_steps['pls'].coef_).flatten()
-        feature_names = pd.Index(best_features)[base_pipeline.named_steps['vt'].get_support()]
-    elif model_name == 'ElasticNet':
-        imp_vals = np.abs(base_pipeline.named_steps['enet'].coef_).flatten()
-        feature_names = pd.Index(best_features)[base_pipeline.named_steps['vt'].get_support()]
-    elif model_name == 'SVR':
-        if base_pipeline.named_steps['svr'].kernel == 'linear':
-            imp_vals = np.abs(base_pipeline.named_steps['svr'].coef_).flatten()
+            # 🌟 Passed custom_feature_groups here
+            selected_cols = filter_active_features(all_cols, sub_combo, feat_combo, global_features, custom_feature_groups)
+            
+            if 'Media_Encoded' in all_cols and 'Media_Encoded' not in selected_cols:
+                selected_cols.append('Media_Encoded')
+                if 'Media' not in feat_combo:
+                    feat_combo = list(feat_combo) + ['Media']
+
+            cols_to_check = [target_col] + selected_cols
+            if weight_col and weight_col in df.columns: cols_to_check.append(weight_col)
+            model_df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=cols_to_check).reset_index(drop=True)
+            
+            if len(model_df) < 15 or len(selected_cols) == len(global_features):
+                writer.writerow([sub_name, feat_name, len(selected_cols), 0, 0, 0, 0, 0, 0, 0, 0])
+                f.flush()
+                continue
+
+            X = model_df[selected_cols + ([weight_col] if weight_col else [])]
+            y = model_df[target_col]
+            
+            model = get_model(model_name, len(selected_cols), transform_type, weight_col)
+            print(f"[{current_run}/{total_runs}] Testing: [{sub_name}] with [{feat_name}] ({len(selected_cols)} feats)...")
+            
+            scores = cross_validate(model, X, y, cv=cv, scoring=scorer, n_jobs=-1, error_score=np.nan)
+            valid = ~np.isnan(scores['test_r2'])
+            
+            if valid.sum() == 0: 
+                writer.writerow([sub_name, feat_name, len(selected_cols), 0, 0, 0, 0, 0, 0, 0, 0])
+            else:
+                writer.writerow([
+                    sub_name, feat_name, len(selected_cols), 
+                    np.mean(scores['test_spearman'][valid]), np.std(scores['test_spearman'][valid]),
+                    -np.mean(scores['test_rmse'][valid]), np.std(scores['test_rmse'][valid]), 
+                    -np.mean(scores['test_mae'][valid]), np.std(scores['test_mae'][valid]), 
+                    np.mean(scores['test_r2'][valid]), np.std(scores['test_r2'][valid])
+                ])
+            f.flush()
+                        
+    df_results_raw = pd.read_csv(checkpoint_csv)
+    valid_mask = df_results_raw['Features'].apply(lambda x: all(feat in available_groups for feat in str(x).split(" + ")))
+    df_results = df_results_raw[valid_mask].sort_values(by="Spearman", ascending=False)
+    if df_results.empty:
+        print(f"⚠️ No valid completed combinations found for current settings. Skipping plotting.")
+        return 
+    df_results.to_excel(final_excel, index=False)
+    
+    # --- STAGE 3: Final Model ---
+    print(f"\n🌟 STAGE 3: Extracting Model Rank #{rank_to_plot + 1} from leaderboard...")
+    best_row = df_results.iloc[rank_to_plot]
+    best_subs, best_feats = best_row['Subregions'].split(" + "), best_row['Features'].split(" + ")
+    
+    final_sub_tag = best_row['Subregions'].replace(' + ', '-')
+    final_feat_tag = best_row['Features'].replace(' + ', '-')
+    global_tag = f"{final_sub_tag}_{final_feat_tag}"
+    
+    # 🌟 Passed custom_feature_groups here
+    final_cols = filter_active_features(all_cols, best_subs, best_feats, global_features, custom_feature_groups)
+    
+    cols_to_check = [target_col] + final_cols
+    if weight_col and weight_col in df.columns: cols_to_check.append(weight_col)
+    
+    df_subset_cols = cols_to_check + ([hue_col] if hue_col and hue_col in df.columns else []) + ([oog_col] if oog_col and oog_col in df.columns else [])
+    final_df = df[df_subset_cols].replace([np.inf, -np.inf], np.nan).dropna(subset=cols_to_check).reset_index(drop=True)
+    
+    X_final = final_df[final_cols + ([weight_col] if weight_col else [])]
+    y_final = final_df[target_col]
+    hue_data_final = final_df[hue_col] if hue_col and hue_col in final_df.columns else None
+    oog_data_final = final_df[oog_col] if oog_col and oog_col in final_df.columns else None
+    
+    model_filename = os.path.join(output_dir, f"Production_{prefix}{model_name}_{target_col}_{global_tag}.joblib")
+    
+    if os.path.exists(model_filename):
+        print(f"\n⚡ Found existing Production Model! Loading '{model_filename}' (Skipping GridSearch)...")
+        loaded_package = joblib.load(model_filename)
+        if isinstance(loaded_package, dict):
+            locked_best_estimator = loaded_package['model']
+            trained_features = loaded_package.get('features', final_cols)
+            expected_cols = trained_features + ([weight_col] if weight_col else [])
+            X_final = X_final[expected_cols]
+            final_cols = trained_features
+            best_params = loaded_package.get('best_params', None)
         else:
-            print("\n  -> Note: Feature importances are not mathematically defined for SVR with non-linear (RBF) kernels.")
-            imp_vals = np.zeros(base_pipeline.named_steps['vt'].get_support().sum())
-        feature_names = pd.Index(best_features)[base_pipeline.named_steps['vt'].get_support()]
+            locked_best_estimator = loaded_package
+            best_params = None
+
     else:
-        imp_vals = np.zeros(len(best_features))
-        feature_names = best_features
-        
-    importances = pd.DataFrame({
-        'Feature': feature_names,
-        'Importance': imp_vals
-    }).sort_values(by='Importance', ascending=False)
-    
-    def get_description(feat_name):
-        if '_AAindex_' in feat_name:
-            code = feat_name.split('_AAindex_')[-1]
-            return aaindex_desc.get(code, "Unknown AAindex Property")
-        elif '_AAC_' in feat_name:
-            aa = feat_name.split('_AAC_')[-1]
-            return f"Absolute Count of Amino Acid {aa} (AAC)"
-        elif '_ESM_' in feat_name:
-            parts = feat_name.split('_ESM_')[-1].split('_')
-            dim = parts[-1]
-            size_tag = "_".join(parts[:-1]) if len(parts) > 1 else "Unknown_Size"
-            return f"ESM-2 Contextual Embedding (Size: {size_tag}, Dimension {dim})"
-        elif feat_name.startswith('CQA_'):
-            return "Global Target-Specific CQA Feature"
-        # elif feat_name.endswith('_Length'): return "Sequence Length"
-        return ""
-        
-    importances['Description'] = importances['Feature'].apply(get_description)
-    importances = importances[['Feature', 'Description', 'Importance']]
-    
-    print("Most Critical Features extracted from the final model:")
-    print(importances.head(20).to_string(index=False))
-    
-    model_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target}{transform_suffix}{feat_suffix}_model.joblib')
-    print(f"\nSaving the final model and feature list to '{model_filename}'...")
-    joblib.dump({
-        'model': final_model,
-        'features': list(best_features),
-        'target': target
-    }, model_filename)
-    print("Model successfully saved!")
-    # --- 🌟 CALL SHAP ANALYSIS HERE (Safely after saving model) ---
-    # We pass only the feature columns, keeping weighting targets out of the SHAP explainer
-    # generate_shap_analysis(
-    #     final_model=final_model,
-    #     X=final_df[list(best_features)], 
-    #     feature_names=best_features,
-    #     model_name=model_name,
-    #     target_col=target,
-    #     output_dir=output_dir,
-    #     prefix=prefix,
-    #     transform_suffix=transform_suffix,
-    #     feat_suffix=feat_suffix
-    # )
-    print("------------------------------------------------------------------\n")
-    
-    best_params_dict = final_model.best_params_ if hasattr(final_model, 'best_params_') else None
-    # plot_best_model_diagnostics(
-    #     X_final, y_final, best_combo_name, model_name, target, output_dir, 
-    #     best_estimator, best_params=best_params_dict, 
-    #     threshold=classification_threshold,
-    #     transform_type=transform_type,
-    #     feature_tag=feature_tag,
-    #     type_labels=type_labels,
-    #     type_col_name=antibody_type_col,
-    #     prefix=prefix,  # 🌟 FIXED: Pass the prefix down to the plotting function
-    #     top_quantile=top_quantile  # 
-    # )
-    plot_best_model_diagnostics2(
-        X_final, y_final, best_combo_name, model_name, target, output_dir, 
-        best_estimator, best_params=best_params_dict, 
-        threshold=classification_threshold,
-        transform_type=transform_type,
-        feature_tag=feature_tag,
-        type_labels=type_labels,
-        type_col_name=antibody_type_col,
-        prefix=prefix,  # 🌟 FIXED: Pass the prefix down to the plotting function
-        top_quantile=top_quantile  # 
+        print(f"\n⚙️ Training Final Production Model...")
+        final_model = get_model(model_name, len(final_cols), transform_type, weight_col)
+        final_model.fit(X_final, y_final)
+        best_params = final_model.best_params_ if hasattr(final_model, 'best_params_') else None
+        locked_best_estimator = final_model.best_estimator_ if hasattr(final_model, 'best_estimator_') else final_model    
+
+    plot_best_model_diagnostics(
+        X=X_final, 
+        y=y_final, 
+        subregions_name=best_row['Subregions'],
+        features_name=best_row['Features'],
+        model_name=model_name, 
+        target_col=target_col, 
+        output_dir=output_dir, 
+        final_estimator=locked_best_estimator,
+        best_params=best_params,
+        feature_tag=global_tag,
+        prefix=prefix,
+        hue_data=hue_data_final,
+        hue_name=hue_col
     )
 
-def plot_target_boxplots(filepath, target_cols, output_filename='target_distributions_combined.png'):
-    """
-    Loads dataset, extracts specified target columns, and generates a single 
-    combined plot with side-by-side boxplots, overlaid data points, and 
-    aligned skewness statistics for direct comparison.
-    """
-    print(f"Loading data from '{filepath}'...")
-    try:
-        df = pd.read_csv(filepath)
-    except FileNotFoundError:
-        print(f"Error: Could not find '{filepath}'. Please check the path.")
-        return
-
-    # Strip whitespace from column names to ensure perfect matching
-    df.columns = df.columns.str.strip()
+    if extended_plots:
+        plot_best_model_diagnostics_old(
+            X=X_final, y=y_final,
+            subregions_name=best_row['Subregions'], features_name=best_row['Features'],
+            model_name=model_name, target_col=target_col, output_dir=output_dir,
+            final_estimator=locked_best_estimator, best_params=best_params, feature_tag=global_tag,
+            prefix=prefix, hue_data=hue_data_final, hue_name=hue_col, threshold=manual_threshold
+        ) 
     
-    # Filter targets to only those that actually exist in the CSV
-    valid_targets = [col for col in target_cols if col in df.columns]
-    
-    if not valid_targets:
-        print("Error: None of the specified target columns were found in the dataset.")
-        print(f"Available columns: {list(df.columns)}")
-        return
-        
-    print(f"Found {len(valid_targets)} valid targets to plot: {valid_targets}")
-
-    # Subset the dataframe to only our targets, then 'melt' it.
-    # Melting converts it from wide format (many columns) to long format (Target, Value)
-    df_filtered = df[valid_targets]
-    df_melted = df_filtered.melt(var_name='Target', value_name='Value').dropna()
-
-    # Dynamically calculate plot width based on the number of targets
-    plot_width = max(10, 3.5 * len(valid_targets))
-    plt.figure(figsize=(plot_width, 8))
-    
-    ax = plt.gca()
-
-    # 1. Plot the Boxplot (Shared X-axis)
-    sns.boxplot(
-        x='Target', 
-        y='Value',
-        data=df_melted, 
-        ax=ax, 
-        color='lightgray', 
-        width=0.5, 
-        boxprops=dict(alpha=0.6, edgecolor='black'),
-        whiskerprops=dict(color='black'),
-        capprops=dict(color='black'),
-        medianprops=dict(color='red', linewidth=2)
-    )
-    
-    # 2. Overlay the Stripplot (Shows every single data point)
-    sns.stripplot(
-        x='Target', 
-        y='Value',
-        data=df_melted, 
-        ax=ax, 
-        color='royalblue', 
-        size=5, 
-        alpha=0.7, 
-        jitter=0.2, # Spreads points horizontally so they don't overlap
-        edgecolor='black',
-        linewidth=0.5
-    )
-
-    # Find the maximum Y value across all data to position our text boxes cleanly above the plot
-    global_max_y = df_melted['Value'].max()
-    global_min_y = df_melted['Value'].min()
-    y_range = global_max_y - global_min_y
-    
-    # Add 25% padding to the top of the Y-axis to make room for the stat boxes
-    ax.set_ylim(global_min_y - (y_range * 0.05), global_max_y + (y_range * 0.25))
-    text_y_position = global_max_y + (y_range * 0.05)
-
-    # Loop through each category to calculate and place its specific stats
-    for i, target in enumerate(valid_targets):
-        data = df_filtered[target].dropna()
-        
-        n_samples = len(data)
-        mean_val = data.mean()
-        median_val = data.median()
-        skewness = data.skew()
-        std_dev = data.std()
-
-        stats_text = (
-            f"N = {n_samples}\n"
-            f"Mean = {mean_val:.2f}\n"
-            f"Median = {median_val:.2f}\n"
-            f"Std = {std_dev:.2f}\n"
-            f"Skew = {skewness:.2f}"
-        )
-        
-        # Place text box aligned exactly with the x-tick for this target
-        props = dict(boxstyle='round,pad=0.4', facecolor='#f8f9fa', alpha=0.9, edgecolor='gray')
-        ax.text(
-            i, text_y_position, stats_text, 
-            ha='center', va='bottom',
-            fontsize=11,
-            bbox=props
+    if oog_data_final is not None:
+        plot_out_of_group_diagnostics(
+            X=X_final,
+            y=y_final,
+            group_labels=oog_data_final,
+            subregions_name=best_row['Subregions'],
+            features_name=best_row['Features'],
+            model_name=model_name, 
+            target_col=target_col, 
+            output_dir=output_dir, 
+            final_estimator=locked_best_estimator,
+            feature_tag=global_tag,
+            prefix=prefix,
+            split_col_name=oog_col
         )
 
-    ax.set_title('Target Distributions Comparison', fontsize=18, fontweight='bold', pad=20)
-    ax.set_ylabel('Percentage (%)' if any('%' in t or 'Monomer' in t or 'HMW' in t for t in valid_targets) else 'Value', fontsize=14)
-    ax.set_xlabel('', fontsize=14) # Hide the generic 'Target' label
-    
-    # Improve x-tick readability
-    plt.xticks(fontsize=12, fontweight='bold')
-    plt.yticks(fontsize=12)
+    generate_shap_analysis(
+        model=locked_best_estimator, X=X_final, y=y_final, output_dir=output_dir, feature_names=final_cols, 
+        model_name=model_name, target_col=target_col, prefix=prefix, feature_tag=global_tag, aaindex_desc=aaindex_desc
+    )
 
-    plt.tight_layout()
+    if not os.path.exists(model_filename):
+        print(f"\n💾 Saving Final Production Model and Feature Metadata...")
+        joblib.dump({
+            'model': locked_best_estimator,
+            'features': final_cols,
+            'target': target_col,
+            'best_params': best_params 
+        }, model_filename)
+        print(f"✅ Production package successfully saved to: {model_filename}")
+    else:
+        print(f"\n✅ Production model already exists on disk. Skipping save.")
+
+def evaluate_single_combination(df, target_col, model_name, output_dir, sub_combo, feat_combo, generated_features, 
+                                transform_type=None, weight_col=None, prefix="targeted_", hue_col=None, oog_col=None, aaindex_desc=None,
+                                custom_feature_groups=None): # <--- NEW ARGUMENT
+    print(f"\n==================================================================")
+    print(f"🎯 TARGETED EVALUATION: {model_name} on {target_col}")
+    print(f"   Regions: {sub_combo}")
+    print(f"   Features: {feat_combo}")
+    print(f"==================================================================")
     
-    plt.savefig(output_filename, dpi=300, facecolor='white', bbox_inches='tight')
-    plt.close()
-    print(f"\n✅ Success! Combined target distributions saved to '{output_filename}'.")
+    os.makedirs(output_dir, exist_ok=True)
+    results_excel = os.path.join(output_dir, f"{prefix}single_eval_results_{model_name}_{target_col}.xlsx")
+    
+    all_cols = df.columns.tolist()
+    global_features = [
+        f for f in generated_features 
+        if not f.startswith('seq_')
+        and not f.startswith('Global_')
+        and not f.startswith('CQA_')
+        and not f.startswith('Propermab_')
+        and not f.startswith('Paired_')
+        and (custom_feature_groups is None or f not in custom_feature_groups) # 🌟 Prevents them from being always-on!
+    ]
+    
+    # 🌟 Passed custom_feature_groups here
+    selected_cols = filter_active_features(all_cols, sub_combo, feat_combo, global_features, custom_feature_groups)
+    
+    if 'Media_Encoded' in all_cols and 'Media_Encoded' not in selected_cols:
+        selected_cols.append('Media_Encoded')
+        if 'Media' not in feat_combo:
+            feat_combo = list(feat_combo) + ['Media']
+            print(f"   -> 🧪 Auto-injected Media_Encoded feature into combination.")
+
+    cols_to_check = [target_col] + selected_cols
+    if weight_col and weight_col in df.columns: cols_to_check.append(weight_col)
+    
+    df_subset_cols = cols_to_check + ([hue_col] if hue_col and hue_col in df.columns else []) + ([oog_col] if oog_col and oog_col in df.columns else [])
+    model_df = df[df_subset_cols].replace([np.inf, -np.inf], np.nan).dropna(subset=cols_to_check).reset_index(drop=True)
+    
+    if len(model_df) < 15:
+        print("⚠️ Not enough data points to evaluate this combination!")
+        return
+        
+    X = model_df[selected_cols + ([weight_col] if weight_col else [])]
+    y = model_df[target_col]
+    hue_data = model_df[hue_col] if hue_col and hue_col in model_df.columns else None
+    oog_data = model_df[oog_col] if oog_col and oog_col in model_df.columns else None
+    
+    model = get_model(model_name, len(selected_cols), transform_type, weight_col)
+    scorer = {'spearman': make_scorer(custom_spearman), 'r2': 'r2', 'rmse': 'neg_root_mean_squared_error', 'mae': 'neg_mean_absolute_error'}
+    cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
+    
+    scores = cross_validate(model, X, y, cv=cv, scoring=scorer, n_jobs=-1, error_score=np.nan)
+    valid = ~np.isnan(scores['test_r2'])
+    
+    sub_name = " + ".join(sub_combo)
+    feat_name = " + ".join(feat_combo)
+    
+    global_tag = f"{sub_name.replace(' + ', '-')}_{feat_name.replace(' + ', '-')}"
+    model_filename = os.path.join(output_dir, f"Production_{prefix}{model_name}_{target_col}_{global_tag}.joblib")
+    
+    new_result = pd.DataFrame([{
+        'Subregions': sub_name, 'Features': feat_name, 'Num_Features': len(selected_cols),
+        'Spearman': np.mean(scores['test_spearman'][valid]), 'Spearman_Std': np.std(scores['test_spearman'][valid]),
+        'RMSE': -np.mean(scores['test_rmse'][valid]), 'RMSE_Std': np.std(scores['test_rmse'][valid]),
+        'MAE': -np.mean(scores['test_mae'][valid]), 'MAE_Std': np.std(scores['test_mae'][valid]),
+        'R2': np.mean(scores['test_r2'][valid]), 'R2_Std': np.std(scores['test_r2'][valid])
+    }])
+    
+    if os.path.exists(results_excel):
+        existing_df = pd.read_excel(results_excel)
+        final_df = pd.concat([existing_df, new_result], ignore_index=True)
+    else:
+        final_df = new_result
+    final_df.to_excel(results_excel, index=False)
+    
+    if os.path.exists(model_filename):
+        print(f"\n⚡ Found existing Production Model! Loading '{model_filename}' (Skipping GridSearch)...")
+        loaded_package = joblib.load(model_filename)
+        if isinstance(loaded_package, dict):
+            locked_best_estimator = loaded_package['model']
+            trained_features = loaded_package.get('features', selected_cols)
+            expected_cols = trained_features + ([weight_col] if weight_col else [])
+            X = X[expected_cols]
+            selected_cols = trained_features
+            best_params = loaded_package.get('best_params', None)
+        else:
+            locked_best_estimator = loaded_package
+            best_params = None
+    else:
+        print(f"\n⚙️ Training Final Production Model...")
+        model.fit(X, y)
+        best_params = model.best_params_ if hasattr(model, 'best_params_') else None
+        locked_best_estimator = model.best_estimator_ if hasattr(model, 'best_estimator_') else model
+    
+    plot_best_model_diagnostics(
+        X=X, y=y, subregions_name=sub_name, features_name=feat_name, model_name=model_name, 
+        target_col=target_col, output_dir=output_dir, final_estimator=locked_best_estimator,
+        best_params=best_params, feature_tag=global_tag, prefix=prefix, hue_data=hue_data, hue_name=hue_col
+    )
+
+    if oog_data is not None:
+        plot_out_of_group_diagnostics(
+            X=X, y=y, group_labels=oog_data, subregions_name=sub_name, features_name=feat_name,
+            model_name=model_name, target_col=target_col, output_dir=output_dir, final_estimator=locked_best_estimator,
+            feature_tag=global_tag, prefix=prefix, split_col_name=oog_col
+        )
+
+    generate_shap_analysis(
+        model=locked_best_estimator, X=X, y=y, output_dir=output_dir, feature_names=selected_cols, 
+        model_name=model_name, target_col=target_col, prefix=prefix, feature_tag=global_tag, aaindex_desc=aaindex_desc
+    )
+
+    if not os.path.exists(model_filename):
+        print(f"\n💾 Saving Final Production Model and Feature Metadata...")
+        joblib.dump({
+            'model': locked_best_estimator,
+            'features': selected_cols,
+            'target': target_col,
+            'best_params': best_params 
+        }, model_filename)
+        print(f"✅ Production package successfully saved to: {model_filename}")
+    else:
+        print(f"\n✅ Production model already exists on disk. Skipping save.")
+    
+    print(f"✅ Targeted Evaluation Complete! Results saved to {results_excel}")
 
 def main():
     filepath = 'data/tubespin.csv'
-    # Define the exact column names you want to visualize
-    # targets_to_visualize = [
-    #     'ProA_Monomer_ActiPro',
-    #     'ProA_Monomer_Excell',
-    #     'ProA_HMW_ActiPro',
-    #     'ProA_HMW_Excell',
-    #     'ELISA_Polyreactivity_Excell'
-    # ]
-    # calculate_and_plot_variance(filepath, 'subregion_sequence_variance.png')
-    # plot_target_boxplots(filepath, targets_to_visualize)
+    # When run SVR for ProA_HMW_ActiPro double check the top models in the excel. for CQA the respective model has a lowe rank in the file.
+    targets_to_test = {'ELISA_Polyreactivity_Excell': 15.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
 
-    # 🎯 Define targets and their MANUALLY set thresholds for the classification metrics
-    targets_to_test = {
-        'ProA_HMW_Excell': 10.0,  # <-- Set your custom HMW threshold here (e.g., 20.0%)
-        # 'ProA_HMW_ActiPro': 10.0,  # <-- Set your custom HMW threshold here
-        # 'ProA_Monomer_ActiPro': 85.0,
-        # 'ProA_Monomer_Excell': 85.0
-        # 'ELISA_Polyreactivity_Excell':10.0
-    }
-    
     # filepath = 'data/inhouse_supp_CD3+CD20only_UPDATED.csv'
     # targets_to_test = {
-    #     'New_Purity%': 80.0,
+    #     'Purity%': 80.0,
     #     # 'HMW':10.0
     # }
-    
-    models_to_test = ['SVR']#, 'PLSRegression']#['SVR']#['PLSRegression'] 
-    
-    force_retrain_cv_grids = False
-    
-    # 🌟 NEW: Set your desired transformation here! 
-    # Options: None, 'log1p', 'box-cox', 'yeo-johnson', or 'weighted-yeo-johnson'
-    transform_strategy = None#'weighted-yeo-johnson'
-    
-    # 🌟 NEW: If using 'weighted-yeo-johnson', specify the custom weight column here!
-    weighting_column = None#'HCCF Titer (mg/L)'
 
-    # 🌟 NEW: Set the ESM-2 model you want to use here!
-    # Options: 'facebook/esm2_t6_8M_UR50D' (Small), 'facebook/esm2_t12_35M_UR50D' (Medium), 'facebook/esm2_t33_650M_UR50D' (Big)
-    esm_model_selection = "facebook/esm2_t6_8M_UR50D"
-    
-    # 🌟 NEW: Set an optional column name here to visualize different antibody types with distinct markers!
-    antibody_format_column = 'Type' # e.g., 'Antibody_Type', 'Format', 'Scaffold_Type'
-    
-    # 🌟 NEW: Toggle to load pre-extracted external features (like Propermab) from a CSV
-    use_external_features = False
-    
-    # 🌟 NEW: Toggle to load target-specific CLQ features from .npy files
-    use_cqa_features = False
+    # filepath = 'data/2+1_Humanized_VH5-VL_anti-CD3_variant_sequece_GA.csv'
+    # targets_to_test = {
+    #     'Monomer': 80.0,
+    #     'HMW%':10.0
+    # }
 
-    # Set the quantile for the Enrichment and Hit Rate plots
-    my_top_quantile = 0.2
+    # filepath = 'data/tubespin_extended.csv'
 
+    # targets_to_test = {
+    #     # 'Monomer_combined':80.0,
+    #     'HMW_combined':10.0
+    # }
+
+    # filepath = 'data/50-50_sequences.csv'
+    # targets_to_test = {#'50-50_HMW%':10.0,
+    #                   # '50-50_HCCF_Titer':750.0,
+    #                     'Normalized_50-50_HCCF_Titer':0.5
+    #                     }
+    
+    models_to_test = ['SVR']#, 'XGBoost', 'PLSRegression']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
+    
+    transform_strategy = None
+    # 🌟 NEW: Pass a list of models to extract both sets of features!
+    esm_model_selections = ["facebook/esm2_t6_8M_UR50D", "facebook/esm2_t33_650M_UR50D"]
+    antibody_format_column = 'Type'
+    # antibody_format_column = 'Dataset'
+
+    # 🌟 NEW: Type the exact name of your 0/1 split column here! 
+    # If the column doesn't exist yet, it will just safely skip the plot.
+    out_of_group_split_column = 'Manual_Split_Group'
+    
+    weighting_column = None
     DROP_MONOMER_OUTLIER = False 
+    # 🌟 NEW: Set to True to generate the massive 9-panel legacy diagnostic and learning curve plot
+    GENERATE_EXTENDED_PLOTS = False
+    
+    # 🌟 NEW: Targeted Single Evaluation Toggle
+    RUN_SINGLE_EVAL = False
+    single_eval_regions = ['Global_VL'] 
+    single_eval_features = ['ESM_Big_650M_SVD50']
 
+    # 🌟 NEW: Targeted Single Evaluation Toggle
+    # 🌟 NEW: Media Type Integration
+    USE_MEDIA_FEATURE = False
+    media_column = 'Media_Type'
+    # 🌟 NEW: Simply list the exact column names from your CSV you want to use as combinational features!
+    # Example: csv_feature_columns = ['Titer_Excell', 'Cell_Viability']
+    csv_feature_columns = []#['50-50_HCCF_Titer'] 
 
-    # Determine the ESM tag based on the selection to appropriately label files
-    if "8M" in esm_model_selection: esm_tag = "ESM_Small_8M"
-    elif "35M" in esm_model_selection: esm_tag = "ESM_Medium_35M"
-    elif "150M" in esm_model_selection: esm_tag = "ESM_Large_150M"
-    elif "650M" in esm_model_selection: esm_tag = "ESM_Big_650M"
-    elif "3B" in esm_model_selection: esm_tag = "ESM_Massive_3B"
-    else: esm_tag = "ESM_Custom"
-        
     try:
         df = load_and_clean_data(filepath, remove_outlier=DROP_MONOMER_OUTLIER)
-
-        determine_preferred_media(df)
-        plot_media_comparison(df)
-        
-        # Extract the raw filename to use as the cache folder
         dataset_name = os.path.splitext(os.path.basename(filepath))[0]
-        # --- NEW: Dynamically tag the cache based on our pipeline settings ---
         outlier_tag = "OutliersRemoved" if DROP_MONOMER_OUTLIER else "AllSamples"
+
+        if USE_MEDIA_FEATURE and media_column in df.columns:
+            print(f"\n🧬 Integrating '{media_column}' as a single universal integer feature...")
+            media_mapping = dict(enumerate(df[media_column].astype('category').cat.categories))
+            df[media_column] = df[media_column].astype('category').cat.codes
+            print(f"   -> Added feature: '{media_column}' to ALL models.")
+            print(f"   -> 📊 Media Dictionary: {media_mapping}")
+
         df_features, seq_cols, generated_features, aaindex_desc = extract_sequence_features(
-            df, 
-            dataset_name=dataset_name, 
-            esm_model_name=esm_model_selection,
-            cache_tag=outlier_tag
-
+            df, dataset_name=dataset_name, esm_model_names=esm_model_selections, cache_tag=outlier_tag
         )
-        
-        # --- 🌟 NEW: Load and append External Features (e.g., Pre-computed Propermab) ---
-        ext_feat_tag = ""
-        if use_external_features:
-            # Looks for a file named "tubespin_external_features.csv" inside the specific dataset's cache folder
-            ext_csv_path = os.path.join("feature_cache", dataset_name, f"{dataset_name}_propermab.csv")            
-            if os.path.exists(ext_csv_path):
-                print(f"Loading external features from '{ext_csv_path}'...")
-                ext_df = pd.read_csv(ext_csv_path)
-                
-                # Append the new columns (ignoring any that already exist to prevent duplicates)
-                new_feats = [c for c in ext_df.columns if c not in df_features.columns]
-                df_features = pd.concat([df_features.reset_index(drop=True), ext_df[new_feats].reset_index(drop=True)], axis=1)
-                
-                # Register the new features so the ML model uses them
-                generated_features.extend(new_feats)
-                ext_feat_tag = "-ExtPM"
-                print(f"✅ Successfully appended {len(new_feats)} external features!\n")
-            else:
-                print(f"⚠️ Warning: External feature file '{ext_csv_path}' not found. Training without them.\n")
 
-        # --- 🌟 NEW: Construct the Smart Tag ---
-        # This string (e.g. "_Feats-AAC-AAidx-ESM-8M-ExtPM") will be stamped on all saved files!
-        base_feature_tag = f"Feats-AAC-AAidx-{esm_tag}{ext_feat_tag}"
-        
-        if seq_cols:
-            for target_column, manual_threshold in targets_to_test.items():
-                # --- 🌟 NEW: Load Target-Specific CLQ Features (.npy) ---
-                df_features_run = df_features.copy()
-                generated_features_run = list(generated_features)
-                run_feature_tag = base_feature_tag
-                
-                if use_cqa_features:
-                    # Deduce media type from target string
-                    media_type = "ActiPro" if "ActiPro" in target_column else "Excell"
-                    cqa_npy_path = os.path.join("feature_cache", dataset_name, f"{dataset_name}_CQA_{media_type}.npy")
-                    
-                    if os.path.exists(cqa_npy_path):
-                        print(f"Loading media-specific CQA features for {media_type} from '{cqa_npy_path}'...")
-                        cqa_data = np.load(cqa_npy_path)
-                        
-                        # Handle both 1D and 2D arrays gracefully
-                        if cqa_data.ndim == 1: cqa_data = cqa_data.reshape(-1, 1)
-                            
-                        # Generate dynamic column names
-                        cqa_cols = [f"CQA_{media_type}_{i}" for i in range(cqa_data.shape[1])]
-                        cqa_df = pd.DataFrame(cqa_data, columns=cqa_cols)
-                        
-                        if len(cqa_df) != len(df_features_run):
-                            print(f"⚠️ Warning: CQA array has {len(cqa_df)} rows but dataset has {len(df_features_run)}. Check for mismatch!")
-                            
-                        # Append the features dynamically to this specific run
-                        df_features_run = pd.concat([df_features_run.reset_index(drop=True), cqa_df.reset_index(drop=True)], axis=1)
-                        generated_features_run.extend(cqa_cols)
-                        run_feature_tag += f"-CQA-{media_type}"
-                        print(f"✅ Successfully appended {len(cqa_cols)} CQA features for {target_column}!\n")
+        for target_column, manual_threshold in targets_to_test.items():
+            df_features_run = df_features.copy()
+            generated_features_run = list(generated_features)
+            
+            # 🌟 NEW: Dynamically push tabular CSV columns into the combinatorial feature space
+            if csv_feature_columns:
+                for col in csv_feature_columns:
+                    if col in df_features_run.columns:
+                        if col not in generated_features_run:
+                            generated_features_run.append(col)
+                        print(f"✅ SUCCESS: Added CSV column '{col}' to the combinatorial feature set.")
                     else:
-                        print(f"⚠️ Warning: CQA feature file '{cqa_npy_path}' not found. Training without them.\n")
+                        print(f"⚠️ WARNING: Requested feature column '{col}' not found in dataset. Skipping!")
+                    
+            for model_name in models_to_test:
+                if USE_MEDIA_FEATURE and media_column in df.columns:
+                    if media_column not in generated_features_run:
+                        generated_features_run.append(media_column)
 
-                for model_name in models_to_test:
-                    # print(f"\n==================================================================")
-                    # print(f"🚀 STARTING RUN: Target = {target_column} | Model = {model_name} | Cutoff = {manual_threshold}% | Transform = {transform_strategy}")
-                    # print(f"==================================================================")
-                    
-                    # 1. Exhaustive Subregion Combinations
-                    evaluate_subregion_combinations(
-                        df_features_run, 
-                        seq_cols, 
-                        generated_features_run, 
-                        aaindex_desc, 
-                        target_col=target_column, 
-                        model_name=model_name,
-                        force_retrain=force_retrain_cv_grids,
-                        classification_threshold=manual_threshold,
-                        transform_type=transform_strategy,
-                        weight_target_col=weighting_column,
-                        feature_tag=run_feature_tag,
-                        antibody_type_col=antibody_format_column,
-                        test_mode="exhaustive"
+                if RUN_SINGLE_EVAL:
+                    evaluate_single_combination(
+                        df=df_features_run, target_col=target_column, model_name=model_name, output_dir=model_name,
+                        sub_combo=single_eval_regions, feat_combo=single_eval_features,
+                        generated_features=generated_features_run, transform_type=transform_strategy,
+                        weight_col=weighting_column, prefix="targeted_", hue_col=antibody_format_column,
+                        oog_col=out_of_group_split_column, aaindex_desc=aaindex_desc,
+                        custom_feature_groups=csv_feature_columns  # 🌟 NEW
                     )
+                else:
+                    print(f"\n==================================================================")
+                    print(f"🚀 EXHAUSTIVE SEARCH: GLOBAL SEQUENCES (VH, VL, Fv)")
+                    print(f"==================================================================")
                     
-                    # # 2. 🌟 NEW: Global Sequence Context (VH, VL, Fv)
-                    # print(f"\n==================================================================")
-                    # print(f"🚀 STARTING RUN: GLOBAL SEQUENCES (VH, VL, Fv) | Target = {target_column}")
-                    # print(f"==================================================================")
-                    # evaluate_subregion_combinations(
-                    #     df_features_run, 
-                    #     seq_cols, 
-                    #     generated_features_run, 
-                    #     aaindex_desc, 
-                    #     target_col=target_column, 
-                    #     model_name=model_name,
-                    #     force_retrain=force_retrain_cv_grids,
-                    #     classification_threshold=manual_threshold,
-                    #     transform_type=transform_strategy,
-                    #     weight_target_col=weighting_column,
-                    #     feature_tag=run_feature_tag,
-                    #     antibody_type_col=antibody_format_column,
-                    #     test_mode="fixed",
-                    #     fixed_combos=[('Global_VH',), ('Global_VL',), ('Global_Fv',)],
-                    #     prefix="global_",
-                    #     top_quantile=my_top_quantile
-                    # )
+                    evaluate_exhaustive_combinations(
+                        df_features_run, ['Global_VH', 'Global_VL', 'Global_Fv'], generated_features_run, 
+                        target_col=target_column, model_name=model_name, output_dir=model_name, 
+                        transform_type=transform_strategy, weight_col=weighting_column, prefix="global_",
+                        hue_col=antibody_format_column, rank_to_plot=0,# oog_col=out_of_group_split_column,
+                        aaindex_desc=aaindex_desc, extended_plots=GENERATE_EXTENDED_PLOTS, manual_threshold=manual_threshold,
+                        custom_feature_groups=csv_feature_columns  # 🌟 NEW
+                    )
             
     except FileNotFoundError:
         print(f"Error: Could not find '{filepath}'.")
