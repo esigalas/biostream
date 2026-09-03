@@ -9,8 +9,6 @@ import joblib
 import glob
 import os
 
-# 🌟 NEW: We must import the custom target transformers directly from your 
-# EDA script so joblib knows how to un-pickle the advanced mathematical objects!
 from bioprocessing_eda import (
     extract_sequence_features, 
     custom_spearman,
@@ -25,11 +23,8 @@ st.title("🧪 Antibody Sequence & Developability Dashboard")
 st.markdown("Visualize sequence building blocks, analyze machine learning predictions, and test *in-silico* mutations in real-time.")
 
 # --- Sidebar Configuration ---
-#st.sidebar.header("1. Loaded Models")
-
-# Automatically find the models based on target names
 poly_files = glob.glob("trained_models/*ELISA_Polyreactivity_Excell*.joblib")
-hmw_files = glob.glob("trained_models/*HMW_Excell*.joblib")
+hmw_files = glob.glob("trained_models/*HMW*.joblib")
 
 if not poly_files or not hmw_files:
     st.sidebar.error("Could not find both Polyreactivity and HMW models in 'trained_models/'. Please ensure they exist.")
@@ -57,33 +52,48 @@ def get_esm_name(features):
     if any("_ESM_Big_650M_" in f for f in features): return "facebook/esm2_t33_650M_UR50D"
     if any("_ESM_Large_150M_" in f for f in features): return "facebook/esm2_t30_150M_UR50D"
     if any("_ESM_Medium_35M_" in f for f in features): return "facebook/esm2_t12_35M_UR50D"
-    return "facebook/esm2_t6_8M_UR50D" # Fallback to small
+    return "facebook/esm2_t6_8M_UR50D"
+
+# 🌟 NEW: Helper to dynamically detect required feature families from the model's expected columns!
+def get_required_feature_types(features):
+    required = []
+    if any("_AAC_" in f for f in features): required.append('AAC')
+    if any("_AAindex_" in f for f in features): required.append('AAindex')
+    if any("_Georgiev_" in f for f in features): required.append('Georgiev')
+    if any("_ESM_" in f for f in features): required.append('ESM')
+    if any("AntiBERTy" in f for f in features): required.append('AntiBERTy')
+    if any("AbLang2" in f for f in features): required.append('AbLang2_Paired')
+    if any("Propermab" in f for f in features): required.append('Propermab')
+    return required
 
 esm_poly = get_esm_name(features_poly)
 esm_hmw = get_esm_name(features_hmw)
 
-#st.sidebar.success(f"Models loaded successfully!\n- **{target_poly}**\n- **{target_hmw}**")
+# 🌟 NEW: Extract the exact feature families needed for each model
+ftypes_poly = get_required_feature_types(features_poly)
+ftypes_hmw = get_required_feature_types(features_hmw)
+
+st.sidebar.header("2. Developability Thresholds")
+poly_threshold = st.sidebar.slider("Max Polyreactivity (Curve X):", min_value=1.0, max_value=50.0, value=15.0, step=0.5)
+hmw_threshold = st.sidebar.slider("Max HMW (Curve Y):", min_value=1.0, max_value=30.0, value=10.0, step=0.5)
 
 st.sidebar.header("1. Load Environment")
 
-# 🌟 NEW: Dynamically find all CSV files in the current directory and the 'data' folder
 csv_files = glob.glob("*.csv") + glob.glob("data/*.csv")
 
 if not csv_files:
     st.sidebar.warning("No .csv dataset files found! Please add your data files to the folder.")
     st.stop()
     
-# 🌟 NEW: Use format_func to hide the folder path in the dropdown UI
 data_file = st.sidebar.selectbox(
     "Select Dataset:", 
     csv_files,
     format_func=lambda x: os.path.basename(x)
 )
 
-
-# 🌟 NEW: Separated Extraction Function
-@st.cache_data
-def load_base_environment_for_model(filepath, esm_model_name):
+# 🌟 FIX 1: Change to cache_resource because we are returning ML model objects!
+@st.cache_resource
+def load_base_environment_for_model(filepath, esm_model_name, ftypes):
     df = pd.read_csv(filepath)
     df.columns = df.columns.str.strip()
     
@@ -95,16 +105,31 @@ def load_base_environment_for_model(filepath, esm_model_name):
         
     dataset_name = os.path.splitext(os.path.basename(filepath))[0]
     
-    df_feat, seq_cols, _, _ = extract_sequence_features(
-        df, is_inference=False, dataset_name=dataset_name, esm_model_name=esm_model_name
+    # 🌟 FIX 2: Make sure it returns 5 variables (catching the svd_models dictionary)
+    df_feat, seq_cols, _, _, svd_models = extract_sequence_features(
+        df, is_inference=False, dataset_name=dataset_name, 
+        esm_model_names=esm_model_name, feature_types=ftypes, extract_subregions=True
     )
-    return df, df_feat, seq_cols
+    
+    # 🌟 FIX 3: Return the svd_models dictionary
+    return df, df_feat, seq_cols, svd_models
+
 
 if os.path.exists(data_file):
-    with st.spinner("Extracting Polyreactivity features..."):
-        df, df_feat_poly, seq_cols = load_base_environment_for_model(data_file, esm_poly)
-    with st.spinner("Extracting HMW features..."):
-        _, df_feat_hmw, _ = load_base_environment_for_model(data_file, esm_hmw)
+    # 🌟 FIX 4: Explicitly unpack the 4th variable into svd_models_poly and svd_models_hmw here!
+    with st.spinner(f"Extracting Polyreactivity features {ftypes_poly}..."):
+        df, df_feat_poly, seq_cols, svd_models_poly = load_base_environment_for_model(data_file, esm_poly, ftypes_poly)
+    with st.spinner(f"Extracting HMW features {ftypes_hmw}..."):
+        _, df_feat_hmw, _, svd_models_hmw = load_base_environment_for_model(data_file, esm_hmw, ftypes_hmw)
+    st.sidebar.success(f"Base data loaded! ({len(df)} antibodies found)")
+
+if os.path.exists(data_file):
+    with st.spinner(f"Extracting Polyreactivity features {ftypes_poly}..."):
+        # 🌟 ADDED 'svd_models_poly' here
+        df, df_feat_poly, seq_cols, svd_models_poly = load_base_environment_for_model(data_file, esm_poly, ftypes_poly)
+    with st.spinner(f"Extracting HMW features {ftypes_hmw}..."):
+        # 🌟 ADDED 'svd_models_hmw' here (and a 4th underscore if you don't need the 3rd variable)
+        _, df_feat_hmw, _, svd_models_hmw = load_base_environment_for_model(data_file, esm_hmw, ftypes_hmw)
     st.sidebar.success(f"Base data loaded! ({len(df)} antibodies found)")
 else:
     st.sidebar.error("Dataset not found. Please check filepath.")
@@ -124,17 +149,15 @@ with tab1:
             if pd.isna(seq) or str(seq).strip().upper() == 'NAN': 
                 return ""
             
-            # Standard Physicochemical Color Scheme (Darker, more vibrant pastels for better contrast)
             color_map = {
-                'A': '#A5D6A7', 'I': '#A5D6A7', 'L': '#A5D6A7', 'M': '#A5D6A7', 'F': '#A5D6A7', 'W': '#A5D6A7', 'V': '#A5D6A7', # Hydrophobic (Green)
-                'K': '#90CAF9', 'R': '#90CAF9', 'H': '#90CAF9', # Basic (Blue)
-                'D': '#EF9A9A', 'E': '#EF9A9A', # Acidic (Red)
-                'N': '#FFCC80', 'Q': '#FFCC80', 'S': '#FFCC80', 'T': '#FFCC80', # Polar (Orange)
-                'C': '#FFF59D', # Cysteine (Yellow)
-                'G': '#E0E0E0', 'P': '#E0E0E0' # Gly/Pro (Grey)
+                'A': '#A5D6A7', 'I': '#A5D6A7', 'L': '#A5D6A7', 'M': '#A5D6A7', 'F': '#A5D6A7', 'W': '#A5D6A7', 'V': '#A5D6A7', 
+                'K': '#90CAF9', 'R': '#90CAF9', 'H': '#90CAF9', 
+                'D': '#EF9A9A', 'E': '#EF9A9A', 
+                'N': '#FFCC80', 'Q': '#FFCC80', 'S': '#FFCC80', 'T': '#FFCC80', 
+                'C': '#FFF59D', 
+                'G': '#E0E0E0', 'P': '#E0E0E0' 
             }
             
-            # Simplified HTML to avoid visual clutter (removed borders and individual margins)
             html = '<span style="font-family: \'Courier New\', Courier, monospace; letter-spacing: 1.5px; font-weight: 600;">'
             for aa in str(seq).upper().replace(' ', '').replace(',', ''):
                 bg = color_map.get(aa, 'transparent')
@@ -147,13 +170,10 @@ with tab1:
             for col in seq_cols:
                 html_df[col] = html_df[col].apply(colorize_sequence)
             
-            # Insert the actual ID column so you know which antibody you are looking at
             html_df.insert(0, "Antibody ID", df['Display_ID'])
             
-            # Generate the raw HTML table
             table_html = html_df.to_html(escape=False, index=False, classes="seq-table")
             
-            # Flush-left HTML string to prevent Streamlit from escaping it as a Markdown code block!
             full_html = f"""<div style="height: 600px; overflow-y: auto; overflow-x: auto; border: 1px solid #e6e9ef; border-radius: 5px; margin-bottom: 15px;">
 <style>
 .seq-table {{ width: 100%; border-collapse: collapse; font-size: 14px; text-align: left; font-family: sans-serif; }}
@@ -165,7 +185,6 @@ with tab1:
 </div>"""
             st.write(full_html, unsafe_allow_html=True)
             
-            # Provide the visual legend directly below the table
             st.markdown("""
             **Color Legend:** 🟢 `Hydrophobic (A, I, L, M, F, W, V)` | 
             🔵 `Basic (K, R, H)` | 
@@ -175,18 +194,15 @@ with tab1:
             ⚪ `Gly/Pro (G, P)`
             """)
     else:
-        # Fallback to the raw dataframe if they want to copy-paste the raw strings easily
         st.dataframe(df[['Display_ID'] + seq_cols], use_container_width=True, height=600)
 
 with tab2:
-    # --- 1. Prepare Data & Predictions First ---
     X_base_poly = df_feat_poly[features_poly].copy()
     X_base_hmw = df_feat_hmw[features_hmw].copy()
     
     y_pred_poly = np.asarray(model_poly.predict(X_base_poly)).flatten()
     y_pred_hmw = np.asarray(model_hmw.predict(X_base_hmw)).flatten()
     
-    # State management for selected parent
     if 'parent_idx' not in st.session_state:
         st.session_state.parent_idx = df.index[0]
         
@@ -201,11 +217,8 @@ with tab2:
         'Antibody ID': df['Display_ID']
     })
 
-    # --- 2. Top Header & Parent Selection Controls ---
     st.subheader("🧬 In-Silico Sequence Editor")
     
-    # 🌟 FIX: Use a callback to update the true parent state BEFORE the script runs. 
-    # This completely eliminates the double-rerun scroll jump!
     def update_parent_from_dropdown():
         st.session_state.parent_idx = st.session_state.parent_dropdown
 
@@ -217,18 +230,16 @@ with tab2:
         key='parent_dropdown',
         on_change=update_parent_from_dropdown
     )
-    # --- 3. Sequence Editor Form (Full Width Grid) ---
+
     with st.form("mutation_form"):
         st.markdown("**🧬 Subregion Sequences (Edit below):**")
         
-        # Display sequence text boxes side-by-side in 3 columns
         num_grid_cols = 3
         grid_cols = st.columns(num_grid_cols)
         
         edited_seqs = {}
         for idx, col in enumerate(seq_cols):
             with grid_cols[idx % num_grid_cols]:
-                # 🌟 FIX: Swapped text_area for text_input to create compact, single-line boxes
                 edited_seqs[col] = st.text_input(
                     f"{col}:", 
                     value=df.loc[parent_idx, col], 
@@ -239,10 +250,8 @@ with tab2:
 
     st.markdown("---")
 
-    # --- 4. Plot and AI Assist Layout ---
     plot_col, ai_col = st.columns([2.5, 1], gap="large")
 
-    # Open the right column FIRST to define the dropdown value before drawing the plot
     with ai_col:
         st.markdown("### ⚙️ Plot Settings")
         cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
@@ -252,22 +261,46 @@ with tab2:
             key="marker_shape_dropdown"
         )
 
-    # Build base Plotly figure (We build the data first, but don't draw it yet!)
+    # Build base Plotly figure
     if symbol_col != "None":
         plot_df['Type'] = df[symbol_col]
         fig = px.scatter(
             plot_df, x='Predicted_Poly', y='Predicted_HMW', symbol='Type',
             hover_data={'Antibody ID': True, 'Index': False, 'Predicted_Poly': ':.2f', 'Predicted_HMW': ':.2f', 'Type': True},
-            opacity=0.6, color_discrete_sequence=['royalblue']
+            opacity=0.8, color_discrete_sequence=['royalblue']
         )
     else:
         fig = px.scatter(
             plot_df, x='Predicted_Poly', y='Predicted_HMW',
             hover_data={'Antibody ID': True, 'Index': False, 'Predicted_Poly': ':.2f', 'Predicted_HMW': ':.2f'},
-            opacity=0.6, color_discrete_sequence=['royalblue']
+            opacity=0.8, color_discrete_sequence=['royalblue']
         )
         
-    fig.update_traces(marker=dict(size=10))
+    fig.update_traces(marker=dict(size=10, line=dict(color='white', width=1)))
+    
+    # 🌟 NEW: 1. Generate smooth elliptical curve points connecting the two thresholds
+    theta = np.linspace(np.pi/2, 0, 100)
+    x_curve = poly_threshold * np.cos(theta)
+    y_curve = hmw_threshold * np.sin(theta)
+    
+    # 🌟 NEW: 2. Create the green 'Sweet Spot' boundary trace
+    curve_trace = go.Scatter(
+        x=x_curve, 
+        y=y_curve,
+        mode='lines',
+        line=dict(color='seagreen', width=3, dash='solid'),
+        fill='tozeroy',
+        fillcolor='rgba(220, 255, 220, 1.0)', # Solid Light Green
+        name='Acceptable Region',
+        hoverinfo='skip'
+    )
+    
+    # 🌟 NEW: 3. Add the green curve, then push it to the background so it doesn't cover your points!
+    fig.add_trace(curve_trace)
+    fig.data = (fig.data[-1],) + fig.data[:-1]
+    
+    # 🌟 NEW: 4. Set the rest of the plot background to light red (Unacceptable)
+    fig.update_layout(plot_bgcolor='rgba(255, 235, 235, 1.0)')
     
     # Highlight selected parent
     fig.add_trace(go.Scatter(
@@ -278,34 +311,30 @@ with tab2:
         hoverinfo='skip'
     ))
 
-    # --- Construct the Left Column Layout ---
     with plot_col:
         st.subheader("📊 2D Developability Landscape")
         st.markdown("💡 **Tip:** Click on any point in the plot to instantly select it as your parent scaffold!")
 
-        # 🌟 FIX: 1. Reserve an empty space for the plot at the top
         plot_placeholder = st.container()
         
         st.markdown("---")
         
-        # 🌟 FIX: 2. Draw the AI Button underneath the reserved plot space
         st.markdown("### 🤖 AI Assist")
         st.markdown("Automatically test naturally occurring variants in hypervariable regions to optimize this sequence.")
         suggest_button = st.button("✨ Auto-Suggest Optimization", type="secondary", use_container_width=True)
         
-        # 🌟 FIX: 3. Reserve another space for the output text to appear below the button
         results_placeholder = st.container()
 
     # --- Handle Manual Mutation Submission ---
     if submitted:
-        # Route the text output into the results container at the bottom
         with results_placeholder:
             with st.spinner("Extracting features for mutation..."):
                 new_row_df = pd.DataFrame([edited_seqs])
                 
-                new_feat_df_poly, _, _, _ = extract_sequence_features(new_row_df, is_inference=True, esm_model_name=esm_poly)
-                new_feat_df_hmw, _, _, _ = extract_sequence_features(new_row_df, is_inference=True, esm_model_name=esm_hmw)
-                
+                # 🌟 NEW: Mutagenesis passes dynamic feature_types exactly as needed
+                new_feat_df_poly, _, _, _, _ = extract_sequence_features(new_row_df, is_inference=True, esm_model_names=esm_poly, feature_types=ftypes_poly, extract_subregions=True, svd_models_dict=svd_models_poly)
+                new_feat_df_hmw, _, _, _, _ = extract_sequence_features(new_row_df, is_inference=True, esm_model_names=esm_hmw, feature_types=ftypes_hmw, extract_subregions=True, svd_models_dict=svd_models_hmw)
+
                 missing_poly = [f for f in features_poly if f not in new_feat_df_poly.columns]
                 missing_hmw = [f for f in features_hmw if f not in new_feat_df_hmw.columns]
                 
@@ -341,7 +370,6 @@ with tab2:
 
     # --- Handle Auto-Suggest Optimization ---
     elif suggest_button:
-        # Route the AI output into the results container at the bottom
         with results_placeholder:
             with st.spinner("Analyzing dataset variability and bulk-testing mutations..."):
                 
@@ -366,8 +394,9 @@ with tab2:
                     cand_df = pd.DataFrame(candidates)
                     cand_df_clean = cand_df.drop(columns=['Mutated_Region', 'Variant_Used'])
                     
-                    new_feat_df_poly, _, _, _ = extract_sequence_features(cand_df_clean, is_inference=True, esm_model_name=esm_poly)
-                    new_feat_df_hmw, _, _, _ = extract_sequence_features(cand_df_clean, is_inference=True, esm_model_name=esm_hmw)
+                    # 🌟 NEW: AI Suggestion passes dynamic feature_types exactly as needed
+                    new_feat_df_poly, _, _, _, _ = extract_sequence_features(cand_df_clean, is_inference=True, esm_model_names=esm_poly, feature_types=ftypes_poly, extract_subregions=True, svd_models_dict=svd_models_poly)
+                    new_feat_df_hmw, _, _, _, _ = extract_sequence_features(cand_df_clean, is_inference=True, esm_model_names=esm_hmw, feature_types=ftypes_hmw, extract_subregions=True, svd_models_dict=svd_models_hmw)
                     
                     X_new_poly = new_feat_df_poly[features_poly].copy()
                     X_new_hmw = new_feat_df_hmw[features_hmw].copy()
@@ -422,7 +451,6 @@ with tab2:
                             })
                             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    # 🌟 FIX: 4. Finally, push the fully updated plot into the placeholder at the top!
     with plot_placeholder:
         fig.update_layout(
             title="Multivariate Developability Landscape",
