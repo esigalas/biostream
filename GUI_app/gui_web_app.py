@@ -79,7 +79,7 @@ hmw_threshold = st.sidebar.slider("Max HMW (Curve Y):", min_value=1.0, max_value
 
 st.sidebar.header("1. Load Environment")
 
-csv_files = glob.glob("*.csv") + glob.glob("data/*.csv")
+csv_files = glob.glob("data/*.csv")
 
 if not csv_files:
     st.sidebar.warning("No .csv dataset files found! Please add your data files to the folder.")
