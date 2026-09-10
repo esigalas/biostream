@@ -12,6 +12,7 @@ import urllib.request
 import joblib
 import math
 import shutil
+import hashlib
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.cross_decomposition import PLSRegression
@@ -31,9 +32,7 @@ from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
 from scipy.optimize import minimize_scalar
 from scipy.stats import yeojohnson
 
-# ==========================================
-# 🌟 NEW: ANTIBERTY & ABLANG2 DEPENDENCY CHECKS
-# ==========================================
+# --- Optional Dependencies Check ---
 try:
     from antiberty import AntiBERTyRunner
     ANTIBERTY_AVAILABLE = True
@@ -46,9 +45,7 @@ try:
 except ImportError:
     ABLANG2_AVAILABLE = False
 
-# ==========================================
-# 🌟 GEORGIEV FEATURES DICTIONARY
-# ==========================================
+# --- Georgiev Amino Acid Principal Components ---
 GEORGIEV_DICT = {
     'A': [0.57, 3.37, -3.66, 2.34, -1.07, -0.4, 1.23, -2.32, -2.01, 1.31, -1.14, 0.19, 1.66, 4.39, 0.18, -2.6, 1.49, 0.46, -4.22],
     'C': [2.66, -1.52, -3.29, -3.77, 2.96, -2.23, 0.44, -3.49, 2.22, -3.78, 1.98, -0.43, -1.03, 0.93, 1.43, 1.45, -1.15, -1.64, -1.05],
@@ -72,8 +69,8 @@ GEORGIEV_DICT = {
     'Y': [0.79, -2.62, 4.11, -0.63, 1.89, -0.53, -1.3, 1.31, -0.56, -0.95, 1.91, -1.26, 1.57, 0.2, -0.76, -5.19, -2.56, 2.87, -3.43]
 }
 
-# --- SILENCE WARNINGS ---
 def completely_silence_warnings(*args, **kwargs):
+    """Overrides the default warning handler to suppress console noise during bulk feature extraction."""
     pass
 warnings.warn = completely_silence_warnings
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -84,10 +81,30 @@ PROPERMAB_AVAILABLE = True
 sns.set_theme(style="whitegrid")
 
 def custom_spearman(y_true, y_pred):
+    """
+    Calculates the Spearman rank-order correlation coefficient safely.
+    
+    Args:
+        y_true (array-like): Ground truth target values.
+        y_pred (array-like): Estimated target values.
+        
+    Returns:
+        float: Correlation coefficient (0 if NaN due to zero variance).
+    """
     sc, _ = spearmanr(y_true, y_pred)
     return sc if not np.isnan(sc) else 0
 
 def calculate_weighted_yeojohnson_lambda(y, weights):
+    """
+    Finds the optimal Yeo-Johnson transformation lambda, accounting for sample weights.
+    
+    Args:
+        y (array-like): Target values to transform.
+        weights (array-like): Sample weights for the optimization function.
+        
+    Returns:
+        float: Optimized lambda value bounded between -3.0 and 3.0.
+    """
     y_flat = np.asarray(y).flatten()
     w = np.asarray(weights).flatten()
     w = (w / np.sum(w)) * len(w)
@@ -105,12 +122,17 @@ def calculate_weighted_yeojohnson_lambda(y, weights):
     return res.x
 
 class CustomYeoJohnsonTransformer(BaseEstimator, TransformerMixin):
+    """Scikit-learn compatible transformer for applying a predefined Yeo-Johnson lambda."""
     def __init__(self, lmbda=1.0):
         self.lmbda = lmbda
-    def fit(self, X, y=None): return self
+        
+    def fit(self, X, y=None): 
+        return self
+        
     def transform(self, X):
         X_flat = np.asarray(X).flatten()
         return yeojohnson(X_flat, self.lmbda).reshape(-1, 1)
+        
     def inverse_transform(self, X_trans):
         X_trans_flat = np.asarray(X_trans).flatten()
         X_inv = np.zeros_like(X_trans_flat)
@@ -124,6 +146,15 @@ class CustomYeoJohnsonTransformer(BaseEstimator, TransformerMixin):
         return X_inv.reshape(-1, 1)
 
 class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
+    """
+    Wrapper class that applies a target transformation (e.g., log1p, box-cox) strictly within 
+    cross-validation folds to prevent data leakage, automatically handling the inverse transform on prediction.
+    
+    Args:
+        regressor (estimator): Scikit-learn regression model.
+        transform_type (str): Type of transformation ('log1p', 'box-cox', 'yeo-johnson').
+        weight_col (str): Column name representing sample weights.
+    """
     def __init__(self, regressor, transform_type=None, weight_col=None):
         self.regressor = regressor
         self.transform_type = transform_type
@@ -131,6 +162,8 @@ class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
         
     def fit(self, X, y):
         self.regressor_ = clone(self.regressor)
+        
+        # Separate sample weights from the feature matrix if provided
         if self.weight_col:
             if isinstance(X, pd.DataFrame):
                 weights = X[self.weight_col].values
@@ -142,7 +175,8 @@ class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
             X_clean = X.copy() if isinstance(X, pd.DataFrame) else np.copy(X)
             weights = None
             
-        if self.transform_type == 'log1p': y_trans = np.log1p(y)
+        if self.transform_type == 'log1p': 
+            y_trans = np.log1p(y)
         elif self.transform_type in ['box-cox', 'yeo-johnson']:
             self.pt_ = PowerTransformer(method=self.transform_type)
             y_trans = self.pt_.fit_transform(np.asarray(y).reshape(-1, 1)).flatten()
@@ -158,6 +192,7 @@ class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
         return self
         
     def predict(self, X):
+        # Remove sample weights before predicting
         if self.weight_col:
             if isinstance(X, pd.DataFrame): X_clean = X.drop(columns=[self.weight_col])
             else: X_clean = X[:, :-1]
@@ -175,6 +210,16 @@ class SelfContainedTargetTransformRegressor(BaseEstimator, RegressorMixin):
             return np.asarray(y_pred_trans).flatten()
 
 def load_and_clean_data(filepath, remove_outlier=False):
+    """
+    Loads sequence data from a CSV, trims column names, and optionally removes known geometric outliers.
+    
+    Args:
+        filepath (str): Path to the input dataset.
+        remove_outlier (bool): If True, drops hardcoded outlier samples.
+        
+    Returns:
+        pd.DataFrame: Cleaned dataset.
+    """
     print(f"Loading data from {filepath}...")
     df = pd.read_csv(filepath)
     df.columns = df.columns.str.strip()
@@ -184,10 +229,21 @@ def load_and_clean_data(filepath, remove_outlier=False):
         outliers_to_remove = ['H57L46', 'H57L38']
         df = df[~df['Samples'].str.strip().isin(outliers_to_remove)].reset_index(drop=True)
         rows_dropped = initial_len - len(df)
-        if rows_dropped > 0: print(f"  -> SUCCESS: Outliers removed. ({rows_dropped} rows dropped)")
+        if rows_dropped > 0: print(f"  -> Outliers removed. ({rows_dropped} rows dropped)")
     return df
 
 def filter_redundant_sequences(df, seq_cols):
+    """
+    Scans sequence columns to identify and remove nested sub-sequences (e.g., preventing CDR1 
+    from being treated as an independent region if it is already fully contained within another column).
+    
+    Args:
+        df (pd.DataFrame): The sequence dataset.
+        seq_cols (list): List of column names containing sequence strings.
+        
+    Returns:
+        tuple: (Filtered list of sequence columns, List of identified parent columns).
+    """
     parents = set()
     for col_a in seq_cols:
         for col_b in seq_cols:
@@ -201,6 +257,12 @@ def filter_redundant_sequences(df, seq_cols):
     return [c for c in seq_cols if c not in parents], list(parents)
 
 def load_aaindex():
+    """
+    Downloads and parses the AAindex1 database, mapping amino acid properties to numerical values.
+    
+    Returns:
+        tuple: (Dictionary mapping AAindex codes to 20-length float arrays, Dictionary of text descriptions).
+    """
     filepath, aaindex_dict, aaindex_desc = 'aaindex1.txt', {}, {}
     if not os.path.exists(filepath):
         try: urllib.request.urlretrieve("https://www.genome.jp/ftp/db/community/aaindex/aaindex1", filepath)
@@ -222,14 +284,50 @@ def load_aaindex():
     except Exception: pass
     return aaindex_dict, aaindex_desc
 
-def compute_aac_features(sequences, prefix=""):
+def compute_aac_features(sequences, prefix="", target_indices=None):
+    """
+    Calculates the Amino Acid Composition (counts of the 20 standard residues).
+    
+    Args:
+        sequences (list): List of amino acid sequences.
+        prefix (str): Prefix to append to the generated feature columns.
+        target_indices (list): Optional 0-indexed positions to restrict extraction to.
+        
+    Returns:
+        dict: Dictionary of generated AAC features.
+    """
     standard_aas = list('ARNDCQEGHILKMFPSTWYV')
     aac_dict = {}
     for aa in standard_aas:
-        aac_dict[f'{prefix}AAC_{aa}'] = np.array([seq.count(aa) if seq != 'NAN' else 0 for seq in sequences])
+        counts = []
+        for seq in sequences:
+            if seq == 'NAN' or not seq:
+                counts.append(0)
+                continue
+            
+            # Extract sequence strictly at user-defined spatial indices
+            if target_indices is not None:
+                valid_aas = [seq[i] for i in target_indices if i < len(seq)]
+                counts.append(valid_aas.count(aa))
+            else:
+                counts.append(seq.count(aa))
+        aac_dict[f'{prefix}AAC_{aa}'] = np.array(counts)
     return aac_dict
 
-def compute_aaindex_features(sequences, aaindex_db, prefix=""):
+def compute_aaindex_features(sequences, aaindex_db, prefix="", target_indices=None):
+    """
+    Maps physical properties from the AAindex database to sequences, averaging the values 
+    either globally or across a targeted subset of residues.
+    
+    Args:
+        sequences (list): List of amino acid sequences.
+        aaindex_db (dict): Parsed AAindex dictionary.
+        prefix (str): Prefix to append to the generated feature columns.
+        target_indices (list): Optional 0-indexed positions to restrict extraction to.
+        
+    Returns:
+        dict: Dictionary of generated AAindex features.
+    """
     aaindex_dict = {}
     if aaindex_db:
         for code, prop_map in aaindex_db.items():
@@ -238,24 +336,61 @@ def compute_aaindex_features(sequences, aaindex_db, prefix=""):
                 if seq == 'NAN' or not seq: 
                     vals_array.append(0)
                     continue
-                vals = [prop_map.get(aa) for aa in seq if prop_map.get(aa) is not None and not np.isnan(prop_map.get(aa))]
+                
+                if target_indices is not None:
+                    valid_aas = [seq[i] for i in target_indices if i < len(seq)]
+                else:
+                    valid_aas = list(seq)
+                    
+                vals = [prop_map.get(aa) for aa in valid_aas if prop_map.get(aa) is not None and not np.isnan(prop_map.get(aa))]
                 vals_array.append(sum(vals)/len(vals) if vals else 0)
             aaindex_dict[f'{prefix}AAindex_{code}'] = np.array(vals_array)
     return aaindex_dict
 
-def compute_georgiev_features(sequences, georgiev_dict, prefix=""):
+def compute_georgiev_features(sequences, georgiev_dict, prefix="", target_indices=None):
+    """
+    Calculates the mean of the 19-dimensional Georgiev Principal Components for the input sequence.
+    
+    Args:
+        sequences (list): List of amino acid sequences.
+        georgiev_dict (dict): Dictionary of Georgiev PCA values.
+        prefix (str): Prefix to append to the generated feature columns.
+        target_indices (list): Optional 0-indexed positions to restrict extraction to.
+        
+    Returns:
+        dict: Dictionary of generated Georgiev PC features.
+    """
     geo_features = []
     for seq in sequences:
         if seq == 'NAN' or len(seq) == 0: 
             geo_features.append([0.0] * 19)
         else:
-            seq_geo = [georgiev_dict[aa] for aa in seq if aa in georgiev_dict]
+            if target_indices is not None:
+                valid_aas = [seq[i] for i in target_indices if i < len(seq)]
+            else:
+                valid_aas = list(seq)
+                
+            seq_geo = [georgiev_dict[aa] for aa in valid_aas if aa in georgiev_dict]
             geo_features.append(np.mean(seq_geo, axis=0).tolist() if seq_geo else [0.0] * 19)
             
     geo_features = np.array(geo_features)
     return {f"{prefix}Georgiev_PC{i+1}": geo_features[:, i] for i in range(19)}
 
-def compute_esm_embeddings(sequences, esm_model_name, prefix="", esm_tag=""):
+def compute_esm_embeddings(sequences, esm_model_name, prefix="", esm_tag="", target_indices=None):
+    """
+    Generates representations using Evolutionary Scale Modeling (ESM-2).
+    Extracts the mean-pooled final hidden state, respecting targeted indices if supplied.
+    
+    Args:
+        sequences (list): List of amino acid sequences.
+        esm_model_name (str): HuggingFace model path for ESM.
+        prefix (str): Prefix to append to the generated feature columns.
+        esm_tag (str): Size descriptor tag (e.g., 'ESM_Big_650M').
+        target_indices (list): Optional 0-indexed positions to restrict extraction to.
+        
+    Returns:
+        tuple: (Dictionary of flattened embeddings, Raw 2D numpy matrix for SVD compression).
+    """
     import torch
     from transformers import EsmModel, EsmTokenizer, logging
     logging.set_verbosity_error()
@@ -272,20 +407,46 @@ def compute_esm_embeddings(sequences, esm_model_name, prefix="", esm_tag=""):
             inputs = tokenizer(seq, return_tensors="pt", add_special_tokens=True)
             with torch.no_grad():
                 hidden = model(**inputs).last_hidden_state[0]
-                embeddings.append(hidden[1:-1].mean(dim=0).cpu().numpy() if hidden.shape[0] > 2 else hidden.mean(dim=0).cpu().numpy())
+                seq_hidden = hidden[1:-1] if hidden.shape[0] > 2 else hidden
+                
+                # Targeted interface pooling
+                if target_indices is not None:
+                    valid_indices = [i for i in target_indices if i < seq_hidden.shape[0]]
+                    if valid_indices:
+                        pooled = seq_hidden[valid_indices].mean(dim=0).cpu().numpy()
+                    else:
+                        pooled = np.zeros(model.config.hidden_size)
+                # Global pooling
+                else:
+                    pooled = seq_hidden.mean(dim=0).cpu().numpy()
+                    
+                embeddings.append(pooled)
                 
     embeddings = np.array(embeddings)
     return {f'{prefix}{esm_tag}_{i}': embeddings[:, i] for i in range(embeddings.shape[1])}, embeddings
 
 def compress_embeddings_svd(embeddings_matrix, prefix="", esm_tag="", svd_model=None):
+    """
+    Compresses high-dimensional neural embeddings down to 50 dimensions using Truncated SVD.
+    
+    Args:
+        embeddings_matrix (np.ndarray): The raw 2D array of embeddings.
+        prefix (str): Prefix to append to the generated feature columns.
+        esm_tag (str): Size descriptor tag.
+        svd_model (object): A pre-fitted TruncatedSVD model. If provided, strictly projects data 
+                            (inference mode) to prevent data leakage. If None, fits a new model.
+                            
+    Returns:
+        tuple: (Dictionary of SVD50 features, Fitted SVD model object).
+    """
     from sklearn.decomposition import TruncatedSVD
     
+    # Inference mode: Project into the existing mathematical space
     if svd_model is not None:
-        # 🌟 INFERENCE MODE: Project into the existing mathematical space
         embeddings_svd = svd_model.transform(embeddings_matrix)
         return {f'{prefix}{esm_tag}_SVD50_{i}': embeddings_svd[:, i] for i in range(embeddings_svd.shape[1])}, svd_model
         
-    # 🌟 TRAINING MODE: Fit a brand new SVD model
+    # Training mode: Fit a brand new SVD model
     n_comps = min(50, embeddings_matrix.shape[0] - 1, embeddings_matrix.shape[1] - 1)
     if n_comps > 0:
         svd = TruncatedSVD(n_components=n_comps, random_state=42)
@@ -295,6 +456,16 @@ def compress_embeddings_svd(embeddings_matrix, prefix="", esm_tag="", svd_model=
     return None, None
 
 def compute_antiberty_embeddings(sequences, prefix=""):
+    """
+    Generates 512-dimensional representations using the antibody-specific AntiBERTy language model.
+    
+    Args:
+        sequences (list): List of amino acid sequences.
+        prefix (str): Prefix to append to the generated feature columns.
+        
+    Returns:
+        dict: Dictionary of flattened AntiBERTy features.
+    """
     import torch
     from antiberty import AntiBERTyRunner
     antiberty = AntiBERTyRunner()
@@ -315,6 +486,18 @@ def compute_antiberty_embeddings(sequences, prefix=""):
     return {f'{prefix}AntiBERTy_{i}': antiberty_embeddings[:, i] for i in range(antiberty_embeddings.shape[1])}
 
 def compute_ablang2_paired_embeddings(heavy_seqs, light_seqs, prefix="Paired_CD3_VH_VL_AbLang2_"):
+    """
+    Generates joint representations using AbLang2, explicitly capturing co-evolutionary dependencies
+    between the provided Heavy and Light chains.
+    
+    Args:
+        heavy_seqs (list): List of VH sequences.
+        light_seqs (list): List of VL sequences.
+        prefix (str): Prefix to append to the generated feature columns.
+        
+    Returns:
+        dict: Dictionary of flattened AbLang2 features.
+    """
     import ablang2
     ablang = ablang2.pretrained(model_to_use="ablang2-paired", random_init=False)
     
@@ -340,6 +523,18 @@ def compute_ablang2_paired_embeddings(heavy_seqs, light_seqs, prefix="Paired_CD3
     return {f'{prefix}{i}': final_embeddings[:, i] for i in range(final_embeddings.shape[1])}
 
 def compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_CD3"):
+    """
+    Models the 3D Fv complex using ABodyBuilder2 and calculates biophysical properties 
+    (e.g., surface charge, patch hydrophobicity) of the folded structure via Propermab.
+    
+    Args:
+        heavy_seqs (list): List of VH sequences.
+        light_seqs (list): List of VL sequences.
+        prefix (str): Prefix to append to the generated feature columns.
+        
+    Returns:
+        dict: Dictionary of calculated 3D structural physics features.
+    """
     import subprocess
     import sys
     import json
@@ -449,13 +644,25 @@ except Exception as e:
 
     return propermab_dict
 
-def extract_sequence_features(df, is_inference=False, dataset_name="default_dataset", esm_model_names=["facebook/esm2_t6_8M_UR50D"], cache_tag="", extract_subregions=False, feature_types=None, svd_models_dict=None):
+def extract_sequence_features(df, is_inference=False, dataset_name="default_dataset", esm_model_names=["facebook/esm2_t6_8M_UR50D"], cache_tag="", extract_subregions=False, feature_types=None, svd_models_dict=None, targeted_pooling_dict=None):
     """
-    Orchestrator for sequence-level and structural feature generation.
+    Main orchestrator for sequence-level and structural feature generation.
+    It builds functional domains (VH, VL, scFv), manages feature caches, and handles 
+    the branching logic for Global vs Targeted feature extraction runs.
     
-    feature_types: List of feature groups to extract.
-      Supported options: ['AAC', 'AAindex', 'Georgiev', 'ESM', 'AntiBERTy', 'AbLang2_Paired', 'Propermab']
-      If None, extracts all available features.
+    Args:
+        df (pd.DataFrame): Base dataset containing sequences.
+        is_inference (bool): If True, bypasses cache writing and skips fitting new SVD models, strictly applying pre-fitted tools.
+        dataset_name (str): Identifier used to route outputs to correct cache folders.
+        esm_model_names (list): List of HF model strings for ESM processing.
+        cache_tag (str): Appended to cache folders to separate outlier-dropped from raw dataset caches.
+        extract_subregions (bool): If True, granularly breaks down sequences into framework/CDR subregions.
+        feature_types (list): Overrides the default feature families if a smaller subset is desired.
+        svd_models_dict (dict): Dictionary of pre-fitted SVD models (used exclusively when is_inference=True).
+        targeted_pooling_dict (dict): Maps regions to semantic tags and targeted 0-indexed positions for extraction.
+        
+    Returns:
+        tuple: (Augmented DataFrame, List of processed sequence columns, List of generated feature names, AAindex descriptors, SVD models dict)
     """
     if svd_models_dict is None: 
         svd_models_dict = {}
@@ -469,7 +676,6 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
         
     print(f"\n🎯 Active Feature Pipelines: {[f for f in ALL_FEATURE_FAMILIES if f.lower() in active_features]}")
 
-    # Protect against single-string ESM model name
     if isinstance(esm_model_names, str):
         esm_model_names = [esm_model_names]
         
@@ -508,12 +714,13 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
         
         seq_cols, redundant_parents = filter_redundant_sequences(df_feat, valid_seq_cols)
         
+        # Explicitly remove known metadata columns that might be incorrectly parsed as sequences
         for override in ['G4S Linker1_HCK', 'Media_Type', 'HCH', 'Method', 'Manual_Split_Group']:
             if override in seq_cols: seq_cols.remove(override)
             
         print(f"\nProceeding with {len(seq_cols)} granular building blocks: {seq_cols}\n")
     
-    # 🌟 RESTORED & UPDATED: Stitch global chains using the new CD3 prefixes!
+    # Stitch global chains from granular subregions
     cd3_vh_ordered_cols = ['seq_CD3_frh1', 'seq_CD3_cdrh1', 'seq_CD3_frh2', 'seq_CD3_cdrh2', 'seq_CD3_frh3', 'seq_CD3_cdrh3', 'seq_CD3_frh4'] 
     cd3_vl_ordered_cols = ['seq_CD3_frl1', 'seq_CD3_cdrl1', 'seq_CD3_frl2', 'seq_CD3_cdrl2', 'seq_CD3_frl3', 'seq_CD3_cdrl3', 'seq_CD3_frl4']
 
@@ -537,11 +744,10 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
             if val not in ['NAN', 'NONE']: linker = val
         return r['CD3_VH'] + linker + r['CD3_VL']
         
-    df_feat['CD3_Fv'] = df_feat.apply(build_fv_with_linker, axis=1)
+    df_feat['scFv'] = df_feat.apply(build_fv_with_linker, axis=1)
     
-    all_seq_cols_to_process = seq_cols + ['CD3_VH', 'CD3_VL', 'CD3_Fv'] if extract_subregions else ['CD3_VH', 'CD3_VL', 'CD3_Fv']
+    all_seq_cols_to_process = seq_cols + ['CD3_VH', 'CD3_VL', 'scFv'] if extract_subregions else ['CD3_VH', 'CD3_VL', 'scFv']
 
-    # Load AAIndex DB only if requested
     aaindex_db, aaindex_desc = None, None
     if 'aaindex' in active_features:
         aaindex_db, aaindex_desc = load_aaindex()
@@ -570,101 +776,118 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
         print(f"\n⚙️  Processing region: {col}")
         seqs = df_feat[col].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper()
 
+        # Determine extraction passes: Pass 1 is Global, Pass 2 is Targeted (if defined).
+        extraction_passes = [(False, "", None)]
+        if targeted_pooling_dict and col in targeted_pooling_dict:
+            # Unpack the tuple provided by the user
+            semantic_tag, target_indices = targeted_pooling_dict[col]
+            
+            # Generate a 6-character MD5 hash of the index list to ensure cache integrity
+            list_string = str(target_indices).encode('utf-8')
+            short_hash = hashlib.md5(list_string).hexdigest()[:6]
+            
+            # Create the dynamic prefix 
+            t_prefix = f"Targeted_{semantic_tag}_{short_hash}_"
+            extraction_passes.append((True, t_prefix, target_indices))
+        
         # 1. AAC
         if 'aac' in active_features:
-            aac_cache = os.path.join(cache_dir, f"{col}_aac_features_N{expected_dataset_len}.npz")
-            cached_dict = _load_valid_cache(aac_cache, expected_dataset_len) if not is_inference else None
-            if cached_dict:
-                print("   -> [AAC] Loaded from cache")
-                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
-            else:
-                print("   -> [AAC] Calculating new features...")
-                aac_dict = compute_aac_features(seqs, prefix=f"{col}_")
-                if not is_inference: np.savez(aac_cache, **aac_dict)
-                for k, v in aac_dict.items(): new_columns[k] = v; generated_features.append(k)
+            for is_targeted, t_prefix, t_indices in extraction_passes:
+                aac_cache = os.path.join(cache_dir, f"{col}_{t_prefix}aac_features_N{expected_dataset_len}.npz")
+                cached_dict = _load_valid_cache(aac_cache, expected_dataset_len) if not is_inference else None
+                if cached_dict:
+                    print(f"   -> [{t_prefix}AAC] Loaded from cache")
+                    for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+                else:
+                    print(f"   -> [{t_prefix}AAC] Calculating new features...")
+                    aac_dict = compute_aac_features(seqs, prefix=f"{col}_{t_prefix}", target_indices=t_indices)
+                    if not is_inference: np.savez(aac_cache, **aac_dict)
+                    for k, v in aac_dict.items(): new_columns[k] = v; generated_features.append(k)
                 
         # 2. AAindex
         if 'aaindex' in active_features:
-            aaindex_cache = os.path.join(cache_dir, f"{col}_aaindex_features_N{expected_dataset_len}.npz")
-            cached_dict = _load_valid_cache(aaindex_cache, expected_dataset_len) if not is_inference else None
-            if cached_dict:
-                print("   -> [AAindex] Loaded from cache")
-                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
-            else:
-                print("   -> [AAindex] Calculating new features...")
-                aaindex_dict = compute_aaindex_features(seqs, aaindex_db, prefix=f"{col}_")
-                if aaindex_dict:
-                    if not is_inference: np.savez(aaindex_cache, **aaindex_dict)
-                    for k, v in aaindex_dict.items(): new_columns[k] = v; generated_features.append(k)
+            for is_targeted, t_prefix, t_indices in extraction_passes:
+                aaindex_cache = os.path.join(cache_dir, f"{col}_{t_prefix}aaindex_features_N{expected_dataset_len}.npz")
+                cached_dict = _load_valid_cache(aaindex_cache, expected_dataset_len) if not is_inference else None
+                if cached_dict:
+                    print(f"   -> [{t_prefix}AAindex] Loaded from cache")
+                    for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+                else:
+                    print(f"   -> [{t_prefix}AAindex] Calculating new features...")
+                    aaindex_dict = compute_aaindex_features(seqs, aaindex_db, prefix=f"{col}_{t_prefix}", target_indices=t_indices)
+                    if aaindex_dict:
+                        if not is_inference: np.savez(aaindex_cache, **aaindex_dict)
+                        for k, v in aaindex_dict.items(): new_columns[k] = v; generated_features.append(k)
                     
         # 3. Georgiev
         if 'georgiev' in active_features:
-            geo_cache = os.path.join(cache_dir, f"{col}_georgiev_features_N{expected_dataset_len}.npz")
-            cached_dict = _load_valid_cache(geo_cache, expected_dataset_len) if not is_inference else None
-            if cached_dict:
-                print("   -> [Georgiev] Loaded from cache")
-                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
-            else:
-                print("   -> [Georgiev] Calculating new features...")
-                geo_dict = compute_georgiev_features(seqs, GEORGIEV_DICT, prefix=f"{col}_")
-                if not is_inference: np.savez(geo_cache, **geo_dict)
-                for k, v in geo_dict.items(): new_columns[k] = v; generated_features.append(k)
+            for is_targeted, t_prefix, t_indices in extraction_passes:
+                geo_cache = os.path.join(cache_dir, f"{col}_{t_prefix}georgiev_features_N{expected_dataset_len}.npz")
+                cached_dict = _load_valid_cache(geo_cache, expected_dataset_len) if not is_inference else None
+                if cached_dict:
+                    print(f"   -> [{t_prefix}Georgiev] Loaded from cache")
+                    for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+                else:
+                    print(f"   -> [{t_prefix}Georgiev] Calculating new features...")
+                    geo_dict = compute_georgiev_features(seqs, GEORGIEV_DICT, prefix=f"{col}_{t_prefix}", target_indices=t_indices)
+                    if not is_inference: np.savez(geo_cache, **geo_dict)
+                    for k, v in geo_dict.items(): new_columns[k] = v; generated_features.append(k)
 
         # 4. ESM-2
         if 'esm' in active_features and ESM_AVAILABLE:
             for esm_model_name in esm_model_names:
                 esm_tag = "ESM_Small_8M" if "8M" in esm_model_name else ("ESM_Medium_35M" if "35M" in esm_model_name else ("ESM_Big_650M" if "650M" in esm_model_name else "ESM_Custom"))
-                esm_cache = os.path.join(cache_dir, f"{col}_{esm_tag}_features_N{expected_dataset_len}.npz")
-                cached_dict = _load_valid_cache(esm_cache, expected_dataset_len) if not is_inference else None
                 
-                if cached_dict:
-                    print(f"   -> [{esm_tag}] Loaded from cache")
-                    for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
-                else:
-                    print(f"   -> [{esm_tag}] Generating neural embeddings...")
-                    esm_dict, raw_embeddings_matrix = compute_esm_embeddings(seqs, esm_model_name, prefix=f"{col}_", esm_tag=esm_tag)
-                    if not is_inference: np.savez(esm_cache, **esm_dict)
-                    for k, v in esm_dict.items(): new_columns[k] = v; generated_features.append(k)
+                for is_targeted, t_prefix, t_indices in extraction_passes:
+                    esm_cache = os.path.join(cache_dir, f"{col}_{t_prefix}{esm_tag}_features_N{expected_dataset_len}.npz")
+                    cached_dict = _load_valid_cache(esm_cache, expected_dataset_len) if not is_inference else None
                     
-                # ESM SVD50 Compression
-                if esm_tag == "ESM_Big_650M":
-                    svd_cache = os.path.join(cache_dir, f"{col}_{esm_tag}_SVD50_features_N{expected_dataset_len}.npz")
-                    svd_model_path = os.path.join(cache_dir, f"{col}_{esm_tag}_SVD50_model.joblib")
-                    
-                    cached_svd = _load_valid_cache(svd_cache, expected_dataset_len) if not is_inference else None
-                    
-                    if is_inference:
-                        # 🌟 INFERENCE: Must use pre-fitted model!
-                        svd_obj = svd_models_dict.get(f"{col}_{esm_tag}")
-                        if svd_obj:
-                            print(f"   -> [{esm_tag}_SVD50] Projecting new sequences using pre-fitted SVD...")
-                            svd_dict, _ = compress_embeddings_svd(raw_embeddings_matrix, prefix=f"{col}_", esm_tag=esm_tag, svd_model=svd_obj)
-                            for k, v in svd_dict.items(): new_columns[k] = v; generated_features.append(k)
-                        else:
-                            print(f"   -> ⚠️ [{esm_tag}_SVD50] ERROR: No fitted SVD model provided for inference!")
-                            
-                    elif cached_svd and os.path.exists(svd_model_path):
-                        # 🌟 CACHE HIT: Load features AND the model
-                        print(f"   -> [{esm_tag}_SVD50] Loaded features and SVD model from cache")
-                        svd_models_dict[f"{col}_{esm_tag}"] = joblib.load(svd_model_path)
-                        for k, v in cached_svd.items(): new_columns[k] = v; generated_features.append(k)
-                        
+                    if cached_dict:
+                        print(f"   -> [{t_prefix}{esm_tag}] Loaded from cache")
+                        for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
                     else:
-                        # 🌟 CACHE MISS: Fit new model, save features AND the model
-                        print(f"   -> [{esm_tag}_SVD50] Compressing 1280D to 50 dimensions using SVD...")
-                        if cached_dict:
-                            num_dims = len(cached_dict)
-                            raw_embeddings_matrix = np.zeros((expected_dataset_len, num_dims))
-                            for i in range(num_dims): raw_embeddings_matrix[:, i] = cached_dict[f'{col}_{esm_tag}_{i}']
+                        print(f"   -> [{t_prefix}{esm_tag}] Generating neural embeddings...")
+                        esm_dict, raw_embeddings_matrix = compute_esm_embeddings(seqs, esm_model_name, prefix=f"{col}_{t_prefix}", esm_tag=esm_tag, target_indices=t_indices)
+                        if not is_inference: np.savez(esm_cache, **esm_dict)
+                        for k, v in esm_dict.items(): new_columns[k] = v; generated_features.append(k)
+                        
+                    # SVD compression applies naturally to both Global and Targeted embedding spaces
+                    if esm_tag == "ESM_Big_650M":
+                        svd_cache = os.path.join(cache_dir, f"{col}_{t_prefix}{esm_tag}_SVD50_features_N{expected_dataset_len}.npz")
+                        svd_model_path = os.path.join(cache_dir, f"{col}_{t_prefix}{esm_tag}_SVD50_model.joblib")
+                        
+                        cached_svd = _load_valid_cache(svd_cache, expected_dataset_len) if not is_inference else None
+                        
+                        # In inference, we MUST apply the saved SVD matrix to avoid test set data leakage
+                        if is_inference:
+                            svd_obj = svd_models_dict.get(f"{col}_{t_prefix}{esm_tag}")
+                            if svd_obj:
+                                print(f"   -> [{t_prefix}{esm_tag}_SVD50] Projecting using pre-fitted SVD...")
+                                svd_dict, _ = compress_embeddings_svd(raw_embeddings_matrix, prefix=f"{col}_{t_prefix}", esm_tag=esm_tag, svd_model=svd_obj)
+                                for k, v in svd_dict.items(): new_columns[k] = v; generated_features.append(k)
+                            else:
+                                print(f"   -> ⚠️ ERROR: No fitted SVD model for {col}_{t_prefix}{esm_tag}")
                                 
-                        svd_dict, fitted_svd = compress_embeddings_svd(raw_embeddings_matrix, prefix=f"{col}_", esm_tag=esm_tag)
-                        if svd_dict and fitted_svd:
-                            np.savez(svd_cache, **svd_dict)
-                            joblib.dump(fitted_svd, svd_model_path)
-                            svd_models_dict[f"{col}_{esm_tag}"] = fitted_svd
-                            for k, v in svd_dict.items(): new_columns[k] = v; generated_features.append(k)
+                        elif cached_svd and os.path.exists(svd_model_path):
+                            print(f"   -> [{t_prefix}{esm_tag}_SVD50] Loaded features and model from cache")
+                            svd_models_dict[f"{col}_{t_prefix}{esm_tag}"] = joblib.load(svd_model_path)
+                            for k, v in cached_svd.items(): new_columns[k] = v; generated_features.append(k)
+                            
                         else:
-                            print(f"   -> ⚠️ Dataset too small for SVD compression. Skipping.")
+                            print(f"   -> [{t_prefix}{esm_tag}_SVD50] Compressing 1280D to 50 dimensions using SVD...")
+                            if cached_dict:
+                                num_dims = len(cached_dict)
+                                raw_embeddings_matrix = np.zeros((expected_dataset_len, num_dims))
+                                for i in range(num_dims): raw_embeddings_matrix[:, i] = cached_dict[f'{col}_{t_prefix}{esm_tag}_{i}']
+                                    
+                            svd_dict, fitted_svd = compress_embeddings_svd(raw_embeddings_matrix, prefix=f"{col}_{t_prefix}", esm_tag=esm_tag)
+                            if svd_dict and fitted_svd:
+                                np.savez(svd_cache, **svd_dict)
+                                joblib.dump(fitted_svd, svd_model_path)
+                                svd_models_dict[f"{col}_{t_prefix}{esm_tag}"] = fitted_svd
+                                for k, v in svd_dict.items(): new_columns[k] = v; generated_features.append(k)
+                            else:
+                                print(f"   -> ⚠️ Dataset too small for SVD compression. Skipping.")
 
         # 5. AntiBERTy
         if 'antiberty' in active_features and ANTIBERTY_AVAILABLE:
@@ -701,7 +924,6 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
     # 7. PROPERMAB PHYSICS
     if 'propermab' in active_features and PROPERMAB_AVAILABLE and 'CD3_VH' in df_feat.columns and 'CD3_VL' in df_feat.columns:
         print("\n⚙️  Processing region: Propermab 3D Physics [CD3_VH + CD3_VL]")
-        # 🌟 UPDATED FILENAME
         propermab_cache = os.path.join(cache_dir, f"Propermab_CD3_features_N{expected_dataset_len}.npz")
         cached_dict = _load_valid_cache(propermab_cache, expected_dataset_len) if not is_inference else None
         
@@ -713,7 +935,6 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
             heavy_seqs = df_feat['CD3_VH'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
             light_seqs = df_feat['CD3_VL'].astype(str).str.replace(r'\s+|,', '', regex=True).str.upper().tolist()
             
-            # 🌟 UPDATED PREFIX
             propermab_dict = compute_propermab_features(heavy_seqs, light_seqs, prefix="Propermab_CD3_")
             
             if not is_inference: np.savez(propermab_cache, **propermab_dict)
@@ -726,6 +947,19 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
     return df_feat, seq_cols, generated_features, aaindex_desc, svd_models_dict
 
 def get_model(model_name, n_features, transform_type=None, weight_col=None):
+    """
+    Constructs an un-fitted scikit-learn pipeline or GridSearchCV object.
+    Automatically applies variance thresholds, scaling, and regularization constraints.
+    
+    Args:
+        model_name (str): Identifier for the algorithm (e.g., 'XGBoost', 'SVR').
+        n_features (int): Number of features (used to cap dimensions for PLS).
+        transform_type (str): Optional target transformation string.
+        weight_col (str): Column representing sample weights.
+        
+    Returns:
+        estimator: GridSearchCV object or base Pipeline.
+    """
     scoring = {'rmse': 'neg_root_mean_squared_error', 'mae': 'neg_mean_absolute_error', 'r2': 'r2', 'spearman': make_scorer(custom_spearman)}
     
     if model_name == 'RandomForest':
@@ -746,11 +980,10 @@ def get_model(model_name, n_features, transform_type=None, weight_col=None):
         base = Pipeline(steps=[
             ('vt', VarianceThreshold()),
             ('scaler', StandardScaler()),
-            # n_jobs=1 inside the model prevents clashes with GridSearchCV's n_jobs=-1
             ('model', XGBRegressor(random_state=42, n_jobs=1, objective='reg:squarederror'))
         ])
         
-        # 🌟 STRICT REGULARIZATION GRID: Designed specifically to prevent scaffold memorization
+        # Regularization grid designed to prevent scaffold memorization in shallow trees
         grid = {
             'model__n_estimators': [200],#[200],    
             'model__max_depth': [3],#[6],               # VERY shallow trees (prevents complex memorization rules)
@@ -770,9 +1003,19 @@ def get_model(model_name, n_features, transform_type=None, weight_col=None):
     return GridSearchCV(model, grid, cv=3, scoring=scoring, refit='spearman', n_jobs=1) if grid else model
 
 def plot_enrichment_comparison(y_true, y_pred, target_col, ax=None, top_quantile=0.2):
+    """
+    Plots an enrichment curve showing the model's ability to identify top-performing variants 
+    compared to a random baseline selection strategy.
+    
+    Args:
+        y_true (array-like): Ground truth values.
+        y_pred (array-like): Predicted values.
+        target_col (str): Name of the target variable for chart labeling.
+        ax (matplotlib.axes.Axes): Optional axis to draw on.
+        top_quantile (float): The fraction representing the "top tier" hits (default 0.2/20%).
+    """
     if ax is None: fig, ax = plt.subplots(figsize=(8, 6))
     
-    # Flatten arrays to prevent multi-dimensional Pandas errors
     y_true_flat = np.asarray(y_true).flatten()
     y_pred_flat = np.asarray(y_pred).flatten()
     
@@ -799,21 +1042,15 @@ def plot_enrichment_comparison(y_true, y_pred, target_col, ax=None, top_quantile
     
     ax.plot(x_abs_counts, enrichment_counts, label=f'Model Selection Hits', color='blue', lw=2.5)
     ax.plot(x_abs_counts, random_expected, 'k--', label='Random Selection (Expected)', lw=2)
-    
-    # 🌟 NEW: Shade the area between the model and random expectation to highlight the Enrichment Gain!
     ax.fill_between(x_abs_counts, enrichment_counts, random_expected, color='dodgerblue', alpha=0.15)
 
-    # 🌟 NEW: Set strict boundaries to frame the plot perfectly
-    
     ax.set_xlim(0, total_library+1)
     ax.set_ylim(0, total_top_performers+1)
     
-    # 🌟 NEW: Force the exact max integers on the X-axis (preventing text overlap)
     x_ticks = [int(t) for t in ax.get_xticks() if 0 <= t < total_library * 0.95]
     x_ticks.append(total_library)
     ax.set_xticks(x_ticks)
     
-    # 🌟 NEW: Force the exact max integers on the Y-axis
     y_ticks = [int(t) for t in ax.get_yticks() if 0 <= t < total_top_performers * 0.95]
     y_ticks.append(total_top_performers)
     ax.set_yticks(y_ticks)
@@ -826,11 +1063,29 @@ def plot_enrichment_comparison(y_true, y_pred, target_col, ax=None, top_quantile
 
 def plot_best_model_diagnostics(X, y, subregions_name, features_name, model_name, target_col, output_dir, final_estimator, 
                                 best_params=None, feature_tag="", prefix="", top_quantile=0.2, hue_data=None, hue_name=None):
-    """Clean 2x2 Grid: Scatter + Enrichment Plot + PR-AUC Sweep + ROC-AUC Sweep."""
+    """
+    Generates a 2x2 diagnostic grid (Scatter, Enrichment, PR-AUC, ROC-AUC) utilizing out-of-fold predictions.
+    
+    Args:
+        X (pd.DataFrame): Final optimized feature matrix.
+        y (pd.Series): Target array.
+        subregions_name (str): The structural regions involved (for labeling).
+        features_name (str): The feature combinations involved (for labeling).
+        model_name (str): Model algorithm identifier.
+        target_col (str): Name of the target variable.
+        output_dir (str): Save directory.
+        final_estimator (estimator): The locked/best model.
+        best_params (dict): Optional model hyperparameters to display.
+        feature_tag (str): Formatted ID for saving files safely.
+        prefix (str): Prefix tag (e.g., 'global_').
+        top_quantile (float): Hits threshold for enrichment curves.
+        hue_data (array-like): Array used to colorize scatter points by class/dataset.
+        hue_name (str): Label for the hue data.
+    """
     from sklearn.metrics import average_precision_score, roc_auc_score
     print(f"\nGenerating 2x2 diagnostic grid for {subregions_name} + {features_name}...")
     
-    # 🌟 EXPANDED: 2x2 Grid
+    # 2x2 Grid
     fig, axes = plt.subplots(2, 2, figsize=(18, 16))
     ax_scatter, ax_enrich = axes[0, 0], axes[0, 1]
     ax_pr, ax_roc = axes[1, 0], axes[1, 1]
@@ -938,15 +1193,18 @@ def plot_best_model_diagnostics(X, y, subregions_name, features_name, model_name
     plt.close()
 
 def plot_best_model_diagnostics_old(X, y, subregions_name, features_name, model_name, target_col, output_dir, final_estimator, best_params=None, threshold=None, transform_type=None, feature_tag="", hue_data=None, hue_name=None, prefix="", top_quantile=0.2):
-    """Generates the massive 3x3 diagnostic and learning curve plots for the best model."""
+    """
+    Generates an extended 3x3 diagnostic dashboard, tracking residual distributions 
+    and confusion matrices under Leave-One-Out Cross-Validation.
+    """
     transform_suffix = f"_{transform_type}" if transform_type else ""
     feat_suffix = f"_{feature_tag}" if feature_tag else ""
     title_tag = f" ({transform_type.title()} Transformed)" if transform_type else ""
     
     combo_name = f"{subregions_name} | {features_name}"
-    print(f"\nGenerating EXTENDED diagnostic plots for ({combo_name}) using {model_name} on {target_col}{title_tag}...")
+    print(f"\nGenerating extended diagnostic plots for ({combo_name}) using {model_name}...")
     
-    # 🌟 EXPANDED: 3x3 Grid (9 slots total)
+    # 3x3 Grid (9 slots total)
     fig, axes = plt.subplots(2, 3, figsize=(24, 12))
     fig.suptitle(f'Diagnostic Plots: Best Model ({combo_name} | {model_name} | {target_col}){title_tag}', fontsize=18, y=0.98)
 
@@ -954,7 +1212,6 @@ def plot_best_model_diagnostics_old(X, y, subregions_name, features_name, model_
         loo = LeaveOneOut()
         cv_preds = cross_val_predict(final_estimator, X, y, cv=loo, n_jobs=-1)
 
-        # 🌟 NEW: Safely flatten arrays before scikit-learn metrics
         y_flat = np.asarray(y).flatten()
         cv_preds_flat = np.asarray(cv_preds).flatten()
         residuals = y_flat - cv_preds_flat
@@ -962,6 +1219,7 @@ def plot_best_model_diagnostics_old(X, y, subregions_name, features_name, model_
         calc_rmse = np.sqrt(mean_squared_error(y_flat, cv_preds_flat))
         calc_mae = mean_absolute_error(y_flat, cv_preds_flat)
         calc_spearman = custom_spearman(y_flat, cv_preds_flat)
+        
         if threshold is None:
             threshold = np.median(y_flat)
             
@@ -1006,6 +1264,7 @@ def plot_best_model_diagnostics_old(X, y, subregions_name, features_name, model_
                 classification_labels.append('False Positive (FP)')
             else:
                 classification_labels.append('False Negative (FN)')
+                
         plot_df = pd.DataFrame({'Actual': y_flat, 'Predicted': cv_preds_flat, 'Classification': classification_labels})
         plot_df_res = pd.DataFrame({'Predicted': cv_preds_flat, 'Residuals': residuals})
 
@@ -1078,54 +1337,39 @@ def plot_best_model_diagnostics_old(X, y, subregions_name, features_name, model_
             for col in range(3):
                 axes[row, col].set_title("Plot Failed")
                 axes[row, col].text(0.5, 0.5, f"Error: {e}", ha='center', va='center', wrap=True)
+                
     plt.tight_layout(rect=[0, 0.03, 1, 0.96])
     plot_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_EXTENDED_diagnostics.png')
 
     plt.savefig(plot_filename, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"Saved Extended Plot '{plot_filename}'")
-    
-    # print("Generating comprehensive learning curves (this takes a moment)...")
-    # fig_lc, axes_lc = plt.subplots(2, 2, figsize=(16, 12))
-    # fig_lc.suptitle(f'Learning Curves: Best Model ({combo_name} | {model_name} | {target_col}){title_tag}', fontsize=16)
-    # metrics_to_plot = {
-    #     'Negative RMSE': 'neg_root_mean_squared_error',
-    #     'Negative MAE': 'neg_mean_absolute_error',
-    #     'R2 Score': 'r2',
-    #     'Spearman Correlation': make_scorer(custom_spearman)
-    # }
-    # try:
-    #     for ax, (name, scorer) in zip(axes_lc.flatten(), metrics_to_plot.items()):
-    #         LearningCurveDisplay.from_estimator(
-    #             final_estimator, X, y, cv=5, n_jobs=-1,
-    #             train_sizes=np.linspace(0.2, 1.0, 10),
-    #             scoring=scorer,
-    #             error_score=np.nan,
-    #             ax=ax
-    #         )
-    #         ax.set_title(f'Learning Curve ({name})')
-    #         ax.legend(loc='best')
-    # except Exception as e:
-    #     print(f"    -> Warning: Learning curves failed due to math error: {e}")
-    #     for ax in axes_lc.flatten():
-    #         ax.set_title("Learning Curve Failed")
-    # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    # lc_filename = os.path.join(output_dir, f'best_{prefix}{model_name}_{target_col}{transform_suffix}{feat_suffix}_learning_curves.png')
-    # plt.savefig(lc_filename, dpi=300, facecolor='white')
-    # plt.close()
-    # print(f"Saved Learning Curves '{lc_filename}'") 
 
 def plot_out_of_group_diagnostics(X, y, group_labels, subregions_name, features_name, model_name, target_col, output_dir, final_estimator, feature_tag="", prefix="", split_col_name=""):
-    """Trains on Group A -> Tests on all other Groups. Plots the out-of-group generalization in consolidated subplots."""
+    """
+    Evaluates model generalizability by sequentially training on one custom subgroup (e.g., variant lineage)
+    and testing exclusively on all unseen subgroups, generating scatter plots and a performance heatmap.
     
+    Args:
+        X (pd.DataFrame): Final optimized feature matrix.
+        y (pd.Series): Target array.
+        group_labels (array-like): Column designating which lineage/batch a variant belongs to.
+        subregions_name (str): Label for structural domains.
+        features_name (str): Label for feature combo.
+        model_name (str): The algorithm in use.
+        target_col (str): The target predicted.
+        output_dir (str): File destination.
+        final_estimator (estimator): Scikit-learn estimator instance to be cloned.
+        feature_tag (str): Unique file naming tag.
+        prefix (str): Preceding tag for saving files safely.
+        split_col_name (str): Label representing the Out-Of-Group column.
+    """
     print(f"\nGenerating Out-of-Group (OOG) diagnostic plots for {target_col}...")
     
     group_labels = np.asarray(group_labels).flatten()
     y_flat = np.asarray(y).flatten()
     
-    # --- NEW: Filter out ignored/empty groups ---
-    # Catch explicit ignore tags, as well as Pandas NaNs and empty strings
-    ignore_values = ['IGNORE', 'EXCLUDE']#, 'NA', 'NAN', 'NONE', '']
+    ignore_values = ['IGNORE', 'EXCLUDE']
     
     valid_mask = []
     for val in group_labels:
@@ -1137,8 +1381,6 @@ def plot_out_of_group_diagnostics(X, y, group_labels, subregions_name, features_
             valid_mask.append(True)
             
     valid_mask = np.array(valid_mask)
-    
-    # Apply the filter to X, y, and the group labels before doing any math
     group_labels = group_labels[valid_mask]
     y_flat = y_flat[valid_mask]
     
@@ -1192,7 +1434,7 @@ def plot_out_of_group_diagnostics(X, y, group_labels, subregions_name, features_
             ax.set_visible(False)
             continue
             
-        # 🌟 THE FIX: Wrap the fitting step in a Try/Except block to catch Zero Variance errors!
+        # Wrap the fitting step in a Try/Except block to catch Zero Variance errors!
         model = clone(final_estimator)
         try:
             model.fit(X_train, y_train)
@@ -1319,16 +1561,31 @@ def plot_out_of_group_diagnostics(X, y, group_labels, subregions_name, features_
         plt.savefig(heatmap_file, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
         
-        print(f"\n  -> 📊 Saved 1 Combined OOG Scatter Plot and 1 Summary Heatmap to '{output_dir}/'")
+        print(f"\n  -> 📊 Saved OOG Scatter Plot and Summary Heatmap to '{output_dir}/'")
 
 def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, target_col, prefix="", feature_tag="", aaindex_desc=None):
+    """
+    Computes SHAP (SHapley Additive exPlanations) values to interpret feature importance,
+    generating a summary plot augmented with a biological feature dictionary.
+    
+    Args:
+        model (estimator): Pre-fitted scikit-learn model.
+        X (pd.DataFrame): Training feature matrix.
+        y (pd.Series): Target array.
+        output_dir (str): Location to save the image.
+        feature_names (list): List of ordered feature strings.
+        model_name (str): Identifier (e.g., 'XGBoost').
+        target_col (str): Current target being predicted.
+        prefix (str): Pipeline branch identifier.
+        feature_tag (str): Global identifier for file saving.
+        aaindex_desc (dict): Dictionary mapping index properties for the side-box legend.
+    """
     print(f"\nExtracting SHAP feature importances for {model_name}...")
     try:
         import shap
         import re
         
-        # --- NEW: Sanitize Feature Names for XGBoost & SHAP ---
-        # Strip accented characters (like 'É') and XGBoost-forbidden brackets
+        # Sanitize feature names to comply with XGBoost requirements
         clean_features = []
         for f in feature_names:
             f_clean = str(f).encode('ascii', 'ignore').decode('ascii')
@@ -1336,17 +1593,14 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
             clean_features.append(f_clean)
         feature_names = clean_features
         
-        # 🌟 CRITICAL CRASH FIX: Actually rename the DataFrame columns!
         if isinstance(X, pd.DataFrame):
             X.columns = feature_names
-        # ------------------------------------------------------
         
-        # 🌟 CRITICAL SPEED FIX: Extract the winner BEFORE fitting!
-        # This prevents running a massive GridSearch all over again.
+        # Use base estimator directly if a cross-validation pipeline was provided
         if hasattr(model, 'best_estimator_'):
             model = model.best_estimator_
             
-        # Fit the single winning pipeline on 100% of data (Takes 1-2 seconds)
+        # Fit the single winning pipeline on 100% of data 
         model.fit(X, y)
         
         # Safely extract the base pipeline
@@ -1364,21 +1618,20 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
         is_tree = model_name in ['RandomForest', 'XGBoost'] or type(predictor).__name__ in ['RandomForestRegressor', 'XGBRegressor']
 
         if is_tree:
-            print("  -> Using lightning-fast TreeExplainer...")
+            print("  -> Using TreeExplainer...")
             explainer = shap.TreeExplainer(predictor)
             shap_values = explainer.shap_values(X_trans)[1] if isinstance(explainer.shap_values(X_trans), list) else explainer.shap_values(X_trans)
         elif model_name in ['PLSRegression', 'ElasticNet'] or (model_name == 'SVR' and getattr(predictor, 'kernel', '') == 'linear'):
-            print("  -> Using exact linear math explainer...")
+            print("  -> Using linear explainer...")
             coef = predictor.coef_.flatten()
             bg_mean = X_trans.mean(axis=0)
             shap_values = (X_trans - bg_mean) * coef
         else:
-            print("  -> Non-linear model detected. Compressing background to 5 centroids to prevent RAM crash...")
+            print("  -> Compressing background to prevent memory allocation failure...")
             background = shap.kmeans(X_trans, 5)
             explainer = shap.KernelExplainer(predictor.predict, background)
             shap_values = explainer.shap_values(X_trans, nsamples=100, silent=True)
 
-        # 🌟 NEW: Clean Y-axis + Side Dictionary Text Box 
         aac_desc = {
             'A': 'Alanine', 'R': 'Arginine', 'N': 'Asparagine', 'D': 'Aspartic Acid',
             'C': 'Cysteine', 'Q': 'Glutamine', 'E': 'Glutamic Acid', 'G': 'Glycine',
@@ -1395,7 +1648,6 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
                     base_col, code = f.split('_AAindex_')
                     clean_name = f"{code}"
                     display_features.append(clean_name)
-                    # ALSO sanitize the dictionary description to be 100% safe
                     raw_desc = aaindex_desc.get(code, "Unknown property").split('(')[0].strip()
                     legend_dict[code] = raw_desc.encode('ascii', 'ignore').decode('ascii')
                 except ValueError:
@@ -1416,7 +1668,6 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
         top_indices = np.argsort(mean_abs_shap)[-20:]
         top_features = [display_features[i] for i in top_indices]
         
-        # Build the legend text strictly for the visible features
         legend_lines = ["Feature Dictionary:"]
         import textwrap
         for feat in reversed(top_features): # Top-to-bottom plot order
@@ -1433,9 +1684,7 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
                         break
                         
         legend_text = "\n".join(legend_lines)
-        # 🌟 Make the figure wider (22 inches) to accommodate the horizontal text
         fig = plt.figure(figsize=(22, 8))
-        # 🌟 Give the text box slightly more of the horizontal layout ratio
         gs = fig.add_gridspec(1, 2, width_ratios=[2, 1.2])
         ax_shap = fig.add_subplot(gs[0])
         ax_text = fig.add_subplot(gs[1])
@@ -1457,60 +1706,117 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
     except Exception as e: print(f"⚠️ SHAP failed: {e}")
 
 def filter_active_features(all_features, sub_combo, feat_combo, global_features, custom_feature_groups=None):
+    """
+    Subsets the massive generated feature pool into a lean matrix specific to the current grid search permutation.
+    Enforces strict mathematical isolation rules to prevent global and targeted features from overlapping.
+    
+    Args:
+        all_features (list): Every single column name available in the dataframe.
+        sub_combo (tuple): The structural regions currently being evaluated (e.g., ['CD3_VH']).
+        feat_combo (tuple): The feature categories currently being evaluated (e.g., ['Targeted_AAC']).
+        global_features (list): Base columns that should remain unaffected by subregion logic.
+        custom_feature_groups (list): Additional CSV columns explicitly requested by the user.
+        
+    Returns:
+        list: Alphabetically sorted list of exactly which feature columns should be sent to the model.
+    """
     if custom_feature_groups is None: custom_feature_groups = []
     active = list(global_features)
     for f in all_features:
         if f in active: continue
 
-        # 🌟 NEW: Combinatorial CSV Columns Bypass
+        # Preserve explicit tabular CSV columns in the feature space
         if f in custom_feature_groups:
             if f in feat_combo: active.append(f)
-            continue # Skip it if it is a custom group but NOT in the current feat_combo
+            continue 
 
-        # 🌟 Safely grant CQA and Propermab VIP access, bypassing subregion checks
+        # Bypass subregion checks for whole-molecule assays and metrics
         if f.startswith('CQA_'):
             if 'CQA' in feat_combo: active.append(f)
             continue
+
+        # Structural models require paired VH/VL chains or an scFv
         if f.startswith('Propermab_'):
-            if 'Propermab' in feat_combo: active.append(f)
+            if 'Propermab' in feat_combo and (('CD3_VH' in sub_combo and 'CD3_VL' in sub_combo) or 'scFv' in sub_combo):
+                active.append(f)
             continue
 
-        # 🌟 Paired AbLang2 Bypass
         if f.startswith('Paired_CD3_VH_VL_AbLang2_'):
-            # Only activate if the user explicitly requested AbLang2 AND they provided both VH and VL!
-            if 'AbLang2_Paired' in feat_combo and 'CD3_VH' in sub_combo and 'CD3_VL' in sub_combo:
+            if 'AbLang2_Paired' in feat_combo and (('CD3_VH' in sub_combo and 'CD3_VL' in sub_combo) or 'scFv' in sub_combo):
                 active.append(f)
             continue
         
-        # Must belong to one of the active subregions
         has_sub = any(f.startswith(sub + '_') for sub in sub_combo)
         if not has_sub: continue
             
-        # Must belong to one of the active feature types
-        markers = {'AAC': '_AAC_', 'AAindex': '_AAindex_', 'Georgiev': '_Georgiev_'}
+        # Filter sequence features based on targeted vs. global status to prevent leakage
         has_feat = False
+        is_targeted_feat = '_Targeted_' in f
+        
         for ft in feat_combo:
-            if ft in markers and markers[ft] in f: has_feat = True; break
-            elif ft.startswith('ESM_'):
-                # Stop the SVD compressed features from accidentally leaking into the raw 650M test!
-                if ft == 'ESM_Big_650M':
-                    if '_ESM_Big_650M_' in f and '_SVD50_' not in f: has_feat = True; break
-                elif f"_{ft}_" in f: has_feat = True; break
-            elif ft == 'AntiBERTy' and '_AntiBERTy_' in f: has_feat = True; break
-            elif ft == 'Propermab' and f.startswith('Propermab_'): has_feat = True; break
-            elif ft == 'CQA' and f.startswith('CQA_'): has_feat = True; break
+            if ft == 'AAC':
+                if '_AAC_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'Targeted_AAC':
+                if '_AAC_' in f and is_targeted_feat: active.append(f); break
                 
-        # Always include base features like Length that lack a marker
+            elif ft == 'AAindex':
+                if '_AAindex_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'Targeted_AAindex':
+                if '_AAindex_' in f and is_targeted_feat: active.append(f); break
+                
+            elif ft == 'Georgiev':
+                if '_Georgiev_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'Targeted_Georgiev':
+                if '_Georgiev_' in f and is_targeted_feat: active.append(f); break
+                
+            elif ft == 'ESM_Small_8M':
+                if '_ESM_Small_8M_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'Targeted_ESM_Small_8M':
+                if '_ESM_Small_8M_' in f and is_targeted_feat: active.append(f); break
+                
+            elif ft == 'ESM_Medium_35M':
+                if '_ESM_Medium_35M_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'Targeted_ESM_Medium_35M':
+                if '_ESM_Medium_35M_' in f and is_targeted_feat: active.append(f); break
+                
+            elif ft == 'ESM_Big_650M':
+                if '_ESM_Big_650M_' in f and '_SVD50_' not in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'Targeted_ESM_Big_650M':
+                if '_ESM_Big_650M_' in f and '_SVD50_' not in f and is_targeted_feat: active.append(f); break
+                
+            elif ft == 'ESM_Big_650M_SVD50':
+                if '_ESM_Big_650M_SVD50_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'Targeted_ESM_Big_650M_SVD50':
+                if '_ESM_Big_650M_SVD50_' in f and is_targeted_feat: active.append(f); break
+                
+            elif ft == 'AntiBERTy':
+                if '_AntiBERTy_' in f and not is_targeted_feat: active.append(f); break
+                
         is_untyped = not any(m in f for m in ['_AAC_', '_AAindex_', '_ESM_', '_Georgiev_', 'Propermab_', 'CQA_', '_AntiBERTy_', '_AbLang2_'])
         if has_feat or is_untyped: active.append(f)
             
-    # CRITICAL FIX: Alphabetically sort the features to completely defeat Python's set randomization!
+    # Alphabetically sort the features to ensure stable output across permutations
     return sorted(list(set(active)))
 
 def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_col, model_name, output_dir, 
                                      transform_type=None, weight_col=None, prefix="", hue_col=None, rank_to_plot=0,
                                      oog_col=None, aaindex_desc=None, extended_plots=False, manual_threshold=None,
-                                     custom_feature_groups=None): # <--- NEW ARGUMENT
+                                     custom_feature_groups=None, exclude_groups=None):
+    """
+    Executes a fully automated combinatorial search across all designated subregions and feature groups.
+    Enforces rules against multicollinearity and automatically produces a final ranked leaderboard.
+    
+    Args:
+        df (pd.DataFrame): Dataset including targets and extracted features.
+        seq_cols (list): Structural sequences available to combine (e.g., VH, VL).
+        generated_features (list): Master list of all feature names present in df.
+        target_col (str): Dependent variable to predict.
+        model_name (str): Scikit-learn estimator ID (e.g., 'SVR').
+        output_dir (str): Destination for all generated plots and CSVs.
+        rank_to_plot (int): Leaderboard position to extract, fit, and plot at the end (0 = best model).
+        oog_col (str): Column name mapping variants to out-of-group splits for validation.
+        exclude_groups (list): Specific feature sets to omit from combinatorial logic.
+    """
     os.makedirs(output_dir, exist_ok=True)
     checkpoint_csv = os.path.join(output_dir, f"{prefix}exhaustive_search_checkpoint_{model_name}_{target_col}.csv")
     final_excel = os.path.join(output_dir, f"{prefix}exhaustive_search_results_{model_name}_{target_col}.xlsx")
@@ -1519,31 +1825,50 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
         f for f in generated_features 
         if not f.startswith('seq_CD3_')
         and not f.startswith('CD3_')
+        and not f.startswith('scFv_')
         and not f.startswith('CQA_')
         and not f.startswith('Propermab_')
         and not f.startswith('Paired_') 
         and (custom_feature_groups is None or f not in custom_feature_groups)
     ]
-    
+
     available_groups = []
-    if any('_AAC_' in f for f in generated_features): available_groups.append('AAC')
-    if any('_AAindex_' in f for f in generated_features): available_groups.append('AAindex')
-    if any('_ESM_Small_8M_' in f for f in generated_features): available_groups.append('ESM_Small_8M')
-    if any('_ESM_Medium_35M_' in f for f in generated_features): available_groups.append('ESM_Medium_35M')
     
-    if any(('_ESM_Big_650M_' in f and '_SVD50_' not in f) for f in generated_features): available_groups.append('ESM_Big_650M')
-    if any('_ESM_Big_650M_SVD50_' in f for f in generated_features): available_groups.append('ESM_Big_650M_SVD50')
-    if any('_AntiBERTy_' in f for f in generated_features): available_groups.append('AntiBERTy')
-    if any('Paired_VH_VL_AbLang2_' in f for f in generated_features): available_groups.append('AbLang2_Paired')
-    if any('_Georgiev_' in f for f in generated_features): available_groups.append('Georgiev')
-    if any(f.startswith('Propermab_') for f in generated_features): available_groups.append('Propermab')
-    if any(f.startswith('CQA_') for f in generated_features): available_groups.append('CQA')
+    # Register available global sequence features
+    if any('_AAC_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('AAC')
+    if any('_AAindex_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('AAindex')
+    if any('_Georgiev_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('Georgiev')
     
-    # 🌟 NEW: Add Custom CSV Columns to the permutation list
+    if any('_ESM_Small_8M_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Small_8M')
+    if any('_ESM_Medium_35M_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Medium_35M')
+    if any('_ESM_Big_650M_' in f and '_SVD50_' not in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Big_650M')
+    if any('_ESM_Big_650M_SVD50_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Big_650M_SVD50')
+    
+    # Register available targeted sequence features
+    if any('_Targeted_' in f and '_AAC_' in f for f in generated_features): available_groups.append('Targeted_AAC')
+    if any('_Targeted_' in f and '_AAindex_' in f for f in generated_features): available_groups.append('Targeted_AAindex')
+    if any('_Targeted_' in f and '_Georgiev_' in f for f in generated_features): available_groups.append('Targeted_Georgiev')
+    
+    if any('_Targeted_' in f and '_ESM_Small_8M_' in f for f in generated_features): available_groups.append('Targeted_ESM_Small_8M')
+    if any('_Targeted_' in f and '_ESM_Medium_35M_' in f for f in generated_features): available_groups.append('Targeted_ESM_Medium_35M')
+    if any('_Targeted_' in f and '_ESM_Big_650M_' in f and '_SVD50_' not in f for f in generated_features): available_groups.append('Targeted_ESM_Big_650M')
+    if any('_Targeted_' in f and '_ESM_Big_650M_SVD50_' in f for f in generated_features): available_groups.append('Targeted_ESM_Big_650M_SVD50')
+    
+    # Register advanced language models and 3D structural features
+    if any('_AntiBERTy_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('AntiBERTy')
+    if any('Paired_CD3_VH_VL_AbLang2_' in f for f in generated_features): available_groups.append('AbLang2_Paired')
+    if any(f.startswith('Propermab_') for f in generated_features): available_groups.append('Propermab')   
+    
+    # Register custom tabular columns
     if custom_feature_groups:
         for grp in custom_feature_groups:
             if grp in generated_features:
                 available_groups.append(grp)
+                
+    # Prune explicitly blacklisted feature groups
+    if exclude_groups:
+        available_groups = [g for g in available_groups if g not in exclude_groups]
+        print(f"🚫 Excluded requested feature groups: {exclude_groups}")
     
     completed_combos = set()
     file_exists = os.path.isfile(checkpoint_csv)
@@ -1566,23 +1891,57 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
         valid_feat_combos = []
         for FL in range(1, len(available_groups) + 1):
             for feat_combo in itertools.combinations(available_groups, FL):
-                lm_count = sum(1 for g in feat_combo if g.startswith('ESM_') or g in ['AntiBERTy', 'AbLang2_Paired'])
-                if lm_count <= 1:
-                    valid_feat_combos.append(feat_combo)
+                
+                # Constraint 1: Limit to one neural network model per permutation
+                lm_count = sum(1 for g in feat_combo if 'ESM_' in g or 'AntiBERTy' in g or 'AbLang2_Paired' in g)
+                if lm_count > 1:
+                    continue
+                    
+                # Constraint 2: Prevent combining Global and Targeted features of the same base type
+                conflict = False
+                for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50']:
+                    if base_feat in feat_combo and f"Targeted_{base_feat}" in feat_combo:
+                        conflict = True
+                        break
+                if conflict:
+                    continue
+
+                # Constraint 3: Georgiev and AAindex are mutually exclusive
+                has_aaindex = any('AAindex' in g for g in feat_combo)
+                has_georgiev = any('Georgiev' in g for g in feat_combo)
+                if has_aaindex and has_georgiev:
+                    continue
+
+                valid_feat_combos.append(feat_combo)
                     
         valid_sub_combos = []
         for L in range(1, len(seq_cols) + 1):
             for sub_combo in itertools.combinations(seq_cols, L):
-                if 'CD3_Fv' in sub_combo and len(sub_combo) > 1:
+                if 'scFv' in sub_combo and len(sub_combo) > 1:
                     continue
                 valid_sub_combos.append(sub_combo)
 
         valid_experiments = []
         for sub_combo in valid_sub_combos:
             for feat_combo in valid_feat_combos:
-                if 'AbLang2_Paired' in feat_combo:
-                    if 'CD3_VH' not in sub_combo or 'CD3_VL' not in sub_combo: continue
-                    if 'CD3_Fv' in sub_combo: continue
+                # Force AbLang2 and Propermab on Paired VH/VL OR scFv
+                if 'AbLang2_Paired' in feat_combo or 'Propermab' in feat_combo:
+                    has_paired = ('CD3_VH' in sub_combo and 'CD3_VL' in sub_combo)
+                    has_scfv = ('scFv' in sub_combo)
+                    if not (has_paired or has_scfv): 
+                        continue
+                
+                # Constraint 4: Prevent evaluating targeted features on regions that lack them in the dataset
+                has_targeted_feat = any('Targeted_' in g for g in feat_combo)
+                if has_targeted_feat:
+                    has_valid_targeted_region = False
+                    for sub in sub_combo:
+                        if any(f.startswith(f"{sub}_Targeted_") for f in generated_features):
+                            has_valid_targeted_region = True
+                            break
+                            
+                    if not has_valid_targeted_region:
+                        continue 
                         
                 valid_experiments.append((sub_combo, feat_combo))
             
@@ -1598,7 +1957,7 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
 
             if combo_id in completed_combos: continue
 
-            # 🌟 Passed custom_feature_groups here
+            # Passed custom_feature_groups here
             selected_cols = filter_active_features(all_cols, sub_combo, feat_combo, global_features, custom_feature_groups)
             
             if 'Media_Encoded' in all_cols and 'Media_Encoded' not in selected_cols:
@@ -1644,8 +2003,8 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
         return 
     df_results.to_excel(final_excel, index=False)
     
-    # --- STAGE 3: Final Model ---
-    print(f"\n🌟 STAGE 3: Extracting Model Rank #{rank_to_plot + 1} from leaderboard...")
+    # --- Final Model Production ---
+    print(f"\n 🌟 Extracting Model Rank #{rank_to_plot + 1} from leaderboard...")
     best_row = df_results.iloc[rank_to_plot]
     best_subs, best_feats = best_row['Subregions'].split(" + "), best_row['Features'].split(" + ")
     
@@ -1653,7 +2012,7 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
     final_feat_tag = best_row['Features'].replace(' + ', '-')
     global_tag = f"{final_sub_tag}_{final_feat_tag}"
     
-    # 🌟 Passed custom_feature_groups here
+    # Passed custom_feature_groups here
     final_cols = filter_active_features(all_cols, best_subs, best_feats, global_features, custom_feature_groups)
     
     cols_to_check = [target_col] + final_cols
@@ -1737,7 +2096,7 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
     )
 
     if not os.path.exists(model_filename):
-        print(f"\n💾 Saving Final Production Model and Feature Metadata...")
+        print(f"Saving Final Production Model and Feature Metadata...")
         joblib.dump({
             'model': locked_best_estimator,
             'features': final_cols,
@@ -1750,13 +2109,39 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
 
 def evaluate_single_combination(df, target_col, model_name, output_dir, sub_combo, feat_combo, generated_features, 
                                 transform_type=None, weight_col=None, prefix="targeted_", hue_col=None, oog_col=None, aaindex_desc=None,
-                                custom_feature_groups=None): # <--- NEW ARGUMENT
+                                custom_feature_groups=None): 
+    """
+    Evaluates a specific region and feature combination directly, bypassing the grid search logic entirely.
+    
+    Args:
+        df (pd.DataFrame): Dataset including targets and extracted features.
+        target_col (str): Dependent variable to predict.
+        model_name (str): Scikit-learn estimator ID (e.g., 'SVR').
+        output_dir (str): File destination for results.
+        sub_combo (list): Explicit regions to test (e.g., ['CD3_VH']).
+        feat_combo (list): Explicit feature groups to test (e.g., ['Targeted_ESM_Big_650M_SVD50']).
+        generated_features (list): Master list of all feature names present in df.
+    """
     print(f"\n==================================================================")
     print(f"🎯 TARGETED EVALUATION: {model_name} on {target_col}")
     print(f"   Regions: {sub_combo}")
     print(f"   Features: {feat_combo}")
     print(f"==================================================================")
     
+    # Validate structural requirements for paired-chain models to prevent silent failures
+    if 'AbLang2_Paired' in feat_combo or 'Propermab' in feat_combo:
+        has_paired = ('CD3_VH' in sub_combo and 'CD3_VL' in sub_combo)
+        has_scfv = ('scFv' in sub_combo)
+        if not (has_paired or has_scfv):
+            print("\n⚠️ WARNING: Propermab & AbLang2 mathematically require either Paired 'CD3_VH'+'CD3_VL' OR 'scFv'.")
+            print("   Your current regions will cause these features to be skipped (0 features loaded).\n")
+
+    # Warn against mixing global and targeted versions of the same space
+    for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50']:
+        if base_feat in feat_combo and f"Targeted_{base_feat}" in feat_combo:
+            print(f"\n⚠️ WARNING: You are manually mixing Global '{base_feat}' and 'Targeted_{base_feat}'.")
+            print("   This causes massive multicollinearity and will likely degrade your model!\n")
+
     os.makedirs(output_dir, exist_ok=True)
     results_excel = os.path.join(output_dir, f"{prefix}single_eval_results_{model_name}_{target_col}.xlsx")
     
@@ -1765,13 +2150,13 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
         f for f in generated_features 
         if not f.startswith('seq_CD3_')
         and not f.startswith('CD3_')
+        and not f.startswith('scFv_')
         and not f.startswith('CQA_')
         and not f.startswith('Propermab_')
         and not f.startswith('Paired_')
         and (custom_feature_groups is None or f not in custom_feature_groups)
     ]
     
-    # 🌟 Passed custom_feature_groups here
     selected_cols = filter_active_features(all_cols, sub_combo, feat_combo, global_features, custom_feature_groups)
     
     if 'Media_Encoded' in all_cols and 'Media_Encoded' not in selected_cols:
@@ -1875,8 +2260,12 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
     print(f"✅ Targeted Evaluation Complete! Results saved to {results_excel}")
 
 def main():
+    """
+    Main execution block. Configures the dataset path, target variables, structural indices, 
+    and drives the combinatorial search logic.
+    """
+
     # filepath = 'data/tubespin.csv'
-    # # When run SVR for ProA_HMW_ActiPro double check the top models in the excel. for CQA the respective model has a lowe rank in the file.
     # targets_to_test = {'ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
 
     # filepath = 'data/inhouse_supp_CD3+CD20only_UPDATED.csv'
@@ -1899,65 +2288,67 @@ def main():
     # }
 
     # filepath = 'data/50-50_sequences.csv'
-    # targets_to_test = {#'50-50_HMW%':10.0,
+    # targets_to_test = {'50-50_HMW%':10.0,
     #                   # '50-50_HCCF_Titer':750.0,
-    #                     'Normalized_50-50_HCCF_Titer':0.5
+    #                   #   'Normalized_50-50_HCCF_Titer':0.5
     #                     }
 
-    filepath = 'data/50-50_sequences_subset.csv'
-    targets_to_test = {'SUBSET_50-50_HMW%':10.0}
-    
-    models_to_test = ['SVR', 'PLSRegression', 'XGBoost']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
+    # filepath = 'data/50-50_sequences_subset.csv'
+    # targets_to_test = {'SUBSET_50-50_HMW%':20.0}
+    filepath = 'data/tubespin_subset.csv'
+    targets_to_test = {'SUBSET_ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
+
+    models_to_test = ['SVR', 'PLSRegression']#, 'XGBoost']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
     
     transform_strategy = None
-    # 🌟 NEW: Pass a list of models to extract both sets of features!
+    
     esm_model_selections = ["facebook/esm2_t6_8M_UR50D", "facebook/esm2_t33_650M_UR50D"]
     antibody_format_column = 'Type'
-    # antibody_format_column = 'Dataset'
-
-    # 🌟 NEW: Type the exact name of your 0/1 split column here! 
-    # If the column doesn't exist yet, it will just safely skip the plot.
     out_of_group_split_column = 'Manual_Split_Group'
-    
     weighting_column = None
+    
     DROP_MONOMER_OUTLIER = False 
-    # 🌟 NEW: Set to True to generate the massive 9-panel legacy diagnostic and learning curve plot
     GENERATE_EXTENDED_PLOTS = False
     
-    # 🌟 NEW: Targeted Single Evaluation Toggle
+    my_target_indices = {
+        'CD3_VH': ('Interface_looseness', [34, 36, 38, 42, 43, 44, 45, 46, 49, 60, 61, 62, 63, 96, 101, 102, 103, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117]),
+        'CD3_VL': ('Interface_looseness', [30, 33, 34, 35, 36, 37, 39, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 88, 90, 92, 94, 95, 96, 97, 98, 99, 100, 101])
+    }
+    
+    FEATURES_TO_EXCLUDE = ['ESM_Big_650M_SVD50', 'Targeted_ESM_Big_650M_SVD50']
+    
+    # Simply list the exact column names from your CSV you want to use as combinational features!
+    csv_feature_columns = [] 
+    USE_MEDIA_FEATURE = False
+    media_column = 'Media_Type'
+    
     RUN_SINGLE_EVAL = False
     single_eval_regions = ['Global_VL'] 
     single_eval_features = ['ESM_Big_650M_SVD50']
 
-    # 🌟 NEW: Targeted Single Evaluation Toggle
-    # 🌟 NEW: Media Type Integration
-    USE_MEDIA_FEATURE = False
-    media_column = 'Media_Type'
-    # 🌟 NEW: Simply list the exact column names from your CSV you want to use as combinational features!
-    # Example: csv_feature_columns = ['Titer_Excell', 'Cell_Viability']
-    csv_feature_columns = []#['50-50_HCCF_Titer'] 
-
     try:
         df = load_and_clean_data(filepath, remove_outlier=DROP_MONOMER_OUTLIER)
         dataset_name = os.path.splitext(os.path.basename(filepath))[0]
-        outlier_tag = "OutliersRemoved" if DROP_MONOMER_OUTLIER else "AllSamples"
+        outlier_tag = "OutliersRemoved" if DROP_MONOMER_OUTLIER else ""
 
         if USE_MEDIA_FEATURE and media_column in df.columns:
-            print(f"\n🧬 Integrating '{media_column}' as a single universal integer feature...")
+            print(f"\nIntegrating '{media_column}' as a single universal integer feature...")
             media_mapping = dict(enumerate(df[media_column].astype('category').cat.categories))
             df[media_column] = df[media_column].astype('category').cat.codes
             print(f"   -> Added feature: '{media_column}' to ALL models.")
-            print(f"   -> 📊 Media Dictionary: {media_mapping}")
+            print(f"   -> Media Dictionary: {media_mapping}")
 
+        # Execute extraction logic. Setting is_inference=False enables cache writing and SVD fitting.
         df_features, seq_cols, generated_features, aaindex_desc,_ = extract_sequence_features(
-            df, dataset_name=dataset_name, esm_model_names=esm_model_selections, cache_tag=outlier_tag
+            df, dataset_name=dataset_name, esm_model_names=esm_model_selections,
+            cache_tag=outlier_tag, targeted_pooling_dict=my_target_indices
         )
 
         for target_column, manual_threshold in targets_to_test.items():
             df_features_run = df_features.copy()
             generated_features_run = list(generated_features)
             
-            # 🌟 NEW: Dynamically push tabular CSV columns into the combinatorial feature space
+            # Dynamically push tabular CSV columns into the combinatorial feature space
             if csv_feature_columns:
                 for col in csv_feature_columns:
                     if col in df_features_run.columns:
@@ -1979,7 +2370,7 @@ def main():
                         generated_features=generated_features_run, transform_type=transform_strategy,
                         weight_col=weighting_column, prefix="targeted_", hue_col=antibody_format_column,
                         oog_col=out_of_group_split_column, aaindex_desc=aaindex_desc,
-                        custom_feature_groups=csv_feature_columns  # 🌟 NEW
+                        custom_feature_groups=csv_feature_columns 
                     )
                 else:
                     print(f"\n==================================================================")
@@ -1987,12 +2378,13 @@ def main():
                     print(f"==================================================================")
                     
                     evaluate_exhaustive_combinations(
-                        df_features_run, ['CD3_VH', 'CD3_VL', 'CD3_Fv'], generated_features_run, 
+                        df_features_run, ['CD3_VH', 'CD3_VL', 'scFv'], generated_features_run, 
                         target_col=target_column, model_name=model_name, output_dir=model_name, 
                         transform_type=transform_strategy, weight_col=weighting_column, prefix="global_",
                         hue_col=antibody_format_column, rank_to_plot=0,# oog_col=out_of_group_split_column,
                         aaindex_desc=aaindex_desc, extended_plots=GENERATE_EXTENDED_PLOTS, manual_threshold=manual_threshold,
-                        custom_feature_groups=csv_feature_columns  # 🌟 NEW
+                        custom_feature_groups=csv_feature_columns,
+                        exclude_groups=FEATURES_TO_EXCLUDE
                     )
             
     except FileNotFoundError:
