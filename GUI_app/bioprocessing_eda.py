@@ -787,7 +787,7 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
             short_hash = hashlib.md5(list_string).hexdigest()[:6]
             
             # Create the dynamic prefix 
-            t_prefix = f"Targeted_{semantic_tag}_{short_hash}_"
+            t_prefix = f"{semantic_tag}_{short_hash}_i-"
             extraction_passes.append((True, t_prefix, target_indices))
         
         # 1. AAC
@@ -1640,6 +1640,15 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
             'T': 'Threonine', 'W': 'Tryptophan', 'Y': 'Tyrosine', 'V': 'Valine'
         }
         
+        # Mapping the top Georgiev PCs to their biological meanings
+        georgiev_desc = {
+            'PC1': 'Hydrophobicity and Polarity',
+            'PC2': 'Size, Volume, and Molecular Weight',
+            'PC3': 'Electronic Properties and Net Charge',
+            'PC4': 'Secondary Structure Propensity (Alpha-helix)',
+            'PC5': 'Secondary Structure Propensity (Beta-sheet/turn)'
+        }
+        
         display_features = []
         legend_dict = {} 
         for f in active_feats:
@@ -1658,6 +1667,16 @@ def generate_shap_analysis(model, X, y, output_dir, feature_names, model_name, t
                     clean_name = f"{base_col} | AAC_{aa}"
                     display_features.append(clean_name)
                     legend_dict[f"AAC_{aa}"] = f"{aac_desc.get(aa, 'Unknown')} Frequency"
+                except ValueError:
+                    display_features.append(f)
+            elif '_Georgiev_' in f:
+                try:
+                    base_col, pc = f.split('_Georgiev_')
+                    clean_name = f"{base_col} | Georgiev_{pc}"
+                    display_features.append(clean_name)
+                    # Automatically map the known PCs, with a fallback for PC6-19
+                    bio_meaning = georgiev_desc.get(pc, 'Complex Biomathematical PCA Blend')
+                    legend_dict[f"Georgiev_{pc}"] = f"{bio_meaning}"
                 except ValueError:
                     display_features.append(f)
             else:
@@ -1749,51 +1768,49 @@ def filter_active_features(all_features, sub_combo, feat_combo, global_features,
         has_sub = any(f.startswith(sub + '_') for sub in sub_combo)
         if not has_sub: continue
             
-        # Filter sequence features based on targeted vs. global status to prevent leakage
-        has_feat = False
-        is_targeted_feat = '_Targeted_' in f
+        is_targeted_feat = '_i-' in f
         
         for ft in feat_combo:
             if ft == 'AAC':
-                if '_AAC_' in f and not is_targeted_feat: active.append(f); break
-            elif ft == 'Targeted_AAC':
-                if '_AAC_' in f and is_targeted_feat: active.append(f); break
+                if 'AAC_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-AAC': 
+                if 'AAC_' in f and is_targeted_feat: active.append(f); break
                 
             elif ft == 'AAindex':
-                if '_AAindex_' in f and not is_targeted_feat: active.append(f); break
-            elif ft == 'Targeted_AAindex':
-                if '_AAindex_' in f and is_targeted_feat: active.append(f); break
+                if 'AAindex_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-AAindex': 
+                if 'AAindex_' in f and is_targeted_feat: active.append(f); break
                 
             elif ft == 'Georgiev':
-                if '_Georgiev_' in f and not is_targeted_feat: active.append(f); break
-            elif ft == 'Targeted_Georgiev':
-                if '_Georgiev_' in f and is_targeted_feat: active.append(f); break
+                if 'Georgiev_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-Georgiev': 
+                if 'Georgiev_' in f and is_targeted_feat: active.append(f); break
                 
             elif ft == 'ESM_Small_8M':
-                if '_ESM_Small_8M_' in f and not is_targeted_feat: active.append(f); break
-            elif ft == 'Targeted_ESM_Small_8M':
-                if '_ESM_Small_8M_' in f and is_targeted_feat: active.append(f); break
+                if 'ESM_Small_8M_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-ESM_Small_8M': 
+                if 'ESM_Small_8M_' in f and is_targeted_feat: active.append(f); break
                 
             elif ft == 'ESM_Medium_35M':
-                if '_ESM_Medium_35M_' in f and not is_targeted_feat: active.append(f); break
-            elif ft == 'Targeted_ESM_Medium_35M':
-                if '_ESM_Medium_35M_' in f and is_targeted_feat: active.append(f); break
+                if 'ESM_Medium_35M_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-ESM_Medium_35M': 
+                if 'ESM_Medium_35M_' in f and is_targeted_feat: active.append(f); break
                 
             elif ft == 'ESM_Big_650M':
-                if '_ESM_Big_650M_' in f and '_SVD50_' not in f and not is_targeted_feat: active.append(f); break
-            elif ft == 'Targeted_ESM_Big_650M':
-                if '_ESM_Big_650M_' in f and '_SVD50_' not in f and is_targeted_feat: active.append(f); break
+                if 'ESM_Big_650M_' in f and 'SVD50_' not in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-ESM_Big_650M': 
+                if 'ESM_Big_650M_' in f and 'SVD50_' not in f and is_targeted_feat: active.append(f); break
                 
             elif ft == 'ESM_Big_650M_SVD50':
-                if '_ESM_Big_650M_SVD50_' in f and not is_targeted_feat: active.append(f); break
-            elif ft == 'Targeted_ESM_Big_650M_SVD50':
-                if '_ESM_Big_650M_SVD50_' in f and is_targeted_feat: active.append(f); break
+                if 'ESM_Big_650M_SVD50_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-ESM_Big_650M_SVD50': 
+                if 'ESM_Big_650M_SVD50_' in f and is_targeted_feat: active.append(f); break
                 
             elif ft == 'AntiBERTy':
-                if '_AntiBERTy_' in f and not is_targeted_feat: active.append(f); break
+                if 'AntiBERTy_' in f and not is_targeted_feat: active.append(f); break
                 
-        is_untyped = not any(m in f for m in ['_AAC_', '_AAindex_', '_ESM_', '_Georgiev_', 'Propermab_', 'CQA_', '_AntiBERTy_', '_AbLang2_'])
-        if has_feat or is_untyped: active.append(f)
+        is_untyped = not any(m in f for m in ['AAC_', 'AAindex_', 'ESM_', 'Georgiev_', 'Propermab_', 'CQA_', 'AntiBERTy_', 'AbLang2_'])
+        if is_untyped: active.append(f)
             
     # Alphabetically sort the features to ensure stable output across permutations
     return sorted(list(set(active)))
@@ -1835,30 +1852,30 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
     available_groups = []
     
     # Register available global sequence features
-    if any('_AAC_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('AAC')
-    if any('_AAindex_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('AAindex')
-    if any('_Georgiev_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('Georgiev')
+    if any('AAC_' in f and '_i-' not in f for f in generated_features): available_groups.append('AAC')
+    if any('AAindex_' in f and '_i-' not in f for f in generated_features): available_groups.append('AAindex')
+    if any('Georgiev_' in f and '_i-' not in f for f in generated_features): available_groups.append('Georgiev')
     
-    if any('_ESM_Small_8M_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Small_8M')
-    if any('_ESM_Medium_35M_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Medium_35M')
-    if any('_ESM_Big_650M_' in f and '_SVD50_' not in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Big_650M')
-    if any('_ESM_Big_650M_SVD50_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('ESM_Big_650M_SVD50')
+    if any('ESM_Small_8M_' in f and '_i-' not in f for f in generated_features): available_groups.append('ESM_Small_8M')
+    if any('ESM_Medium_35M_' in f and '_i-' not in f for f in generated_features): available_groups.append('ESM_Medium_35M')
+    if any('ESM_Big_650M_' in f and 'SVD50_' not in f and '_i-' not in f for f in generated_features): available_groups.append('ESM_Big_650M')
+    if any('ESM_Big_650M_SVD50_' in f and '_i-' not in f for f in generated_features): available_groups.append('ESM_Big_650M_SVD50')
     
     # Register available targeted sequence features
-    if any('_Targeted_' in f and '_AAC_' in f for f in generated_features): available_groups.append('Targeted_AAC')
-    if any('_Targeted_' in f and '_AAindex_' in f for f in generated_features): available_groups.append('Targeted_AAindex')
-    if any('_Targeted_' in f and '_Georgiev_' in f for f in generated_features): available_groups.append('Targeted_Georgiev')
+    if any('_i-' in f and 'AAC_' in f for f in generated_features): available_groups.append('i-AAC')
+    if any('_i-' in f and 'AAindex_' in f for f in generated_features): available_groups.append('i-AAindex')
+    if any('_i-' in f and 'Georgiev_' in f for f in generated_features): available_groups.append('i-Georgiev')
     
-    if any('_Targeted_' in f and '_ESM_Small_8M_' in f for f in generated_features): available_groups.append('Targeted_ESM_Small_8M')
-    if any('_Targeted_' in f and '_ESM_Medium_35M_' in f for f in generated_features): available_groups.append('Targeted_ESM_Medium_35M')
-    if any('_Targeted_' in f and '_ESM_Big_650M_' in f and '_SVD50_' not in f for f in generated_features): available_groups.append('Targeted_ESM_Big_650M')
-    if any('_Targeted_' in f and '_ESM_Big_650M_SVD50_' in f for f in generated_features): available_groups.append('Targeted_ESM_Big_650M_SVD50')
+    if any('_i-' in f and 'ESM_Small_8M_' in f for f in generated_features): available_groups.append('i-ESM_Small_8M')
+    if any('_i-' in f and 'ESM_Medium_35M_' in f for f in generated_features): available_groups.append('i-ESM_Medium_35M')
+    if any('_i-' in f and 'ESM_Big_650M_' in f and 'SVD50_' not in f for f in generated_features): available_groups.append('i-ESM_Big_650M')
+    if any('_i-' in f and 'ESM_Big_650M_SVD50_' in f for f in generated_features): available_groups.append('i-ESM_Big_650M_SVD50')
     
     # Register advanced language models and 3D structural features
-    if any('_AntiBERTy_' in f and '_Targeted_' not in f for f in generated_features): available_groups.append('AntiBERTy')
+    if any('AntiBERTy_' in f and '_i-' not in f for f in generated_features): available_groups.append('AntiBERTy')
     if any('Paired_CD3_VH_VL_AbLang2_' in f for f in generated_features): available_groups.append('AbLang2_Paired')
-    if any(f.startswith('Propermab_') for f in generated_features): available_groups.append('Propermab')   
-    
+    if any(f.startswith('Propermab_') for f in generated_features): available_groups.append('Propermab')
+
     # Register custom tabular columns
     if custom_feature_groups:
         for grp in custom_feature_groups:
@@ -1900,7 +1917,7 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
                 # Constraint 2: Prevent combining Global and Targeted features of the same base type
                 conflict = False
                 for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50']:
-                    if base_feat in feat_combo and f"Targeted_{base_feat}" in feat_combo:
+                    if base_feat in feat_combo and f"i-{base_feat}" in feat_combo:
                         conflict = True
                         break
                 if conflict:
@@ -1931,17 +1948,17 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
                     if not (has_paired or has_scfv): 
                         continue
                 
-                # Constraint 4: Prevent evaluating targeted features on regions that lack them in the dataset
-                has_targeted_feat = any('Targeted_' in g for g in feat_combo)
+                # Constraint 4: Prevent evaluating targeted features on regions that lack them
+                has_targeted_feat = any('i-' in g for g in feat_combo)
                 if has_targeted_feat:
                     has_valid_targeted_region = False
                     for sub in sub_combo:
-                        if any(f.startswith(f"{sub}_Targeted_") for f in generated_features):
+                        if any(f.startswith(f"{sub}_") and '_i-' in f for f in generated_features):
                             has_valid_targeted_region = True
                             break
                             
                     if not has_valid_targeted_region:
-                        continue 
+                        continue
                         
                 valid_experiments.append((sub_combo, feat_combo))
             
@@ -2138,8 +2155,8 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
 
     # Warn against mixing global and targeted versions of the same space
     for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50']:
-        if base_feat in feat_combo and f"Targeted_{base_feat}" in feat_combo:
-            print(f"\n⚠️ WARNING: You are manually mixing Global '{base_feat}' and 'Targeted_{base_feat}'.")
+        if base_feat in feat_combo and f"i-{base_feat}" in feat_combo:
+            print(f"\n⚠️ WARNING: You are manually mixing Global '{base_feat}' and 'i-{base_feat}'.")
             print("   This causes massive multicollinearity and will likely degrade your model!\n")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -2165,6 +2182,23 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
             feat_combo = list(feat_combo) + ['Media']
             print(f"   -> 🧪 Auto-injected Media_Encoded feature into combination.")
 
+    missing_features = []
+    for req_feat in feat_combo:
+        # Strip '_Paired' because the actual generated column name is 'Paired_CD3_..._AbLang2'
+        search_term = req_feat.replace('_Paired', '') 
+
+        # Check if this requested group contributed AT LEAST ONE column to the final matrix
+        if not any(search_term in col for col in selected_cols):
+            missing_features.append(req_feat)
+
+    if missing_features:
+        print(f"\n🛑 CRITICAL ERROR: The requested feature(s) {missing_features} generated ZERO columns!")
+        print(f"   Please check for typos in your 'single_eval_features' or 'csv_feature_columns' list.")
+        print(f"   Execution safely halted to prevent saving a mislabeled model.")
+        return
+
+    cols_to_check = [target_col] + selected_cols
+    if weight_col and weight_col in df.columns: cols_to_check.append(weight_col)
     cols_to_check = [target_col] + selected_cols
     if weight_col and weight_col in df.columns: cols_to_check.append(weight_col)
     
@@ -2293,12 +2327,12 @@ def main():
     #                   #   'Normalized_50-50_HCCF_Titer':0.5
     #                     }
 
-    # filepath = 'data/50-50_sequences_subset.csv'
-    # targets_to_test = {'SUBSET_50-50_HMW%':20.0}
-    filepath = 'data/tubespin_subset.csv'
-    targets_to_test = {'SUBSET_ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
+    filepath = 'data/50-50_sequences_subset.csv'
+    targets_to_test = {'SUBSET_50-50_HMW%':20.0}
+    # filepath = 'data/tubespin_subset.csv'
+    # targets_to_test = {'SUBSET_ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
 
-    models_to_test = ['SVR', 'PLSRegression']#, 'XGBoost']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
+    models_to_test = ['XGBoost']#, 'PLSRegression']#, 'XGBoost']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
     
     transform_strategy = None
     
@@ -2315,16 +2349,17 @@ def main():
         'CD3_VL': ('Interface_looseness', [30, 33, 34, 35, 36, 37, 39, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 88, 90, 92, 94, 95, 96, 97, 98, 99, 100, 101])
     }
     
-    FEATURES_TO_EXCLUDE = ['ESM_Big_650M_SVD50', 'Targeted_ESM_Big_650M_SVD50']
+    FEATURES_TO_EXCLUDE = ['ESM_Big_650M_SVD50', 'i-ESM_Big_650M_SVD50']
     
     # Simply list the exact column names from your CSV you want to use as combinational features!
-    csv_feature_columns = [] 
+    csv_feature_columns = ['Delta_G_Rank1', 'VH_VL_Log10_Kd','50-50_HCCF_Titer'] 
+    
     USE_MEDIA_FEATURE = False
     media_column = 'Media_Type'
     
-    RUN_SINGLE_EVAL = False
-    single_eval_regions = ['Global_VL'] 
-    single_eval_features = ['ESM_Big_650M_SVD50']
+    RUN_SINGLE_EVAL = True
+    single_eval_regions = ['CD3_VL'] 
+    single_eval_features = ['Georgiev', 'i-ESM_Big_650M', 'VH_VL_Log10_Kd']#, 'Targeted_AAC', 'Delta_G_Rank1', '50-50_HCCF_Titer']
 
     try:
         df = load_and_clean_data(filepath, remove_outlier=DROP_MONOMER_OUTLIER)
@@ -2369,7 +2404,8 @@ def main():
                         sub_combo=single_eval_regions, feat_combo=single_eval_features,
                         generated_features=generated_features_run, transform_type=transform_strategy,
                         weight_col=weighting_column, prefix="targeted_", hue_col=antibody_format_column,
-                        oog_col=out_of_group_split_column, aaindex_desc=aaindex_desc,
+                        #oog_col=out_of_group_split_column,
+                        aaindex_desc=aaindex_desc,
                         custom_feature_groups=csv_feature_columns 
                     )
                 else:
