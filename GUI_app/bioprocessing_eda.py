@@ -2426,5 +2426,3 @@ def main():
     except FileNotFoundError:
         print(f"Error: Could not find '{filepath}'.")
 
-if __name__ == "__main__":
-    main()
