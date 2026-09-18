@@ -455,13 +455,15 @@ def compress_embeddings_svd(embeddings_matrix, prefix="", esm_tag="", svd_model=
         
     return None, None
 
-def compute_antiberty_embeddings(sequences, prefix=""):
+def compute_antiberty_embeddings(sequences, prefix="", target_indices=None):
     """
     Generates 512-dimensional representations using the antibody-specific AntiBERTy language model.
+    Extracts the mean-pooled final hidden state, respecting targeted indices if supplied.
     
     Args:
         sequences (list): List of amino acid sequences.
         prefix (str): Prefix to append to the generated feature columns.
+        target_indices (list): Optional 0-indexed positions to restrict extraction to.
         
     Returns:
         dict: Dictionary of flattened AntiBERTy features.
@@ -478,8 +480,24 @@ def compute_antiberty_embeddings(sequences, prefix=""):
         else:
             with torch.no_grad():
                 emb = antiberty.embed([seq])[0]
-                if emb.shape[0] > 2: emb_mean = emb[1:-1].mean(dim=0).cpu().numpy()
-                else: emb_mean = emb.mean(dim=0).cpu().numpy()
+                
+                # Account for special tokens (cls/sep) if present
+                if emb.shape[0] > 2: 
+                    seq_emb = emb[1:-1]
+                else: 
+                    seq_emb = emb
+                
+                # Targeted interface pooling
+                if target_indices is not None:
+                    valid_indices = [i for i in target_indices if i < seq_emb.shape[0]]
+                    if valid_indices:
+                        emb_mean = seq_emb[valid_indices].mean(dim=0).cpu().numpy()
+                    else:
+                        emb_mean = np.zeros(512)
+                # Global pooling
+                else: 
+                    emb_mean = seq_emb.mean(dim=0).cpu().numpy()
+                    
                 antiberty_embeddings.append(emb_mean)
                 
     antiberty_embeddings = np.array(antiberty_embeddings)
@@ -891,17 +909,18 @@ def extract_sequence_features(df, is_inference=False, dataset_name="default_data
 
         # 5. AntiBERTy
         if 'antiberty' in active_features and ANTIBERTY_AVAILABLE:
-            antiberty_cache = os.path.join(cache_dir, f"{col}_AntiBERTy_features_N{expected_dataset_len}.npz")
-            cached_dict = _load_valid_cache(antiberty_cache, expected_dataset_len) if not is_inference else None
-            
-            if cached_dict:
-                print("   -> [AntiBERTy] Loaded from cache")
-                for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
-            else:
-                print("   -> [AntiBERTy] Generating antibody-specific embeddings...")
-                antiberty_dict = compute_antiberty_embeddings(seqs, prefix=f"{col}_")
-                if not is_inference: np.savez(antiberty_cache, **antiberty_dict)
-                for k, v in antiberty_dict.items(): new_columns[k] = v; generated_features.append(k)
+            for is_targeted, t_prefix, t_indices in extraction_passes:
+                antiberty_cache = os.path.join(cache_dir, f"{col}_{t_prefix}AntiBERTy_features_N{expected_dataset_len}.npz")
+                cached_dict = _load_valid_cache(antiberty_cache, expected_dataset_len) if not is_inference else None
+                
+                if cached_dict:
+                    print(f"   -> [{t_prefix}AntiBERTy] Loaded from cache")
+                    for k, v in cached_dict.items(): new_columns[k] = v; generated_features.append(k)
+                else:
+                    print(f"   -> [{t_prefix}AntiBERTy] Generating antibody-specific embeddings...")
+                    antiberty_dict = compute_antiberty_embeddings(seqs, prefix=f"{col}_{t_prefix}", target_indices=t_indices)
+                    if not is_inference: np.savez(antiberty_cache, **antiberty_dict)
+                    for k, v in antiberty_dict.items(): new_columns[k] = v; generated_features.append(k)
 
     # 6. AbLang2 PAIRED
     if any(k in active_features for k in ['ablang2', 'ablang2_paired']) and ABLANG2_AVAILABLE:
@@ -1808,6 +1827,8 @@ def filter_active_features(all_features, sub_combo, feat_combo, global_features,
                 
             elif ft == 'AntiBERTy':
                 if 'AntiBERTy_' in f and not is_targeted_feat: active.append(f); break
+            elif ft == 'i-AntiBERTy':
+                if 'AntiBERTy_' in f and is_targeted_feat: active.append(f); break
                 
         is_untyped = not any(m in f for m in ['AAC_', 'AAindex_', 'ESM_', 'Georgiev_', 'Propermab_', 'CQA_', 'AntiBERTy_', 'AbLang2_'])
         if is_untyped: active.append(f)
@@ -1860,6 +1881,8 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
     if any('ESM_Medium_35M_' in f and '_i-' not in f for f in generated_features): available_groups.append('ESM_Medium_35M')
     if any('ESM_Big_650M_' in f and 'SVD50_' not in f and '_i-' not in f for f in generated_features): available_groups.append('ESM_Big_650M')
     if any('ESM_Big_650M_SVD50_' in f and '_i-' not in f for f in generated_features): available_groups.append('ESM_Big_650M_SVD50')
+    if any('AntiBERTy_' in f and '_i-' not in f for f in generated_features): available_groups.append('AntiBERTy')
+    if any('AntiBERTy_' in f and '_i-' in f for f in generated_features): available_groups.append('i-AntiBERTy')
     
     # Register available targeted sequence features
     if any('_i-' in f and 'AAC_' in f for f in generated_features): available_groups.append('i-AAC')
@@ -1872,7 +1895,6 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
     if any('_i-' in f and 'ESM_Big_650M_SVD50_' in f for f in generated_features): available_groups.append('i-ESM_Big_650M_SVD50')
     
     # Register advanced language models and 3D structural features
-    if any('AntiBERTy_' in f and '_i-' not in f for f in generated_features): available_groups.append('AntiBERTy')
     if any('Paired_CD3_VH_VL_AbLang2_' in f for f in generated_features): available_groups.append('AbLang2_Paired')
     if any(f.startswith('Propermab_') for f in generated_features): available_groups.append('Propermab')
 
@@ -1916,7 +1938,7 @@ def evaluate_exhaustive_combinations(df, seq_cols, generated_features, target_co
                     
                 # Constraint 2: Prevent combining Global and Targeted features of the same base type
                 conflict = False
-                for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50']:
+                for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50', 'AntiBERTy']:
                     if base_feat in feat_combo and f"i-{base_feat}" in feat_combo:
                         conflict = True
                         break
@@ -2154,7 +2176,7 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
             print("   Your current regions will cause these features to be skipped (0 features loaded).\n")
 
     # Warn against mixing global and targeted versions of the same space
-    for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50']:
+    for base_feat in ['AAC', 'AAindex', 'Georgiev', 'ESM_Small_8M', 'ESM_Big_650M', 'ESM_Big_650M_SVD50', 'AntiBERTy']:
         if base_feat in feat_combo and f"i-{base_feat}" in feat_combo:
             print(f"\n⚠️ WARNING: You are manually mixing Global '{base_feat}' and 'i-{base_feat}'.")
             print("   This causes massive multicollinearity and will likely degrade your model!\n")
@@ -2346,20 +2368,26 @@ def main():
     
     my_target_indices = {
         'CD3_VH': ('Interface_looseness', [34, 36, 38, 42, 43, 44, 45, 46, 49, 60, 61, 62, 63, 96, 101, 102, 103, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117]),
-        'CD3_VL': ('Interface_looseness', [30, 33, 34, 35, 36, 37, 39, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 88, 90, 92, 94, 95, 96, 97, 98, 99, 100, 101])
+        'CD3_VL': ('Interface_looseness', [30, 33, 34, 35, 36, 37, 39, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 88, 90, 92, 94, 95, 96, 97, 98, 99, 100, 101]),
+        'scFv': ('Interface_looseness', [# Original VH indices
+                                            34, 36, 38, 42, 43, 44, 45, 46, 49, 60, 61, 62, 63, 96, 101, 102, 103, 107, 108,
+                                            109, 110, 111, 112, 113, 114, 115, 116, 117,
+                                            # Shifted VL indices (+140)
+                                            170, 173, 174, 175, 176, 177, 179, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 194,
+                                            195, 196, 197, 228, 230, 232, 234, 235, 236, 237, 238, 239, 240, 241])
     }
-    
+
     FEATURES_TO_EXCLUDE = ['ESM_Big_650M_SVD50', 'i-ESM_Big_650M_SVD50']
     
     # Simply list the exact column names from your CSV you want to use as combinational features!
-    csv_feature_columns = ['Delta_G_Rank1', 'VH_VL_Log10_Kd','50-50_HCCF_Titer'] 
+    csv_feature_columns = ['Delta_G_Rank1', 'VH_VL_Log10_Kd', '50-50_HCCF_Titer'] 
     
     USE_MEDIA_FEATURE = False
     media_column = 'Media_Type'
     
-    RUN_SINGLE_EVAL = True
+    RUN_SINGLE_EVAL = False
     single_eval_regions = ['CD3_VL'] 
-    single_eval_features = ['Georgiev', 'i-ESM_Big_650M', 'VH_VL_Log10_Kd']#, 'Targeted_AAC', 'Delta_G_Rank1', '50-50_HCCF_Titer']
+    single_eval_features = ['Georgiev', 'i-ESM_Big_650M', 'VH_VL_Log10_Kd']
 
     try:
         df = load_and_clean_data(filepath, remove_outlier=DROP_MONOMER_OUTLIER)
