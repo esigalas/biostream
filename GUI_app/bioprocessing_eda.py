@@ -2315,6 +2315,136 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
     
     print(f"✅ Targeted Evaluation Complete! Results saved to {results_excel}")
 
+def evaluate_ood_robustness(df_features, splits_csv, champions_excel, target_col, model_name, 
+                            generated_features, custom_feature_groups=None):
+    """
+    Evaluates Pareto champions on Out-Of-Distribution splits, calculating both 
+    Spearman correlation and Enrichment Hit Rates (Top 10% to Top 50%).
+    """
+    import pandas as pd
+    import numpy as np
+    import os
+    
+    print(f"\n==================================================================")
+    print(f"🛡️  EVALUATING OOD ROBUSTNESS & HIT RATES ON CHAMPIONS")
+    print(f"==================================================================")
+    
+    df_splits = pd.read_csv(splits_csv)
+    
+    try:
+        df_champs = pd.read_excel(champions_excel, sheet_name='Top_Performers')#sheet_name='All_Champions')
+    except Exception as e:
+        print(f"⚠️ Could not load Elite Champions from {champions_excel}. ({e})")
+        return
+
+    df_merged = pd.merge(df_features, df_splits, on='ID', how='inner')
+    df_merged = df_merged.dropna(subset=[target_col]).reset_index(drop=True)
+    splits_to_test = [col for col in df_splits.columns if col.startswith('Split_') and 'Domain' not in col]
+    
+    global_features = [
+        f for f in generated_features 
+        if not f.startswith('seq_CD3_') and not f.startswith('CD3_')
+        and not f.startswith('scFv_') and not f.startswith('CQA_')
+        and not f.startswith('Propermab_') and not f.startswith('Paired_')
+        and (custom_feature_groups is None or f not in custom_feature_groups)
+    ]
+    
+    minimize_target = any(keyword in target_col for keyword in ['HMW', 'Agg', 'Kd', 'Viscosity'])
+    sort_dir = "Ascending (Minimizing)" if minimize_target else "Descending (Maximizing)"
+    print(f"🎯 Target '{target_col}' detected. Sorting for Top Tier: {sort_dir}\n")
+    
+    output_name = f'model_comparison/OOD_Robustness_Leaderboard_{model_name}_{target_col}_without_Titer_top_performers.csv'
+    # output_name = f'model_comparison/OOD_Robustness_Leaderboard_{model_name}_{target_col}_best_holdout_models.csv'
+
+    completed_combos = set()
+    results = []
+    
+    if os.path.exists(output_name):
+        try:
+            df_existing = pd.read_csv(output_name)
+            for _, row in df_existing.iterrows():
+                completed_combos.add(f"{row['Subregions']}|{row['Features']}")
+            results = df_existing.to_dict('records')
+            print(f"✅ Resuming past {len(completed_combos)} completed models.")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not parse existing leaderboard ({e}). Starting fresh.")
+    
+    for i, row in df_champs.iterrows():
+        sub_str = str(row['Subregions']).strip()
+        feat_str = str(row['Features']).strip()
+        combo_id = f"{sub_str}|{feat_str}"
+        
+        if combo_id in completed_combos:
+            continue
+            
+        sub_combo = [s.strip() for s in sub_str.split('+')]
+        feat_combo = [f.strip() for f in feat_str.split('+')]
+        
+        selected_cols = filter_active_features(df_merged.columns.tolist(), sub_combo, feat_combo, global_features, custom_feature_groups)
+        if 'Media_Encoded' in df_merged.columns and 'Media_Encoded' not in selected_cols:
+            selected_cols.append('Media_Encoded')
+
+        print(f"\n[{i+1}/{len(df_champs)}] {sub_str} | {feat_str} ({len(selected_cols)} dims)")
+        print(f"   -> Orig CV Spearman: {row['Spearman']:.3f}")
+        
+        model_result = {
+            'Rank': i + 1, 'Subregions': sub_str, 'Features': feat_str,
+            'Num_Dims': len(selected_cols), 'CV_Spearman': row['Spearman']
+        }
+        
+        for split_col in splits_to_test:
+            train_mask = df_merged[split_col] == 'Train'
+            test_mask = df_merged[split_col] == 'Test'
+            
+            X_train, y_train = df_merged.loc[train_mask, selected_cols], df_merged.loc[train_mask, target_col]
+            X_test, y_test = df_merged.loc[test_mask, selected_cols], df_merged.loc[test_mask, target_col]
+            
+            # Setup NaN defaults in case of failure or skip
+            model_result[f'{split_col}_Spearman'] = np.nan
+            for k in [10, 20, 30, 40, 50]:
+                model_result[f'{split_col}_HR{k}'] = np.nan
+                
+            if len(X_train) < 5 or len(X_test) < 5:
+                continue
+                
+            model = get_model(model_name, len(selected_cols))
+            
+            try:
+                model.fit(X_train, y_train)
+                preds = model.predict(X_test)
+                
+                # 1. Standard Spearman
+                ood_spearman = custom_spearman(y_test, preds)
+                model_result[f'{split_col}_Spearman'] = ood_spearman
+                change_pct = ((ood_spearman - row['Spearman']) / row['Spearman']) * 100
+                
+                # 2. 🌟 NEW: Hit Rate Calculation (Top 10% to 50%)
+                y_test_s = pd.Series(y_test.values)
+                preds_s = pd.Series(preds)
+                
+                hr_strings = []
+                for k in [10, 20, 30, 40, 50]:
+                    n_k = max(1, int(len(y_test) * (k / 100.0)))
+                    
+                    true_top_k = set(y_test_s.sort_values(ascending=minimize_target).head(n_k).index)
+                    pred_top_k = set(preds_s.sort_values(ascending=minimize_target).head(n_k).index)
+                    hr_k = len(true_top_k.intersection(pred_top_k)) / n_k
+                    
+                    model_result[f'{split_col}_HR{k}'] = hr_k
+                    hr_strings.append(f"HR@{k}%: {hr_k:.2f}")
+                
+                hr_display = " | ".join(hr_strings)
+                print(f"   -> {split_col}: R = {ood_spearman:.3f} ({change_pct:+.1f}%) | {hr_display}")
+                
+            except Exception as e:
+                print(f"   -> {split_col}: Failed ({e})")
+                
+        results.append(model_result)
+        pd.DataFrame(results).to_csv(output_name, index=False)
+        completed_combos.add(combo_id)
+        
+    print(f"\n✅ SUCCESS! Leaderboard with full Hit Rate curves updated at {output_name}")
+
 def main():
     """
     Main execution block. Configures the dataset path, target variables, structural indices, 
@@ -2343,14 +2473,11 @@ def main():
     #     'HMW_combined':10.0
     # }
 
-    # filepath = 'data/50-50_sequences.csv'
-    # targets_to_test = {'50-50_HMW%':10.0,
-    #                   # '50-50_HCCF_Titer':750.0,
-    #                   #   'Normalized_50-50_HCCF_Titer':0.5
-    #                     }
+    filepath = 'data/50-50_sequences.csv'
+    targets_to_test = {'50-50_HMW%':10.0}
 
-    filepath = 'data/50-50_sequences_subset.csv'
-    targets_to_test = {'SUBSET_50-50_HMW%':20.0}
+    # filepath = 'data/50-50_sequences_subset.csv'
+    # targets_to_test = {'SUBSET_50-50_HMW%':20.0}
     # filepath = 'data/tubespin_subset.csv'
     # targets_to_test = {'SUBSET_ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
 
@@ -2386,8 +2513,15 @@ def main():
     media_column = 'Media_Type'
     
     RUN_SINGLE_EVAL = False
-    single_eval_regions = ['CD3_VL'] 
-    single_eval_features = ['Georgiev', 'i-ESM_Big_650M', 'VH_VL_Log10_Kd']
+    single_eval_regions = ['CD3_VH', 'CD3_VL'] 
+    single_eval_features = ['i-Georgiev']
+                            #['i-Georgiev', 'i-ESM_Big_650M', '50-50_HCCF_Titer']
+                            #['i-AAC', 'i-AAindex', 'i-ESM_Small_8M', 'VH_VL_Log10_Kd', '50-50_HCCF_Titer']
+                            #['i-AAindex', 'i-ESM_Small_8M', '50-50_HCCF_Titer']
+                            #['i-AAC', 'i-Georgiev', 'i-ESM_Small_8M', '50-50_HCCF_Titer']'Propermab', 'Delta_G_Rank1',
+
+    # Run separate pipeline for out of distribution evaluation based on Mutation Splits
+    RUN_OOD_EVAL = True
 
     try:
         df = load_and_clean_data(filepath, remove_outlier=DROP_MONOMER_OUTLIER)
@@ -2436,7 +2570,7 @@ def main():
                         aaindex_desc=aaindex_desc,
                         custom_feature_groups=csv_feature_columns 
                     )
-                else:
+                elif not RUN_OOD_EVAL:
                     print(f"\n==================================================================")
                     print(f"🚀 EXHAUSTIVE SEARCH: GLOBAL SEQUENCES (VH, VL, Fv)")
                     print(f"==================================================================")
@@ -2450,7 +2584,18 @@ def main():
                         custom_feature_groups=csv_feature_columns,
                         exclude_groups=FEATURES_TO_EXCLUDE
                     )
-            
+                else:
+                    evaluate_ood_robustness(
+                        df_features=df_features_run,
+                        splits_csv='data/OOD_Test_Splits.csv', # The file generated by your split script
+                        champions_excel='model_comparison/Elite_Candidates_For_Inference_50-50_without_Titer_.xlsx', # Output from Parsimony plot
+                        # champions_excel='model_comparison/best_performers_on_holdout_sequences.xlsx', # Output from Parsimony plot
+                        target_col=target_column,
+                        model_name=model_name,
+                        generated_features=generated_features_run,
+                        custom_feature_groups=csv_feature_columns
+                    )
     except FileNotFoundError:
         print(f"Error: Could not find '{filepath}'.")
+
 
