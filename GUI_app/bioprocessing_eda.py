@@ -2316,7 +2316,7 @@ def evaluate_single_combination(df, target_col, model_name, output_dir, sub_comb
     print(f"✅ Targeted Evaluation Complete! Results saved to {results_excel}")
 
 def evaluate_ood_robustness(df_features, splits_csv, champions_excel, target_col, model_name, 
-                            generated_features, custom_feature_groups=None):
+                            generated_features, custom_feature_groups=None, output_suffix="", my_sheet_name="All_models"):
     """
     Evaluates Pareto champions on Out-Of-Distribution splits, calculating both 
     Spearman correlation and Enrichment Hit Rates (Top 10% to Top 50%).
@@ -2332,7 +2332,7 @@ def evaluate_ood_robustness(df_features, splits_csv, champions_excel, target_col
     df_splits = pd.read_csv(splits_csv)
     
     try:
-        df_champs = pd.read_excel(champions_excel, sheet_name='Top_Performers')#sheet_name='All_Champions')
+        df_champs = pd.read_excel(champions_excel, sheet_name=my_sheet_name)#sheet_name='Top_Performers')#sheet_name='All_Champions')
     except Exception as e:
         print(f"⚠️ Could not load Elite Champions from {champions_excel}. ({e})")
         return
@@ -2353,8 +2353,9 @@ def evaluate_ood_robustness(df_features, splits_csv, champions_excel, target_col
     sort_dir = "Ascending (Minimizing)" if minimize_target else "Descending (Maximizing)"
     print(f"🎯 Target '{target_col}' detected. Sorting for Top Tier: {sort_dir}\n")
     
-    output_name = f'model_comparison/OOD_Robustness_Leaderboard_{model_name}_{target_col}_without_Titer_top_performers.csv'
+    # output_name = f'model_comparison/OOD_Robustness_Leaderboard_{model_name}_{target_col}_without_Titer_top_performers.csv'
     # output_name = f'model_comparison/OOD_Robustness_Leaderboard_{model_name}_{target_col}_best_holdout_models.csv'
+    output_name = f'model_comparison/OOD_Robustness_Leaderboard_{model_name}_{target_col}_{output_suffix}.csv'
 
     completed_combos = set()
     results = []
@@ -2444,158 +2445,5 @@ def evaluate_ood_robustness(df_features, splits_csv, champions_excel, target_col
         completed_combos.add(combo_id)
         
     print(f"\n✅ SUCCESS! Leaderboard with full Hit Rate curves updated at {output_name}")
-
-def main():
-    """
-    Main execution block. Configures the dataset path, target variables, structural indices, 
-    and drives the combinatorial search logic.
-    """
-
-    # filepath = 'data/tubespin.csv'
-    # targets_to_test = {'ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
-
-    # filepath = 'data/inhouse_supp_CD3+CD20only_UPDATED.csv'
-    # targets_to_test = {
-    #     'Purity%': 80.0,
-    #     # 'HMW':10.0
-    # }
-
-    # filepath = 'data/2+1_Humanized_VH5-VL_anti-CD3_variant_sequece_GA.csv'
-    # targets_to_test = {
-    #     'Monomer': 80.0,
-    #     'HMW%':10.0
-    # }
-
-    # filepath = 'data/tubespin_extended.csv'
-
-    # targets_to_test = {
-    #     # 'Monomer_combined':80.0,
-    #     'HMW_combined':10.0
-    # }
-
-    filepath = 'data/50-50_sequences.csv'
-    targets_to_test = {'50-50_HMW%':10.0}
-
-    # filepath = 'data/50-50_sequences_subset.csv'
-    # targets_to_test = {'SUBSET_50-50_HMW%':20.0}
-    # filepath = 'data/tubespin_subset.csv'
-    # targets_to_test = {'SUBSET_ELISA_Polyreactivity_Excell': 12.0}#, 'ProA_HMW_ActiPro':20, 'ProA_HMW_Excell': 20.0}
-
-    models_to_test = ['XGBoost']#, 'PLSRegression']#, 'XGBoost']#['XGBoost']#['ElasticNet', 'SVR','PLSRegression']#, 'SVR'] 
-    
-    transform_strategy = None
-    
-    esm_model_selections = ["facebook/esm2_t6_8M_UR50D", "facebook/esm2_t33_650M_UR50D"]
-    antibody_format_column = 'Type'
-    out_of_group_split_column = 'Manual_Split_Group'
-    weighting_column = None
-    
-    DROP_MONOMER_OUTLIER = False 
-    GENERATE_EXTENDED_PLOTS = False
-    
-    my_target_indices = {
-        'CD3_VH': ('Interface_looseness', [34, 36, 38, 42, 43, 44, 45, 46, 49, 60, 61, 62, 63, 96, 101, 102, 103, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117]),
-        'CD3_VL': ('Interface_looseness', [30, 33, 34, 35, 36, 37, 39, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 88, 90, 92, 94, 95, 96, 97, 98, 99, 100, 101]),
-        'scFv': ('Interface_looseness', [# Original VH indices
-                                            34, 36, 38, 42, 43, 44, 45, 46, 49, 60, 61, 62, 63, 96, 101, 102, 103, 107, 108,
-                                            109, 110, 111, 112, 113, 114, 115, 116, 117,
-                                            # Shifted VL indices (+140)
-                                            170, 173, 174, 175, 176, 177, 179, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 194,
-                                            195, 196, 197, 228, 230, 232, 234, 235, 236, 237, 238, 239, 240, 241])
-    }
-
-    FEATURES_TO_EXCLUDE = ['ESM_Big_650M_SVD50', 'i-ESM_Big_650M_SVD50']
-    
-    # Simply list the exact column names from your CSV you want to use as combinational features!
-    csv_feature_columns = ['Delta_G_Rank1', 'VH_VL_Log10_Kd', '50-50_HCCF_Titer'] 
-    
-    USE_MEDIA_FEATURE = False
-    media_column = 'Media_Type'
-    
-    RUN_SINGLE_EVAL = False
-    single_eval_regions = ['CD3_VH', 'CD3_VL'] 
-    single_eval_features = ['i-Georgiev']
-                            #['i-Georgiev', 'i-ESM_Big_650M', '50-50_HCCF_Titer']
-                            #['i-AAC', 'i-AAindex', 'i-ESM_Small_8M', 'VH_VL_Log10_Kd', '50-50_HCCF_Titer']
-                            #['i-AAindex', 'i-ESM_Small_8M', '50-50_HCCF_Titer']
-                            #['i-AAC', 'i-Georgiev', 'i-ESM_Small_8M', '50-50_HCCF_Titer']'Propermab', 'Delta_G_Rank1',
-
-    # Run separate pipeline for out of distribution evaluation based on Mutation Splits
-    RUN_OOD_EVAL = True
-
-    try:
-        df = load_and_clean_data(filepath, remove_outlier=DROP_MONOMER_OUTLIER)
-        dataset_name = os.path.splitext(os.path.basename(filepath))[0]
-        outlier_tag = "OutliersRemoved" if DROP_MONOMER_OUTLIER else ""
-
-        if USE_MEDIA_FEATURE and media_column in df.columns:
-            print(f"\nIntegrating '{media_column}' as a single universal integer feature...")
-            media_mapping = dict(enumerate(df[media_column].astype('category').cat.categories))
-            df[media_column] = df[media_column].astype('category').cat.codes
-            print(f"   -> Added feature: '{media_column}' to ALL models.")
-            print(f"   -> Media Dictionary: {media_mapping}")
-
-        # Execute extraction logic. Setting is_inference=False enables cache writing and SVD fitting.
-        df_features, seq_cols, generated_features, aaindex_desc,_ = extract_sequence_features(
-            df, dataset_name=dataset_name, esm_model_names=esm_model_selections,
-            cache_tag=outlier_tag, targeted_pooling_dict=my_target_indices
-        )
-
-        for target_column, manual_threshold in targets_to_test.items():
-            df_features_run = df_features.copy()
-            generated_features_run = list(generated_features)
-            
-            # Dynamically push tabular CSV columns into the combinatorial feature space
-            if csv_feature_columns:
-                for col in csv_feature_columns:
-                    if col in df_features_run.columns:
-                        if col not in generated_features_run:
-                            generated_features_run.append(col)
-                        print(f"✅ SUCCESS: Added CSV column '{col}' to the combinatorial feature set.")
-                    else:
-                        print(f"⚠️ WARNING: Requested feature column '{col}' not found in dataset. Skipping!")
-                    
-            for model_name in models_to_test:
-                if USE_MEDIA_FEATURE and media_column in df.columns:
-                    if media_column not in generated_features_run:
-                        generated_features_run.append(media_column)
-
-                if RUN_SINGLE_EVAL:
-                    evaluate_single_combination(
-                        df=df_features_run, target_col=target_column, model_name=model_name, output_dir=model_name,
-                        sub_combo=single_eval_regions, feat_combo=single_eval_features,
-                        generated_features=generated_features_run, transform_type=transform_strategy,
-                        weight_col=weighting_column, prefix="targeted_", hue_col=antibody_format_column,
-                        #oog_col=out_of_group_split_column,
-                        aaindex_desc=aaindex_desc,
-                        custom_feature_groups=csv_feature_columns 
-                    )
-                elif not RUN_OOD_EVAL:
-                    print(f"\n==================================================================")
-                    print(f"🚀 EXHAUSTIVE SEARCH: GLOBAL SEQUENCES (VH, VL, Fv)")
-                    print(f"==================================================================")
-                    
-                    evaluate_exhaustive_combinations(
-                        df_features_run, ['CD3_VH', 'CD3_VL', 'scFv'], generated_features_run, 
-                        target_col=target_column, model_name=model_name, output_dir=model_name, 
-                        transform_type=transform_strategy, weight_col=weighting_column, prefix="global_",
-                        hue_col=antibody_format_column, rank_to_plot=0,# oog_col=out_of_group_split_column,
-                        aaindex_desc=aaindex_desc, extended_plots=GENERATE_EXTENDED_PLOTS, manual_threshold=manual_threshold,
-                        custom_feature_groups=csv_feature_columns,
-                        exclude_groups=FEATURES_TO_EXCLUDE
-                    )
-                else:
-                    evaluate_ood_robustness(
-                        df_features=df_features_run,
-                        splits_csv='data/OOD_Test_Splits.csv', # The file generated by your split script
-                        champions_excel='model_comparison/Elite_Candidates_For_Inference_50-50_without_Titer_.xlsx', # Output from Parsimony plot
-                        # champions_excel='model_comparison/best_performers_on_holdout_sequences.xlsx', # Output from Parsimony plot
-                        target_col=target_column,
-                        model_name=model_name,
-                        generated_features=generated_features_run,
-                        custom_feature_groups=csv_feature_columns
-                    )
-    except FileNotFoundError:
-        print(f"Error: Could not find '{filepath}'.")
 
 
