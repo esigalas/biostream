@@ -5,6 +5,7 @@ import os
 from pipeline import run_scfv_developability_pipeline, score_scfv_variants
 import py3Dmol
 from stmol import showmol
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="scFv Developability", layout="wide")
 st.title("🧬 scFv Variant Developability Pipeline")
@@ -270,31 +271,103 @@ with tab2:
             st.plotly_chart(fig2, use_container_width=True)
 
         # ==========================================
-        # Final Export Table (Returns to full width)
+        # Final Export Table & Multi-Metric Radar Chart
         # ==========================================
         st.markdown("---")
         
-        passed_df = df[df['survival_status'] == True].sort_values('global_composite_score', ascending=False)
+        passed_df = df[df['survival_status'] == True].sort_values('global_composite_score', ascending=False).reset_index(drop=True)
         st.markdown(f"**Top Candidates Passing All Thresholds ({len(passed_df)} found)**")
         
-        rename_map = {
-            'id': 'Sequence ID', 'mutations': 'Mutations',
-            'global_composite_score': 'Global Score', 'janus_ddg': 'Stability (JanusDDG)',
-            'camsol_score': 'Solubility (CamSol)', 'bindpred_kd': 'Affinity (BINDPRED)',
-            'net_charge': 'Net Charge'
-        }
-        
-        raw_cols = ['id', 'mutations', 'global_composite_score', 'janus_ddg', 'camsol_score', 'bindpred_kd', 'net_charge', 'VH', 'VL']
-        export_df = passed_df[raw_cols].rename(columns=rename_map)
-        
-        st.dataframe(
-            export_df.style.background_gradient(cmap='viridis', subset=['Global Score']),
-            use_container_width=True, hide_index=True
-        )
-        
-        st.download_button(
-            label="Download Filtered Candidates",
-            data=export_df.to_csv(index=False).encode('utf-8'),
-            file_name=f"{p2_run_name}_top_candidates.csv",
-            mime='text/csv'
-        )
+        if len(passed_df) > 0:
+            col_radar, col_table = st.columns([1, 2])
+            
+            with col_radar:
+                st.subheader("7-Axis Developability Footprint")
+                
+                selected_ids = st.multiselect(
+                    "Select Variants to Compare:", 
+                    options=passed_df['id'], 
+                    default=passed_df['id'].head(2).tolist()
+                )
+                
+                if selected_ids:
+                    radar_fig = go.Figure()
+                    # 7 categories matching our 7 normalizations
+                    categories = [
+                        'Solubility (CamSol)', 'Stability (Janus)', 'Affinity (BINDPRED)', 
+                        'General (ESM-2)', 'Ab-Specific (AntiBERTy)', 
+                        'Paired-Ab (AbLang2)', 'Evolutionary (ProtBERT)'
+                    ]
+                    
+                    for variant_id in selected_ids:
+                        v_data = df[df['id'] == variant_id].iloc[0]
+                        
+                        values = [
+                            v_data.get('camsol_norm', 0.5),
+                            v_data.get('janus_norm', 0.5), 
+                            v_data.get('bindpred_norm', 0.5),
+                            v_data.get('esm_norm', 0.5),
+                            v_data.get('ab_norm', 0.5),
+                            v_data.get('ablang_norm', 0.5),
+                            v_data.get('protbert_norm', 0.5)
+                        ]
+                        
+                        values.append(values[0]) # Close the polygon
+                        cat_closed = categories + [categories[0]]
+                        
+                        radar_fig.add_trace(go.Scatterpolar(
+                            r=values, theta=cat_closed,
+                            fill='toself', name=variant_id,
+                            hoverinfo="text",
+                            text=[f"{val:.2f}" for val in values]
+                        ))
+                        
+                    radar_fig.update_layout(
+                        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                        showlegend=True, legend=dict(orientation="h", y=-0.2),
+                        margin=dict(l=40, r=40, t=20, b=20), height=400
+                    )
+                    st.plotly_chart(radar_fig, use_container_width=True)
+                else:
+                    st.info("Select a variant to view its developability footprint.")
+
+            with col_table:
+                rename_map = {
+                    'id': 'Sequence ID', 'mutations': 'Mutations',
+                    'global_composite_score': 'Global Score', 
+                    'esm_fitness': 'ESM-2 (General)', 
+                    'antiberty_fitness': 'AntiBERTy (Ab-Specific)',
+                    'ablang_fitness': 'AbLang2 (Paired)',
+                    'protbert_fitness': 'ProtBERT (Evolution)',
+                    'janus_ddg': 'Stability (Janus)',
+                    'camsol_score': 'Solubility (CamSol)', 
+                    'bindpred_kd': 'Affinity (BINDPRED)',
+                    'net_charge': 'Net Charge',
+                    'VH': 'VH Sequence', 'VL': 'VL Sequence'
+                }
+                
+                # REORDERED: All 4 PLMs grouped immediately after the Global Score
+                download_cols = [
+                    'id', 'mutations', 'global_composite_score', 
+                    'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
+                    'janus_ddg', 'camsol_score', 'bindpred_kd', 'net_charge', 
+                    'VH', 'VL'
+                ]
+                
+                download_df = passed_df[download_cols].rename(columns=rename_map)
+                
+                # Filter out the heavy sequence strings for the UI table
+                display_cols = [c for c in download_df.columns if c not in ['VH Sequence', 'VL Sequence']]
+                display_df = download_df[display_cols]
+                
+                st.dataframe(
+                    display_df.style.background_gradient(cmap='viridis', subset=['Global Score']),
+                    use_container_width=True, hide_index=True
+                )
+                
+                st.download_button(
+                    label="Download Filtered Candidates",
+                    data=download_df.to_csv(index=False).encode('utf-8'),
+                    file_name=f"{p2_run_name}_top_candidates.csv",
+                    mime='text/csv'
+                )

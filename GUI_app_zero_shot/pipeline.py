@@ -19,60 +19,43 @@ from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
 from catboost import CatBoostRegressor
 from huggingface_hub import hf_hub_download
+import gc
 
 def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     print(f"--- Phase 2: Scoring Variants for {run_name} ---")
     
     # ---------------------------------------------------------
-    # 1. File Checks & Path Injection
+    # 1. File Checks & Parsing
     # ---------------------------------------------------------
     raw_fasta_path = os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
     camsol_txt_path = os.path.join(run_dir, f"{run_name}_camsol.txt")
     
     if not os.path.exists(raw_fasta_path):
         raise FileNotFoundError(f"Cannot find {raw_fasta_path}. Run Phase 1 first.")
-    if not os.path.exists(camsol_txt_path):
-        raise FileNotFoundError(f"Cannot find {camsol_txt_path}. Upload your FASTA to the CamSol web server, download the results, and save it here.")
-
-    # Inject the JanusDDG src directory directly into Python's path
+    
     janus_src_path = "/home/esigalas/workspace/JanusDDG/src" 
     if janus_src_path not in sys.path:
         sys.path.append(janus_src_path)
         
-    try:
-        import utils
-        import esm
-        # Hijack the internal MODELS_DIR variable so utils.load_model 
-        # looks in your cloned repo instead of the current working directory
-        utils.MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models" 
-    except ImportError as e:
-        raise ImportError(f"Failed to load Janus dependencies. Ensure 'fair-esm' is installed and path is correct. ({e})")
+    import utils
+    import esm
+    utils.MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models" 
 
-    # ---------------------------------------------------------
-    # 2. Parse FASTA and Extract Mutations & Chains
-    # ---------------------------------------------------------
     records = list(SeqIO.parse(raw_fasta_path, "fasta"))
     variants = []
-    
-    clean_wt = wt_sequence.replace(":", "")
+    clean_wt = wt_sequence.replace(":", "").replace("/", "")
     
     for i, record in enumerate(records):
-        # 1. Generate the exact same ID used in the CamSol upload to allow pandas merging
         unique_id = f"{run_name}_WT" if i == 0 else f"{run_name}_sample_{i}"
+        raw_seq_str = str(record.seq).replace(":", "").replace("/", "")
         
-        # 2. Use the native AntiFold delimiter to isolate the chains
-        raw_seq_str = str(record.seq)
-        if "/" in raw_seq_str:
-            vh, vl = raw_seq_str.split("/")
-        elif ":" in raw_seq_str:
-            vh, vl = raw_seq_str.split(":")
-        else:
-            vh, vl = raw_seq_str, ""
+        # Approximate VH/VL split based on WT length
+        vh_len = len(clean_wt) // 2  # Adjust if your sequences split differently
+        vh, vl = raw_seq_str[:vh_len], raw_seq_str[vh_len:]
             
         mut_seq = vh + vl
         mutations = []
         
-        # 3. Calculate mutations
         if mut_seq == clean_wt:
             mut_string = "WT"
         else:
@@ -81,179 +64,228 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
                     mutations.append(f"{wt_aa}{idx+1}{mut_aa}")
             mut_string = ",".join(mutations)
             
-        variants.append({
-            "id": unique_id,
-            "mutations": mut_string,
-            "VH": vh,  # Save independent chains
-            "VL": vl
-        })
+        variants.append({"id": unique_id, "mutations": mut_string, "VH": vh, "VL": vl})
         
     df = pd.DataFrame(variants)
-    print(f"Loaded {len(df)} variants. Identifying mutations...")
     
     # ---------------------------------------------------------
-    # 3. Integrate Web Server CamSol Scores
+    # 2. Integrate Web Server CamSol Scores
     # ---------------------------------------------------------
-    print("Merging CamSol web server predictions...")
     camsol_df = pd.read_csv(camsol_txt_path, sep='\t')
-    
-    if len(camsol_df) != len(df):
-        raise ValueError(f"Mismatch: CamSol file has {len(camsol_df)} rows, but FASTA has {len(df)}.")
-        
     df['camsol_score'] = camsol_df['protein variant score'].values
     
-    # ---------------------------------------------------------
-    # 4. Global Model Initialization (ESM-2 & BINDPRED)
-    # ---------------------------------------------------------
-    print("Initializing ESM-2 Model for BINDPRED and JanusDDG...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    wt_list = list(clean_wt)
+
+    # ---------------------------------------------------------
+    # 3. PLM 1: AntiBERTy (Antibody-Specific Fitness)
+    # ---------------------------------------------------------
+    print("Loading AntiBERTy...")
+    from transformers import AutoModelForMaskedLM, AutoTokenizer
+    ab_tokenizer = AutoTokenizer.from_pretrained("jeffruffolo/AntiBERTy")
+    ab_model = AutoModelForMaskedLM.from_pretrained("jeffruffolo/AntiBERTy").to(device)
+    ab_model.eval()
+
+    ab_fitness_scores = []
+    for _, row in df.iterrows():
+        if row['mutations'] == "WT":
+            ab_fitness_scores.append(0.0)
+            continue
+            
+        mut_delta_logp = 0.0
+        for m in row['mutations'].split(","):
+            wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+            masked_seq = wt_list.copy()
+            masked_seq[pos] = "[MASK]" 
+            
+            inputs = ab_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
+            with torch.no_grad():
+                logits = ab_model(**inputs).logits
+                log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1) 
+                mut_delta_logp += (log_probs[ab_tokenizer.convert_tokens_to_ids(mut_aa)] - 
+                                   log_probs[ab_tokenizer.convert_tokens_to_ids(wt_aa)]).item()
+        ab_fitness_scores.append(mut_delta_logp)
+        
+    df['antiberty_fitness'] = ab_fitness_scores
+    del ab_model, ab_tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ---------------------------------------------------------
+    # 4. PLM 2: AbLang2 (Paired Germline Fitness)
+    # ---------------------------------------------------------
+    print("Loading AbLang2...")
+    import ablang2
+    import numpy as np
     
+    # Initialized exactly as your snippet demonstrated
+    ablang_model = ablang2.pretrained("ablang2-paired", random_init=False) 
+    
+    ablang_fitness_scores = []
+    
+    # 1. Calculate the baseline Wild-Type (WT) sequence likelihood
+    wt_row = df[df['mutations'] == "WT"].iloc[0]
+    
+    # ablang returns an array of likelihoods for each position. We sum them for the total sequence score.
+    wt_res = ablang_model([[wt_row['VH'], wt_row['VL']]], mode='likelihood')
+    wt_score = np.sum(wt_res[0]) 
+    
+    for _, row in df.iterrows():
+        if row['mutations'] == "WT":
+            ablang_fitness_scores.append(0.0)
+            continue
+            
+        # 2. Calculate the Mutant sequence likelihood
+        mut_res = ablang_model([[row['VH'], row['VL']]], mode='likelihood')
+        mut_score = np.sum(mut_res[0])
+        
+        # 3. Delta Log-Likelihood (Mutant - WT)
+        # Positive values mean the mutant is more fit/germline-like than the WT
+        mut_delta_logp = mut_score - wt_score
+        
+        ablang_fitness_scores.append(mut_delta_logp)
+
+    df['ablang_fitness'] = ablang_fitness_scores
+    
+    # Safely clear the model from GPU
+    del ablang_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ---------------------------------------------------------
+    # 5. PLM 3: ProtBERT (Evolutionary Fitness)
+    # ---------------------------------------------------------
+    print("Loading ProtBERT...")
+    from transformers import AutoModelForMaskedLM, AutoTokenizer
+    
+    pb_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")
+    pb_model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert").to(device)
+    pb_model.eval()
+
+    pb_fitness_scores = []
+    for _, row in df.iterrows():
+        if row['mutations'] == "WT":
+            pb_fitness_scores.append(0.0)
+            continue
+            
+        mut_delta_logp = 0.0
+        for m in row['mutations'].split(","):
+            wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+            masked_seq = wt_list.copy()
+            masked_seq[pos] = "[MASK]" 
+            
+            # ProtBERT requires space-separated sequences like AntiBERTy
+            inputs = pb_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
+            
+            with torch.no_grad():
+                logits = pb_model(**inputs).logits
+                # ProtBERT adds a [CLS] token at the start, so offset by 1
+                log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1)
+                
+                wt_tok = pb_tokenizer.convert_tokens_to_ids(wt_aa)
+                mut_tok = pb_tokenizer.convert_tokens_to_ids(mut_aa)
+                
+                mut_delta_logp += (log_probs[mut_tok] - log_probs[wt_tok]).item()
+                
+        pb_fitness_scores.append(mut_delta_logp)
+
+    df['protbert_fitness'] = pb_fitness_scores
+    del pb_model, pb_tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ---------------------------------------------------------
+    # 6. PLM 4: ESM-2 (General Fitness) & BINDPRED
+    # ---------------------------------------------------------
+    print("Loading ESM-2 & BINDPRED...")
     model_esm, alphabet_esm = esm.pretrained.esm2_t33_650M_UR50D()
     model_esm = model_esm.to(device)
     batch_converter_esm = alphabet_esm.get_batch_converter()
     model_esm.eval()
 
-    print("Downloading and Loading BINDPRED CatBoost Model...")
-    model_path = hf_hub_download(repo_id="hbp5181/BindPred", filename="ESM2_BindPred.cbm")
     bindpred_model = CatBoostRegressor()
-    bindpred_model.load_model(model_path, format="cbm")
+    bindpred_model.load_model(hf_hub_download(repo_id="hbp5181/BindPred", filename="ESM2_BindPred.cbm"), format="cbm")
 
-    # ---------------------------------------------------------
-    # 5. Calculate Net Charge & BINDPRED Inference
-    # ---------------------------------------------------------
-    print("Calculating Net Charge and running BINDPRED inference...")
-    bindpred_scores = []
-    net_charges = []
-    
+    net_charges, bindpred_scores, esm_fitness_scores = [], [], []
+
     for _, row in df.iterrows():
-        # 1. Net Charge at pH 7.4
-        full_seq = row['VH'] + row['VL']
-        charge = ProteinAnalysis(full_seq).charge_at_pH(7.4)
-        net_charges.append(charge)
+        net_charges.append(ProteinAnalysis(row['VH'] + row['VL']).charge_at_pH(7.4))
         
-        # 2. Extract ESM-2 Embeddings
-        data = [("VH", row['VH']), ("VL", row['VL'])]
-        _, _, batch_tokens = batch_converter_esm(data)
-        batch_tokens = batch_tokens.to(device)
-        
+        _, _, batch_tokens = batch_converter_esm([("VH", row['VH']), ("VL", row['VL'])])
         with torch.no_grad():
-            results = model_esm(batch_tokens, repr_layers=[33], return_contacts=False)
-            token_reps = results["representations"][33]
-            
-            # Extract mean-pooled tensors and move them back to CPU/Numpy for CatBoost
-            vh_emb = token_reps[0, 1 : len(row['VH']) + 1].mean(0).cpu().numpy()
-            vl_emb = token_reps[1, 1 : len(row['VL']) + 1].mean(0).cpu().numpy()
-            
-            # 3. Stack features (1280 + 1280 = 2560 dimensions) and predict
-            combined_features = np.hstack([vh_emb, vl_emb])
-            kd_score = bindpred_model.predict(combined_features)
-            
-            bindpred_scores.append(kd_score)
+            reps = model_esm(batch_tokens.to(device), repr_layers=[33], return_contacts=False)["representations"][33]
+            bindpred_scores.append(bindpred_model.predict(np.hstack([
+                reps[0, 1:len(row['VH'])+1].mean(0).cpu().numpy(),
+                reps[1, 1:len(row['VL'])+1].mean(0).cpu().numpy()
+            ])))
 
-    df['net_charge'] = net_charges
-    df['bindpred_kd'] = bindpred_scores
+        if row['mutations'] == "WT":
+            esm_fitness_scores.append(0.0)
+        else:
+            mut_delta_logp = 0.0
+            for m in row['mutations'].split(","):
+                wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+                masked_seq = wt_list.copy()
+                masked_seq[pos] = "<mask>"
+                
+                _, _, mask_tokens = batch_converter_esm([("seq", "".join(masked_seq))])
+                with torch.no_grad():
+                    log_probs = torch.log_softmax(model_esm(mask_tokens.to(device))["logits"][0, pos + 1], dim=-1)
+                    mut_delta_logp += (log_probs[alphabet_esm.tok_to_idx[mut_aa]] - log_probs[alphabet_esm.tok_to_idx[wt_aa]]).item()
+            esm_fitness_scores.append(mut_delta_logp)
 
-    
+    df['net_charge'], df['bindpred_kd'], df['esm_fitness'] = net_charges, bindpred_scores, esm_fitness_scores
+
     # ---------------------------------------------------------
-    # 6. JanusDDG Scoring (Thermodynamic Stability)
+    # 7. JanusDDG Scoring
     # ---------------------------------------------------------
-    print("Running JanusDDG stability predictions locally...")
-    
-    # Isolate only mutated sequences for Janus
-    janus_df = df[df['mutations'] != "WT"].copy()
-    
-    # Format the temporary CSV exactly as utils.py expects
-    janus_input = pd.DataFrame({
-        'ID': janus_df['id'],
-        'Sequence': clean_wt, 
-        'MTS': janus_df['mutations'].str.replace(",", "_") 
-    })
-    
+    print("Running JanusDDG...")
     temp_csv_path = os.path.join(run_dir, "temp_janus_input.csv")
-    janus_input.to_csv(temp_csv_path, index=False)
+    pd.DataFrame({'ID': df[df['mutations'] != "WT"]['id'], 'Sequence': clean_wt, 
+                  'MTS': df[df['mutations'] != "WT"]['mutations'].str.replace(",", "_")}).to_csv(temp_csv_path, index=False)
     
-    # --- HOTFIX FOR PYTORCH UNPICKLER ---
     import __main__
     import model as janus_model
-    
-    # 1. Patch the missing global device variable in their model.py file
     janus_model.device = device
-    
-    # 2. Map their architectures into the notebook's global scope so torch.load can find them
     setattr(__main__, 'Cross_Attention_DDG', janus_model.Cross_Attention_DDG)
     setattr(__main__, 'TransformerRegression', janus_model.TransformerRegression)
     setattr(__main__, 'SinusoidalPositionalEncoding', janus_model.SinusoidalPositionalEncoding)
-    # ------------------------------------
 
     model_janus = utils.load_model('JanusDDG_fine_tuned.pth', device)
-    
-    # Execute the academic pipeline
     pred_dir, _ = utils.process_and_predict(temp_csv_path, model_janus, model_esm, batch_converter_esm, device)
-    
-    # Map predictions back to the main dataframe (filling WT with 0.0)
-    janus_df['janus_ddg'] = pred_dir.values
-    df = df.merge(janus_df[['id', 'janus_ddg']], on='id', how='left')
-    df['janus_ddg'] = df['janus_ddg'].fillna(0.0)
-    
-    # Clean up temporary file
+    df = df.merge(pd.DataFrame({'id': df[df['mutations'] != "WT"]['id'], 'janus_ddg': pred_dir.values}), on='id', how='left').fillna({'janus_ddg': 0.0})
     os.remove(temp_csv_path)
 
     # ---------------------------------------------------------
-    # 5. Evaluation Metrics & Global Composite Score
+    # 8. 7-Pillar Normalization & Global Composite Score
     # ---------------------------------------------------------
-    print("Establishing survival thresholds and global composite scores...")
-    
-    # 1. Baseline Survival Status (Required for Step 6 Seaborn diagnostic plot)
-    camsol_10th_p = df['camsol_score'].quantile(0.10)
     df['survives_ddg'] = df['janus_ddg'] >= -1.0
-    df['survives_camsol'] = df['camsol_score'] >= camsol_10th_p
+    df['survives_camsol'] = df['camsol_score'] >= df['camsol_score'].quantile(0.10)
     df['survival_status'] = df['survives_ddg'] & df['survives_camsol']
     
-    # 2. Normalize CamSol (Higher is better -> 1.0)
-    c_min, c_max = df['camsol_score'].min(), df['camsol_score'].max()
-    camsol_norm = (df['camsol_score'] - c_min) / (c_max - c_min) if c_max > c_min else 0.5
-    
-    # 3. Normalize JanusDDG (Lower/more negative is better -> 1.0)
-    j_min, j_max = df['janus_ddg'].min(), df['janus_ddg'].max()
-    janus_norm = (j_max - df['janus_ddg']) / (j_max - j_min) if j_max > j_min else 0.5
-    
-    # 4. Normalize BINDPRED (Lower/more negative Kd is better -> 1.0)
-    b_min, b_max = df['bindpred_kd'].min(), df['bindpred_kd'].max()
-    bindpred_norm = (b_max - df['bindpred_kd']) / (b_max - b_min) if b_max > b_min else 0.5
-    
-    # 5. Balanced Composite Score (0.0 = worst, 1.0 = best across batch)
-    df['global_composite_score'] = (camsol_norm + janus_norm + bindpred_norm) / 3.0
-    df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
+    def norm(col, invert=False):
+        c_min, c_max = df[col].min(), df[col].max()
+        if c_max == c_min: return 0.5
+        return (c_max - df[col]) / (c_max - c_min) if invert else (df[col] - c_min) / (c_max - c_min)
 
-    # ---------------------------------------------------------
-    # 6. Diagnostic Visualization
-    # ---------------------------------------------------------
-    output_csv = os.path.join(run_dir, f"{run_name}_developability_metrics.csv")
-    df.to_csv(output_csv, index=False)
+    df['camsol_norm'] = norm('camsol_score')
+    df['janus_norm'] = norm('janus_ddg', invert=True)     # Lower is better
+    df['bindpred_norm'] = norm('bindpred_kd', invert=True) # Lower is better
+    df['esm_norm'] = norm('esm_fitness')
+    df['ab_norm'] = norm('antiberty_fitness')
+    df['ablang_norm'] = norm('ablang_fitness')
+    df['protbert_norm'] = norm('protbert_fitness')
+
+    # Update the global composite score equation:
+    df['global_composite_score'] = (df['camsol_norm'] + df['janus_norm'] + df['bindpred_norm'] + 
+                                    df['esm_norm'] + df['ab_norm'] + df['ablang_norm'] + df['protbert_norm']) / 7.0
     
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(
-        data=df, x='janus_ddg', y='camsol_score', 
-        hue='survival_status', palette={True: "#2ca02c", False: "#d62728"},
-        s=70, edgecolor="w", alpha=0.8
-    )
-    plt.axvline(-1.0, color='gray', linestyle='--', label="DDG Threshold")
-    plt.axhline(camsol_10th_p, color='gray', linestyle=':', label="CamSol 10th %ile")
-    plt.title(f"Variant Survival: {df['survival_status'].sum()} / {len(df)} Passed")
-    plt.xlabel("JanusDDG (ΔΔG)")
-    plt.ylabel("CamSol Intrinsic Score")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
+    df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
+    df.to_csv(os.path.join(run_dir, f"{run_name}_developability_metrics.csv"), index=False)
     
-    plot_path = os.path.join(run_dir, f"{run_name}_diagnostic_scatter.png")
-    plt.savefig(plot_path)
-    plt.close()
-    
-    print(f"Phase 2 complete! Results ready at {output_csv}")
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
     return df
 
 def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: str, run_name: str):
