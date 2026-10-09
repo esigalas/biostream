@@ -3,14 +3,16 @@ import sys
 import pandas as pd
 import numpy as np
 from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
+from Bio.Seq import Seq
 import seaborn as sns
 import matplotlib.pyplot as plt
 import torch
-    
+import torch.nn.functional as F
 import subprocess
 import shutil
 import urllib.request
-from transformers import AutoTokenizer, EsmForProteinFolding
+from transformers import AutoTokenizer, EsmForProteinFolding, AutoModelForMaskedLM
 import pyrosetta
 from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.core.scoring import ScoreFunctionFactory
@@ -20,6 +22,9 @@ from Bio.SeqUtils.ProtParam import ProteinAnalysis
 from catboost import CatBoostRegressor
 from huggingface_hub import hf_hub_download
 import gc
+import glob
+import streamlit as st
+import esm
 
 def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     print(f"--- Phase 2: Scoring Variants for {run_name} ---")
@@ -38,7 +43,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         sys.path.append(janus_src_path)
         
     import utils
-    import esm
+
     utils.MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models" 
 
     records = list(SeqIO.parse(raw_fasta_path, "fasta"))
@@ -81,7 +86,6 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     # 3. PLM 1: AntiBERTy (Antibody-Specific Fitness)
     # ---------------------------------------------------------
     print("Loading AntiBERTy...")
-    from transformers import AutoModelForMaskedLM, AutoTokenizer
     ab_tokenizer = AutoTokenizer.from_pretrained("jeffruffolo/AntiBERTy")
     ab_model = AutoModelForMaskedLM.from_pretrained("jeffruffolo/AntiBERTy").to(device)
     ab_model.eval()
@@ -157,7 +161,6 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     # 5. PLM 3: ProtBERT (Evolutionary Fitness)
     # ---------------------------------------------------------
     print("Loading ProtBERT...")
-    from transformers import AutoModelForMaskedLM, AutoTokenizer
     
     pb_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")
     pb_model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert").to(device)
@@ -288,7 +291,8 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     if torch.cuda.is_available(): torch.cuda.empty_cache()
     return df
 
-def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: str, run_name: str):
+def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: str, run_name: str, 
+                                     gen_models=["AntiFold (Antibody-specific)"], num_seqs=100, temp=0.2):
     
     # 1. Create a dedicated workspace for this specific run
     run_dir = os.path.join(base_output_dir, run_name)
@@ -361,7 +365,8 @@ def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: 
                 if res_idx > vh_len:
                     current_chain = 'B'
                     line = line[:21] + 'B' + line[22:]
-                    new_res_idx = res_idx - vh_len
+                    # FIX: Subtract both the VH length AND the artificial 512 offset
+                    new_res_idx = res_idx - vh_len - 512
                     line = line[:22] + f"{new_res_idx:4d}" + line[26:]
                 
                 if current_chain != previous_chain:
@@ -396,72 +401,389 @@ def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: 
         pose.dump_pdb(relaxed_pdb_path)
 
     # ---------------------------------------------------------
-    # STEP 4: Variant Generation & CDR Masking (AntiFold)
+    # STEP 4: Multi-Model Generative Ensemble
     # ---------------------------------------------------------    
-    print("Step 4: Running AntiFold Inverse Folding...")
 
-    antifold_code_dir = os.path.dirname(antifold.__file__)
-    site_packages_dir = os.path.dirname(antifold_code_dir)
-    buggy_expected_model_path = os.path.join(site_packages_dir, "models", "model.pt")
-
-    manual_model_path = os.path.join(antifold_code_dir, "models", "model.pt")
-    local_model_path = os.path.join(os.getcwd(), "models", "model.pt")
-
-    if not os.path.exists(buggy_expected_model_path):
-        os.makedirs(os.path.dirname(buggy_expected_model_path), exist_ok=True)
-        if os.path.exists(manual_model_path):
-            shutil.copy(manual_model_path, buggy_expected_model_path)
-            print(f"Fixed bug: Copied weights to {buggy_expected_model_path}")
-        elif os.path.exists(local_model_path):
-            shutil.copy(local_model_path, buggy_expected_model_path)
-            print(f"Fixed bug: Copied weights to {buggy_expected_model_path}")
-        else:
-            print("ERROR: Could not find the model.pt file you downloaded earlier!")
-        
-    antifold_cmd = [
-        "python", "-m", "antifold.main",
-        "--pdb_file", relaxed_pdb_path,
-        "--heavy_chain", "A",
-        "--light_chain", "B",
-        "--regions", "FWH FWL",
-        "--num_seq_per_target", "100",
-        "--sampling_temp", "0.2",
-        "--out_dir", run_dir
-    ]
+    print(f"Step 4: Running Generative Ensemble: {gen_models}")
     
-    try:
-        subprocess.run(antifold_cmd, check=True)
-        print(f"AntiFold run finished. Raw variants saved in {run_dir}")
-    except subprocess.CalledProcessError as e:
-        print(f"AntiFold encountered an error: {e}")
-        return
-
-    # ---------------------------------------------------------
-    # STEP 5: Post-Processing Clean FASTA for CamSol Web Server
-    # ---------------------------------------------------------
-    raw_fasta_path = os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
-    camsol_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
-
-    if os.path.exists(raw_fasta_path):
-        print(f"Step 5: Formatting clean FASTA for CamSol server -> {camsol_fasta_path}")
-        cleaned_records = []
+    all_raw_records = []
+    
+    # --- MODEL A: AntiFold ---
+    if "AntiFold (Antibody-specific)" in gen_models:
+        print(" -> Running AntiFold at Temperature {temp}...")
         
-        for i, record in enumerate(SeqIO.parse(raw_fasta_path, "fasta")):
-            # Strip non-standard chain breaks (: and /)
-            clean_seq = str(record.seq).replace(":", "").replace("/", "")
-            record.seq = record.seq.__class__(clean_seq)
+        antifold_cmd = [
+            "python", "-m", "antifold.main",
+            "--pdb_file", relaxed_pdb_path,
+            "--heavy_chain", "A", "--light_chain", "B",
+            "--regions", "FWL FWH",
+            "--num_seq_per_target", str(num_seqs),
+            "--sampling_temp", str(temp),
+            "--out_dir", run_dir
+        ]
+        try:
+            # capture_output forces the internal errors to be saved so we can read them
+            subprocess.run(antifold_cmd, check=True, capture_output=True, text=True)
+            af_fasta = os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
+            if os.path.exists(af_fasta):
+                af_records = list(SeqIO.parse(af_fasta, "fasta"))
+                SeqIO.write(af_records, os.path.join(run_dir, f"{run_name}_antifold.fasta"), "fasta")
+                all_raw_records.extend(af_records)
+
+        except subprocess.CalledProcessError as e:
+            # Route the actual crash log to the Streamlit UI and stop the pipeline
+            st.error(f"**AntiFold Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
+            raise RuntimeError("Phase 1 halted due to AntiFold failure.")
+
+    # --- DYNAMIC CDR MASKING FOR MPNN MODELS ---
+    # FIX 1: Change file extension to .jsonl
+    fixed_json_path = os.path.join(run_dir, "fixed_positions.jsonl")
+    
+    if ("ProteinMPNN (Diverse)" in gen_models) or ("ThermoMPNN (ddG-Driven)" in gen_models) or ("ProteinMPNN (Soluble)" in gen_models) or ("ESM-C (Evolutionary LM)" in gen_models) or ("AbLang2 (Antibody LM)" in gen_models):
+        from abnumber import Chain
+        import json
+        
+        vh_chain = Chain(vh_seq, scheme='chothia')
+        vl_chain = Chain(vl_seq, scheme='chothia')
+        
+        fixed_A, fixed_B = [], []
+        
+        for cdr in [vh_chain.cdr1_seq, vh_chain.cdr2_seq, vh_chain.cdr3_seq]:
+            start = vh_seq.find(cdr)
+            if start != -1:
+                fixed_A.extend(list(range(start + 1, start + 1 + len(cdr))))
+                
+        for cdr in [vl_chain.cdr1_seq, vl_chain.cdr2_seq, vl_chain.cdr3_seq]:
+            start = vl_seq.find(cdr)
+            if start != -1:
+                fixed_B.extend(list(range(start + 1, start + 1 + len(cdr))))
+                
+        pdb_basename = os.path.splitext(os.path.basename(relaxed_pdb_path))[0]
+        with open(fixed_json_path, 'w') as f:
+            json.dump({pdb_basename: {"A": fixed_A, "B": fixed_B}}, f)
+
+    # --- MODEL B: ProteinMPNN ---
+    if "ProteinMPNN (Diverse)" in gen_models:
+        print(f" -> Running ProteinMPNN at Temperature {temp}...")
+        mpnn_out_dir = os.path.join(run_dir, "mpnn_out")
+        
+        PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
+        
+        if not os.path.exists(PROTEIN_MPNN_SCRIPT):
+            st.error(f"Could not find ProteinMPNN at {PROTEIN_MPNN_SCRIPT}.")
+            raise FileNotFoundError("Missing ProteinMPNN script.")
             
-            # Assign unique IDs for the web server to prevent pandas merge explosions
-            record.id = f"{run_name}_WT" if i == 0 else f"{run_name}_sample_{i}"
-            record.description = ""
+        mpnn_cmd = [
+            "python", PROTEIN_MPNN_SCRIPT,
+            "--pdb_path", relaxed_pdb_path,
+            "--pdb_path_chains", "A B",
+            # FIX 2: Removed --chains_to_design entirely
+            # FIX 3: Corrected flag to --fixed_positions_jsonl
+            "--fixed_positions_jsonl", fixed_json_path,
+            "--out_folder", mpnn_out_dir,
+            "--num_seq_per_target", str(num_seqs),
+            "--sampling_temp", str(temp),
+            "--batch_size", "1"
+        ]
+        try:
+            subprocess.run(mpnn_cmd, check=True, capture_output=True, text=True)
+            mpnn_fastas = glob.glob(os.path.join(mpnn_out_dir, "seqs", "*.fa"))
             
-            cleaned_records.append(record)
+            mpnn_records = []
+            for fa in mpnn_fastas:
+                mpnn_records.extend(list(SeqIO.parse(fa, "fasta")))
+                
+            if mpnn_records:
+                SeqIO.write(mpnn_records, os.path.join(run_dir, f"{run_name}_proteinmpnn.fasta"), "fasta")
+                all_raw_records.extend(mpnn_records)
+
+        except subprocess.CalledProcessError as e:
+            st.error(f"**ProteinMPNN Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
+            raise RuntimeError("Phase 1 halted due to ProteinMPNN failure.")
+
+    # --- MODEL C: ThermoMPNN (ddG-Driven) ---
+    if "ThermoMPNN (ddG-Driven)" in gen_models:
+        print(" -> Running ThermoMPNN ddG Generator (Full Complex)...")
+        
+        THERMO_MPNN_SCRIPT = "/home/esigalas/workspace/ThermoMPNN/analysis/custom_inference.py"
+        
+        if not os.path.exists(THERMO_MPNN_SCRIPT):
+            st.error(f"Could not find ThermoMPNN at {THERMO_MPNN_SCRIPT}.")
+            st.stop()
             
-        # Only save the CamSol payload. Do NOT overwrite the raw FASTA.
-        SeqIO.write(cleaned_records, camsol_fasta_path, "fasta")
-        print(f"Step 5 Complete: {camsol_fasta_path} ready for web upload.")
+        pdb_basename = os.path.splitext(os.path.basename(relaxed_pdb_path))[0]
+        csv_path = os.path.join(run_dir, f"ThermoMPNN_inference_{pdb_basename}.csv")
+        
+        all_thermo_muts = []
+        clean_wt = vh_seq + vl_seq
+        
+        # Combine the 1-indexed PyRosetta coordinates into a single 0-indexed flat set for CSV matching
+        combined_cdr_mask = {p - 1 for p in fixed_A}.union({len(vh_seq) + p - 1 for p in fixed_B})
+        
+        # Pass "AB" so alt_parse_PDB parses the whole complex into a single graph
+        thermo_cmd = [
+            "python", THERMO_MPNN_SCRIPT,
+            "--pdb", relaxed_pdb_path,
+            "--chain", "AB", 
+            "--out_dir", run_dir
+        ]
+        
+        try:
+            subprocess.run(thermo_cmd, check=True, capture_output=True, text=True)
+            
+            if not os.path.exists(csv_path):
+                st.error("ThermoMPNN failed to create output CSV.")
+                st.stop()
+                
+            df_thermo = pd.read_csv(csv_path)
+            
+            # Parse the unified CSV
+            for _, row in df_thermo.iterrows():
+                pos = int(row['position']) 
+                mut_aa = row['mutation']
+                ddg = float(row['ddG_pred'])
+                
+                if pos in combined_cdr_mask:
+                    continue 
+                    
+                # We want stabilizing mutations (negative ddG)
+                if ddg < 0:
+                    all_thermo_muts.append({
+                        'pos': pos,
+                        'wt_aa': row['wildtype'],
+                        'mut_aa': mut_aa,
+                        'ddg': ddg
+                    })
+                    
+            os.remove(csv_path)
+            
+        except subprocess.CalledProcessError as e:
+            st.error(f"**ThermoMPNN Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
+            st.stop()
+            
+        # Sort by most stabilizing (most negative ddG)
+        all_thermo_muts = sorted(all_thermo_muts, key=lambda x: x['ddg'])
+        top_muts = all_thermo_muts[:int(num_seqs)]
+        
+        print(f"    Building {len(top_muts)} guaranteed stabilizing ThermoMPNN candidates...")
+        
+        thermo_records = []
+        for i, m in enumerate(top_muts):
+            mut_seq = list(clean_wt)
+            mut_seq[m['pos']] = m['mut_aa']
+            
+            new_record = SeqRecord(
+                Seq("".join(mut_seq)), 
+                id=f"ThermoMPNN_{m['wt_aa']}{m['pos']+1}{m['mut_aa']}_rank{i+1}", 
+                description=""
+            )
+            thermo_records.append(new_record)
+            if thermo_records:
+                SeqIO.write(thermo_records, os.path.join(run_dir, f"{run_name}_thermompnn.fasta"), "fasta")
+                all_raw_records.extend(thermo_records)
+    
+    # --- MODEL D: ProteinMPNN (Soluble) ---
+    if "ProteinMPNN (Soluble)" in gen_models:
+        print(f" -> Running ProteinMPNN (Soluble Model) at Temperature {temp}...")
+        soluble_out_dir = os.path.join(run_dir, "soluble_mpnn_out")
+        
+        PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
+        
+        soluble_cmd = [
+            "python", PROTEIN_MPNN_SCRIPT,
+            "--pdb_path", relaxed_pdb_path,
+            "--pdb_path_chains", "A B",
+            "--fixed_positions_jsonl", fixed_json_path,
+            "--out_folder", soluble_out_dir,
+            "--num_seq_per_target", str(num_seqs),
+            "--sampling_temp", str(temp),
+            "--batch_size", "1",
+            "--use_soluble_model"  # The flag that triggers the specialized weights
+        ]
+        try:
+            subprocess.run(soluble_cmd, check=True, capture_output=True, text=True)
+            soluble_fastas = glob.glob(os.path.join(soluble_out_dir, "seqs", "*.fa"))
+            
+            soluble_records = []
+            for fa in soluble_fastas:
+                soluble_records.extend(list(SeqIO.parse(fa, "fasta")))
+                
+            # Save a standalone SolubleMPNN FASTA
+            if soluble_records:
+                SeqIO.write(soluble_records, os.path.join(run_dir, f"{run_name}_solublempnn.fasta"), "fasta")
+                all_raw_records.extend(soluble_records)
+                
+        except subprocess.CalledProcessError as e:
+            st.error(f"**ProteinMPNN (Soluble) Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
+            st.stop()
+    
+    # --- MODEL E: ESM-C (Isolated Environment Subprocess) ---
+    if "ESM-C (Evolutionary LM)" in gen_models:
+        print(" -> Running ESM-C Masked-Marginal Probability Generator (Isolated Env)...")
+        esmc_fasta = os.path.join(run_dir, f"{run_name}_esmc.fasta")
+        
+        # Combine CDR mask into a comma-separated string for the subprocess argument
+        combined_cdr_mask = {p - 1 for p in fixed_A}.union({len(vh_seq) + p - 1 for p in fixed_B})
+        cdr_str = ",".join(map(str, combined_cdr_mask))
+        clean_wt = vh_seq + vl_seq
+        
+        # Use conda run to execute the script entirely within the Python 3.10 micro-environment
+        esmc_cmd = [
+            "conda", "run", "-n", "esmc_env", 
+            "python", "run_esmc_dms.py",
+            "--sequence", clean_wt,
+            "--cdr_indices", cdr_str,
+            "--num_seqs", str(num_seqs),
+            "--out_fasta", esmc_fasta
+        ]
+        
+        try:
+            subprocess.run(esmc_cmd, check=True, capture_output=True, text=True)
+            
+            if os.path.exists(esmc_fasta):
+                esmc_records = list(SeqIO.parse(esmc_fasta, "fasta"))
+                all_raw_records.extend(esmc_records)
+                
+        except subprocess.CalledProcessError as e:
+            st.error(f"**ESM-C Subprocess Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
+            st.stop()
+    
+    # --- MODEL F: AbLang2-Paired (Native OPIG Installation) ---
+    if "AbLang2 (Antibody LM)" in gen_models:
+        print(" -> Running AbLang2-Paired Masked-Marginal Probability Generator...")
+        import ablang2
+        import numpy as np
+        
+        try:
+            # Load your working, local OPIG paired model
+            ablang = ablang2.pretrained(model_to_use="ablang2-paired", random_init=False)
+            
+            # AbLang2 alphabet order (standard 20 AAs)
+            alphabet = list("ACDEFGHIKLMNPQRSTVWY")
+            
+            vh_len = len(vh_seq)
+            combined_cdr_mask = {p - 1 for p in fixed_A}.union({vh_len + p - 1 for p in fixed_B})
+            
+            ablang_muts = []
+            
+            # Iterate over the Heavy Chain (VH)
+            for i in range(len(vh_seq)):
+                if i in combined_cdr_mask: continue
+                
+                wt_aa = vh_seq[i]
+                # AbLang2 expects the mask to be an asterisk
+                masked_vh = vh_seq[:i] + "*" + vh_seq[i+1:]
+                
+                # Forward pass requesting normalized probabilities
+                res = ablang([[masked_vh, vl_seq]], mode='probability')
+                
+                # FIX: Removed the extra [0]. 
+                # res[0] is the 2D array [seq_len, 20]. res[0][i] gets the 20 probabilities for position i.
+                probs = res[0][i] 
+                
+                wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
+                if wt_idx is None: continue
+                wt_prob = probs[wt_idx]
+                
+                for mut_idx, mut_aa in enumerate(alphabet):
+                    if mut_aa == wt_aa: continue
+                    mut_prob = probs[mut_idx]
+                    
+                    # Calculate probability difference
+                    delta_p = mut_prob - wt_prob
+                    if delta_p > 0:
+                        ablang_muts.append({
+                            'pos': i, 'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
+                        })
+
+            # Iterate over the Light Chain (VL)
+            for i in range(len(vl_seq)):
+                global_pos = vh_len + i
+                if global_pos in combined_cdr_mask: continue
+                
+                wt_aa = vl_seq[i]
+                masked_vl = vl_seq[:i] + "*" + vl_seq[i+1:]
+                
+                res = ablang([[vh_seq, masked_vl]], mode='probability')
+                
+                # FIX: Removed the extra [0] here as well
+                probs = res[0][global_pos]
+                
+                wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
+                if wt_idx is None: continue
+                wt_prob = probs[wt_idx]
+                
+                for mut_idx, mut_aa in enumerate(alphabet):
+                    if mut_aa == wt_aa: continue
+                    mut_prob = probs[mut_idx]
+                    
+                    delta_p = mut_prob - wt_prob
+                    if delta_p > 0:
+                        ablang_muts.append({
+                            'pos': global_pos, 'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
+                        })
+
+            # Sort by highest evolutionary probability boost
+            ablang_muts = sorted(ablang_muts, key=lambda x: x['delta'], reverse=True)
+            top_muts = ablang_muts[:int(num_seqs)]
+            
+            print(f"    Building {len(top_muts)} masked evolutionary candidates from AbLang2-Paired...")
+            
+            clean_wt = vh_seq + vl_seq
+            ablang_records = []
+            for i, m in enumerate(top_muts):
+                mut_seq = list(clean_wt)
+                mut_seq[m['pos']] = m['mut_aa']
+                new_record = SeqRecord(
+                    Seq("".join(mut_seq)), 
+                    id=f"AbLang2Paired_{m['wt_aa']}{m['pos']+1}{m['mut_aa']}_rank{i+1}", 
+                    description=""
+                )
+                ablang_records.append(new_record)
+            
+            if ablang_records:
+                SeqIO.write(ablang_records, os.path.join(run_dir, f"{run_name}_ablang2.fasta"), "fasta")
+                all_raw_records.extend(ablang_records)
+                
+        except Exception as e:
+            st.error(f"**AbLang2-Paired Crashed!**\n\nError Log:\n```\n{str(e)}\n```")
+            st.stop()
+
     # ---------------------------------------------------------
-    # Cleanup: Free GPU Memory
+    # STEP 5: Pooling, Deduplication, and CamSol Formatting
     # ---------------------------------------------------------
+    camsol_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
+    print(f"Step 5: Pooling candidates and formatting for CamSol -> {camsol_fasta_path}")
+    
+    unique_seqs = {}
+    cleaned_records = []
+    
+    # 1. Isolate the Wild-Type sequence first to ensure it's always at index 0
+    clean_wt = (vh_seq + vl_seq).replace(":", "").replace("/", "")
+    
+    wt_record = SeqRecord(Seq(clean_wt), id=f"{run_name}_WT", description="")
+    cleaned_records.append(wt_record)
+    unique_seqs[clean_wt] = True 
+    
+    # 2. Iterate through all generated records across all models
+    for record in all_raw_records:
+        clean_seq = str(record.seq).replace(":", "").replace("/", "")
+        
+        # Deduplicate: Only add if we haven't seen this exact sequence before
+        if clean_seq not in unique_seqs:
+            unique_seqs[clean_seq] = True
+            
+            # Assign unique sequential ID (e.g., sample_1, sample_2)
+            new_record = SeqRecord(
+                Seq(clean_seq), 
+                id=f"{run_name}_sample_{len(cleaned_records)}", 
+                description=""
+            )
+            cleaned_records.append(new_record)
+
+    # 3. Save the final merged payload
+    SeqIO.write(cleaned_records, camsol_fasta_path, "fasta")
+    print(f"Step 5 Complete: Pooled {len(cleaned_records)} unique variants across {len(gen_models)} models.")
+    
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

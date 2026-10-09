@@ -22,24 +22,44 @@ tab1, tab2 = st.tabs(["Phase 1: Generation", "Phase 2: Evaluation"])
 # ==========================================
 with tab1:
     st.header("1. Structural Generation & Inverse Folding")
-    st.markdown("Predict 3D topology, relax coordinates, and generate framework mutations.")
+    st.markdown("Predict 3D topology, relax coordinates, and generate framework mutations using an ensemble of models.")
     
     col1, col2 = st.columns(2)
     with col1:
         run_name = st.text_input("Sequence Name", value="scFvLA-L2K")
         base_dir = st.text_input("Workspace Directory", value="./zero-shot_results")
+        
+        # NEW: Ensemble UI Controls
+        st.markdown("**Ensemble Settings**")
+        gen_models = st.multiselect(
+            "Generative Models to Run:",
+            options=["AntiFold (Antibody-specific)", "ProteinMPNN (Diverse)", "ProteinMPNN (Soluble)", "ThermoMPNN (ddG-Driven)", "ESM-C (Evolutionary LM)", "AbLang2 (Antibody LM)"],
+            default=["AntiFold (Antibody-specific)"]
+        )
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            num_seqs = st.number_input("Sequences per model", min_value=10, max_value=500, value=100, step=50)
+        with col_s2:
+            temp = st.slider("Sampling Temperature", 0.1, 1.0, 0.2, step=0.1)
+
     with col2:
         vh_seq = st.text_area("VH Sequence")
         vl_seq = st.text_area("VL Sequence")
 
     # 1. The Execution Block
-    if st.button("Run Phase 1", type="primary"):
+    if st.button("Run Phase 1 (Ensemble)", type="primary"):
         if not vh_seq or not vl_seq:
             st.error("Please provide both VH and VL sequences.")
+        elif not gen_models:
+            st.error("Please select at least one generative model.")
         else:
-            with st.spinner("Running ESMFold, PyRosetta, and AntiFold. This will take a few minutes..."):
-                run_scfv_developability_pipeline(vh_seq.strip(), vl_seq.strip(), base_dir, run_name)
-                st.success("Phase 1 Complete!")
+            with st.spinner("Running Phase 1 Ensemble (ESMFold -> PyRosetta -> Generators)..."):
+                # Pass the new ensemble arguments to the pipeline
+                run_scfv_developability_pipeline(
+                    vh_seq.strip(), vl_seq.strip(), base_dir, run_name, 
+                    gen_models=gen_models, num_seqs=num_seqs, temp=temp
+                )
+                st.success("Phase 1 Complete! Sequences pooled and deduplicated.")
                 
     # 2. The Persistent Download Block
     fasta_path = os.path.join(base_dir, run_name, f"{run_name}_camsol_upload.fasta")
@@ -53,16 +73,13 @@ with tab1:
             fasta_data = f.read()
         
         st.download_button(
-            label="⬇️ Download FASTA for CamSol",
+            label="⬇️ Download Ensemble FASTA for CamSol",
             data=fasta_data,
             file_name=f"{run_name}_camsol_upload.fasta",
             mime="text/plain"
         )
         
-        st.info(
-            "Upload the downloaded FASTA file to the CamSol web server to calculate intrinsic solubility.\n\n"
-            "🔗 [Open Cambridge CamSol Web Server](https://www-cohsoftware.ch.cam.ac.uk/index.php/camsolintrinsic)"
-        )
+        st.info("Upload the downloaded FASTA file to the CamSol web server to calculate intrinsic solubility.\n\n🔗 [Open Cambridge CamSol Web Server](https://www-cohsoftware.ch.cam.ac.uk/index.php/camsolintrinsic)")
 
     # 3. Interactive 3D Structure Viewer
     if os.path.exists(pdb_path):
