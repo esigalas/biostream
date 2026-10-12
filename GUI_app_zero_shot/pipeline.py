@@ -30,41 +30,34 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     print(f"--- Phase 2: Scoring Variants for {run_name} ---")
     
     # ---------------------------------------------------------
-    # 1. File Checks & Parsing
+    # 1. Initialization & FASTA Parsing
     # ---------------------------------------------------------
-    raw_fasta_path = os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
+    raw_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
     camsol_txt_path = os.path.join(run_dir, f"{run_name}_camsol.txt")
+    final_csv_path = os.path.join(run_dir, f"{run_name}_developability_metrics.csv")
     
     if not os.path.exists(raw_fasta_path):
         raise FileNotFoundError(f"Cannot find {raw_fasta_path}. Run Phase 1 first.")
-    
-    janus_src_path = "/home/esigalas/workspace/JanusDDG/src" 
-    if janus_src_path not in sys.path:
-        sys.path.append(janus_src_path)
         
-    import utils
-
-    utils.MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models" 
-
     records = list(SeqIO.parse(raw_fasta_path, "fasta"))
-    variants = []
     clean_wt = wt_sequence.replace(":", "").replace("/", "")
+    vh_len = len(clean_wt) // 2
+    
+    variants = []
+    master_fasta_mapping = []
     
     for i, record in enumerate(records):
         unique_id = f"{run_name}_WT" if i == 0 else f"{run_name}_sample_{i}"
-        raw_seq_str = str(record.seq).replace(":", "").replace("/", "")
+        seq = str(record.seq).replace(":", "").replace("/", "")
         
-        # Approximate VH/VL split based on WT length
-        vh_len = len(clean_wt) // 2  # Adjust if your sequences split differently
-        vh, vl = raw_seq_str[:vh_len], raw_seq_str[vh_len:]
-            
-        mut_seq = vh + vl
+        master_fasta_mapping.append({"id": unique_id, "seq": seq})
+        
+        vh, vl = seq[:vh_len], seq[vh_len:]
         mutations = []
-        
-        if mut_seq == clean_wt:
+        if seq == clean_wt:
             mut_string = "WT"
         else:
-            for idx, (wt_aa, mut_aa) in enumerate(zip(clean_wt, mut_seq)):
+            for idx, (wt_aa, mut_aa) in enumerate(zip(clean_wt, seq)):
                 if wt_aa != mut_aa:
                     mutations.append(f"{wt_aa}{idx+1}{mut_aa}")
             mut_string = ",".join(mutations)
@@ -72,221 +65,403 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         variants.append({"id": unique_id, "mutations": mut_string, "VH": vh, "VL": vl})
         
     df = pd.DataFrame(variants)
-    
-    # ---------------------------------------------------------
-    # 2. Integrate Web Server CamSol Scores
-    # ---------------------------------------------------------
-    camsol_df = pd.read_csv(camsol_txt_path, sep='\t')
-    df['camsol_score'] = camsol_df['protein variant score'].values
-    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     wt_list = list(clean_wt)
 
     # ---------------------------------------------------------
-    # 3. PLM 1: AntiBERTy (Antibody-Specific Fitness)
+    # 2. METRIC-LEVEL SMART CACHE MERGE
     # ---------------------------------------------------------
-    print("Loading AntiBERTy...")
-    ab_tokenizer = AutoTokenizer.from_pretrained("jeffruffolo/AntiBERTy")
-    ab_model = AutoModelForMaskedLM.from_pretrained("jeffruffolo/AntiBERTy").to(device)
-    ab_model.eval()
-
-    ab_fitness_scores = []
-    for _, row in df.iterrows():
-        if row['mutations'] == "WT":
-            ab_fitness_scores.append(0.0)
-            continue
+    if os.path.exists(final_csv_path):
+        try:
+            cached_df = pd.read_csv(final_csv_path)
+            cols_to_drop = [c for c in cached_df.columns if 'norm' in c or 'survives' in c or 'global' in c or 'pi_delta' in c]
+            cached_df = cached_df.drop(columns=cols_to_drop, errors='ignore')
             
-        mut_delta_logp = 0.0
-        for m in row['mutations'].split(","):
-            wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
-            masked_seq = wt_list.copy()
-            masked_seq[pos] = "[MASK]" 
+            df = df.merge(cached_df.drop(columns=['mutations', 'VH', 'VL'], errors='ignore'), on='id', how='left')
+            print(f" -> Cache loaded. Evaluating missing metrics for {len(df)} sequences...")
             
-            inputs = ab_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
-            with torch.no_grad():
-                logits = ab_model(**inputs).logits
-                log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1) 
-                mut_delta_logp += (log_probs[ab_tokenizer.convert_tokens_to_ids(mut_aa)] - 
-                                   log_probs[ab_tokenizer.convert_tokens_to_ids(wt_aa)]).item()
-        ab_fitness_scores.append(mut_delta_logp)
+            # --- FAST CAMSOL UPDATE ---
+            if 'camsol_score' in df.columns and df['camsol_score'].isna().all() and os.path.exists(camsol_txt_path):
+                # Check if all other metrics are present (meaning ONLY camsol is missing)
+                expected_compute_metrics = ['janus_ddg', 'pyrosetta_ddg', 'bindpred_kd', 'net_charge', 'pI', 'gravy', 'charge_asymmetry', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness']
+                if all(m in df.columns for m in expected_compute_metrics) and not df[expected_compute_metrics].isna().any().any():
+                    print(" -> Cache Hit for all sequences! New CamSol data detected. Performing fast update...")
+                    camsol_df = pd.read_csv(camsol_txt_path, sep='\t')
+                    if len(camsol_df) == len(master_fasta_mapping):
+                        camsol_mapping = {master_fasta_mapping[i]["id"]: score for i, score in enumerate(camsol_df['protein variant score'].values)}
+                        df['camsol_score'] = df['id'].map(camsol_mapping)
+                        
+                        def norm_cache(col, invert=False):
+                            if col not in df.columns or df[col].isna().all(): return 0.5 
+                            c_min, c_max = df[col].min(), df[col].max()
+                            if c_max == c_min: return 0.5
+                            return (c_max - df[col]) / (c_max - c_min) if invert else (df[col] - c_min) / (c_max - c_min)
+                            
+                        df['camsol_norm'] = norm_cache('camsol_score')
+                        df['janus_norm'] = norm_cache('janus_ddg', invert=True)      
+                        df['pyrosetta_norm'] = norm_cache('pyrosetta_ddg', invert=True) 
+                        df['bindpred_norm'] = norm_cache('bindpred_kd', invert=True) 
+                        df['esm_norm'] = norm_cache('esm_fitness')
+                        df['ab_norm'] = norm_cache('antiberty_fitness')
+                        df['ablang_norm'] = norm_cache('ablang_fitness')
+                        df['protbert_norm'] = norm_cache('protbert_fitness')
+                        df['gravy_norm'] = norm_cache('gravy', invert=True)
+                        df['charge_asym_norm'] = norm_cache('charge_asymmetry', invert=True)
+                        
+                        df['pi_delta'] = (df['pI'] - 7.4).abs()
+                        df['pi_norm'] = norm_cache('pi_delta', invert=False) 
+                        
+                        score_sum = (df['janus_norm'] + df['pyrosetta_norm'] + df['bindpred_norm'] + 
+                                     df['esm_norm'] + df['ab_norm'] + df['ablang_norm'] + 
+                                     df['protbert_norm'] + df['gravy_norm'] + df['charge_asym_norm'] + 
+                                     df['pi_norm'] + df['camsol_norm'])
+                        
+                        df['global_composite_score'] = score_sum / 11.0
+                        
+                        df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
+                        cols_to_save = [c for c in df.columns if not c.endswith('_norm') and c != 'pi_delta']
+                        df[cols_to_save].to_csv(final_csv_path, index=False)
+                        print(" -> Fast update complete! Returning updated cache.")
+                        return df
+        except Exception as e:
+            print(f" -> Could not verify cache: {e}. Recomputing from scratch...")
+            
+    # ---------------------------------------------------------
+    # 3. Web Server CamSol Scores
+    # ---------------------------------------------------------
+    if 'camsol_score' not in df.columns: df['camsol_score'] = np.nan
         
-    df['antiberty_fitness'] = ab_fitness_scores
-    del ab_model, ab_tokenizer
-    gc.collect()
-    torch.cuda.empty_cache()
+    if df['camsol_score'].isna().any() and os.path.exists(camsol_txt_path):
+        try:
+            camsol_df = pd.read_csv(camsol_txt_path, sep='\t')
+            if len(camsol_df) == len(master_fasta_mapping):
+                camsol_mapping = {master_fasta_mapping[i]["id"]: score for i, score in enumerate(camsol_df['protein variant score'].values)}
+                df['camsol_score'] = df['id'].map(camsol_mapping)
+                print(" -> Integrated missing CamSol data.")
+        except Exception as e:
+            print(f" -> WARNING: Failed to parse CamSol: {e}")
 
     # ---------------------------------------------------------
-    # 4. PLM 2: AbLang2 (Paired Germline Fitness)
+    # 4. Fast Sequence Biophysics (pI, GRAVY, Charge Asymmetry, Net Charge)
     # ---------------------------------------------------------
-    print("Loading AbLang2...")
-    import ablang2
-    import numpy as np
+    if 'pI' not in df.columns: df['pI'] = np.nan
+    if 'gravy' not in df.columns: df['gravy'] = np.nan
+    if 'charge_asymmetry' not in df.columns: df['charge_asymmetry'] = np.nan
+    if 'net_charge' not in df.columns: df['net_charge'] = np.nan
     
-    # Initialized exactly as your snippet demonstrated
-    ablang_model = ablang2.pretrained("ablang2-paired", random_init=False) 
+    mask = df['pI'].isna() | df['gravy'].isna() | df['charge_asymmetry'].isna() | df['net_charge'].isna()
     
-    ablang_fitness_scores = []
-    
-    # 1. Calculate the baseline Wild-Type (WT) sequence likelihood
-    wt_row = df[df['mutations'] == "WT"].iloc[0]
-    
-    # ablang returns an array of likelihoods for each position. We sum them for the total sequence score.
-    wt_res = ablang_model([[wt_row['VH'], wt_row['VL']]], mode='likelihood')
-    wt_score = np.sum(wt_res[0]) 
-    
-    for _, row in df.iterrows():
-        if row['mutations'] == "WT":
-            ablang_fitness_scores.append(0.0)
-            continue
-            
-        # 2. Calculate the Mutant sequence likelihood
-        mut_res = ablang_model([[row['VH'], row['VL']]], mode='likelihood')
-        mut_score = np.sum(mut_res[0])
+    if mask.any():
+        print(f"Calculating basic sequence biophysics for {mask.sum()} missing variants...")
+        from Bio.SeqUtils.ProtParam import ProteinAnalysis
         
-        # 3. Delta Log-Likelihood (Mutant - WT)
-        # Positive values mean the mutant is more fit/germline-like than the WT
-        mut_delta_logp = mut_score - wt_score
-        
-        ablang_fitness_scores.append(mut_delta_logp)
+        for idx, row in df[mask].iterrows():
+            vh_seq, vl_seq = row['VH'], row['VL']
+            full_seq = vh_seq + vl_seq
+            
+            vh_analysis = ProteinAnalysis(vh_seq)
+            vl_analysis = ProteinAnalysis(vl_seq)
+            full_analysis = ProteinAnalysis(full_seq)
+            
+            df.at[idx, 'net_charge'] = full_analysis.charge_at_pH(7.4)
+            df.at[idx, 'pI'] = full_analysis.isoelectric_point()
+            df.at[idx, 'gravy'] = full_analysis.gravy()
+            
+            # Asymmetry is the absolute difference in charge between the two domains
+            df.at[idx, 'charge_asymmetry'] = abs(vh_analysis.charge_at_pH(7.4) - vl_analysis.charge_at_pH(7.4))
+    else:
+        print(" -> Sequence biophysics up to date. Skipping calculation.")
 
-    df['ablang_fitness'] = ablang_fitness_scores
+    # ---------------------------------------------------------
+    # 5. PyRosetta Structural Thermodynamic Stability (ddG)
+    # ---------------------------------------------------------
+    if 'pyrosetta_ddg' not in df.columns: df['pyrosetta_ddg'] = np.nan
+    mask = df['pyrosetta_ddg'].isna()
     
-    # Safely clear the model from GPU
-    del ablang_model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ---------------------------------------------------------
-    # 5. PLM 3: ProtBERT (Evolutionary Fitness)
-    # ---------------------------------------------------------
-    print("Loading ProtBERT...")
-    
-    pb_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")
-    pb_model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert").to(device)
-    pb_model.eval()
-
-    pb_fitness_scores = []
-    for _, row in df.iterrows():
-        if row['mutations'] == "WT":
-            pb_fitness_scores.append(0.0)
-            continue
-            
-        mut_delta_logp = 0.0
-        for m in row['mutations'].split(","):
-            wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
-            masked_seq = wt_list.copy()
-            masked_seq[pos] = "[MASK]" 
-            
-            # ProtBERT requires space-separated sequences like AntiBERTy
-            inputs = pb_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
-            
-            with torch.no_grad():
-                logits = pb_model(**inputs).logits
-                # ProtBERT adds a [CLS] token at the start, so offset by 1
-                log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1)
-                
-                wt_tok = pb_tokenizer.convert_tokens_to_ids(wt_aa)
-                mut_tok = pb_tokenizer.convert_tokens_to_ids(mut_aa)
-                
-                mut_delta_logp += (log_probs[mut_tok] - log_probs[wt_tok]).item()
-                
-        pb_fitness_scores.append(mut_delta_logp)
-
-    df['protbert_fitness'] = pb_fitness_scores
-    del pb_model, pb_tokenizer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ---------------------------------------------------------
-    # 6. PLM 4: ESM-2 (General Fitness) & BINDPRED
-    # ---------------------------------------------------------
-    print("Loading ESM-2 & BINDPRED...")
-    model_esm, alphabet_esm = esm.pretrained.esm2_t33_650M_UR50D()
-    model_esm = model_esm.to(device)
-    batch_converter_esm = alphabet_esm.get_batch_converter()
-    model_esm.eval()
-
-    bindpred_model = CatBoostRegressor()
-    bindpred_model.load_model(hf_hub_download(repo_id="hbp5181/BindPred", filename="ESM2_BindPred.cbm"), format="cbm")
-
-    net_charges, bindpred_scores, esm_fitness_scores = [], [], []
-
-    for _, row in df.iterrows():
-        net_charges.append(ProteinAnalysis(row['VH'] + row['VL']).charge_at_pH(7.4))
+    if mask.any():
+        print(f"Calculating PyRosetta for {mask.sum()} missing variants...")
+        import pyrosetta
+        from pyrosetta.toolbox import mutate_residue
+        pyrosetta.init("-mute all")
         
-        _, _, batch_tokens = batch_converter_esm([("VH", row['VH']), ("VL", row['VL'])])
-        with torch.no_grad():
-            reps = model_esm(batch_tokens.to(device), repr_layers=[33], return_contacts=False)["representations"][33]
-            bindpred_scores.append(bindpred_model.predict(np.hstack([
-                reps[0, 1:len(row['VH'])+1].mean(0).cpu().numpy(),
-                reps[1, 1:len(row['VL'])+1].mean(0).cpu().numpy()
-            ])))
-
-        if row['mutations'] == "WT":
-            esm_fitness_scores.append(0.0)
+        relaxed_pdb_path = os.path.join(run_dir, f"{run_name}_relaxed.pdb")
+        if os.path.exists(relaxed_pdb_path):
+            wt_pose = pyrosetta.pose_from_file(relaxed_pdb_path)
+            scorefxn = pyrosetta.get_fa_scorefxn()
+            wt_energy = scorefxn(wt_pose)
+            
+            for idx, row in df[mask].iterrows():
+                if row['mutations'] == "WT":
+                    df.at[idx, 'pyrosetta_ddg'] = 0.0
+                    continue
+                    
+                mut_pose = wt_pose.clone()
+                for m in row['mutations'].split(","):
+                    pos, mut_aa = int(m[1:-1]), m[-1]
+                    mutate_residue(mut_pose, pos, mut_aa, pack_scorefxn=scorefxn)
+                    
+                df.at[idx, 'pyrosetta_ddg'] = scorefxn(mut_pose) - wt_energy
         else:
+            df['pyrosetta_ddg'] = 0.0
+    else:
+        print(" -> PyRosetta metrics up to date. Skipping model.")
+
+    # ---------------------------------------------------------
+    # 6. PLM 1: AntiBERTy (Antibody-Specific Fitness)
+    # ---------------------------------------------------------
+    if 'antiberty_fitness' not in df.columns: df['antiberty_fitness'] = np.nan
+    mask = df['antiberty_fitness'].isna()
+    
+    if mask.any():
+        print(f"Loading AntiBERTy to score {mask.sum()} missing variants...")
+        from transformers import AutoTokenizer, AutoModelForMaskedLM
+        ab_tokenizer = AutoTokenizer.from_pretrained("jeffruffolo/AntiBERTy")
+        ab_model = AutoModelForMaskedLM.from_pretrained("jeffruffolo/AntiBERTy").to(device)
+        ab_model.eval()
+
+        for idx, row in df[mask].iterrows():
+            if row['mutations'] == "WT":
+                df.at[idx, 'antiberty_fitness'] = 0.0
+                continue
+                
             mut_delta_logp = 0.0
             for m in row['mutations'].split(","):
                 wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
                 masked_seq = wt_list.copy()
-                masked_seq[pos] = "<mask>"
+                masked_seq[pos] = "[MASK]" 
                 
-                _, _, mask_tokens = batch_converter_esm([("seq", "".join(masked_seq))])
+                inputs = ab_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
                 with torch.no_grad():
-                    log_probs = torch.log_softmax(model_esm(mask_tokens.to(device))["logits"][0, pos + 1], dim=-1)
-                    mut_delta_logp += (log_probs[alphabet_esm.tok_to_idx[mut_aa]] - log_probs[alphabet_esm.tok_to_idx[wt_aa]]).item()
-            esm_fitness_scores.append(mut_delta_logp)
-
-    df['net_charge'], df['bindpred_kd'], df['esm_fitness'] = net_charges, bindpred_scores, esm_fitness_scores
+                    logits = ab_model(**inputs).logits
+                    log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1) 
+                    mut_delta_logp += (log_probs[ab_tokenizer.convert_tokens_to_ids(mut_aa)] - 
+                                       log_probs[ab_tokenizer.convert_tokens_to_ids(wt_aa)]).item()
+            df.at[idx, 'antiberty_fitness'] = mut_delta_logp
+            
+        del ab_model, ab_tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        print(" -> AntiBERTy metrics up to date. Skipping model.")
 
     # ---------------------------------------------------------
-    # 7. JanusDDG Scoring
+    # 7. PLM 2: AbLang2 (Paired Germline Fitness)
     # ---------------------------------------------------------
-    print("Running JanusDDG...")
-    temp_csv_path = os.path.join(run_dir, "temp_janus_input.csv")
-    pd.DataFrame({'ID': df[df['mutations'] != "WT"]['id'], 'Sequence': clean_wt, 
-                  'MTS': df[df['mutations'] != "WT"]['mutations'].str.replace(",", "_")}).to_csv(temp_csv_path, index=False)
+    if 'ablang_fitness' not in df.columns: df['ablang_fitness'] = np.nan
+    mask = df['ablang_fitness'].isna()
     
-    import __main__
-    import model as janus_model
-    janus_model.device = device
-    setattr(__main__, 'Cross_Attention_DDG', janus_model.Cross_Attention_DDG)
-    setattr(__main__, 'TransformerRegression', janus_model.TransformerRegression)
-    setattr(__main__, 'SinusoidalPositionalEncoding', janus_model.SinusoidalPositionalEncoding)
+    if mask.any():
+        print(f"Loading AbLang2 to score {mask.sum()} missing variants...")
+        import ablang2
+        ablang_model = ablang2.pretrained("ablang2-paired", random_init=False) 
+        
+        wt_res = ablang_model([[clean_wt[:vh_len], clean_wt[vh_len:]]], mode='likelihood')
+        wt_score = np.sum(wt_res[0]) 
+        
+        for idx, row in df[mask].iterrows():
+            if row['mutations'] == "WT":
+                df.at[idx, 'ablang_fitness'] = 0.0
+                continue
+                
+            mut_res = ablang_model([[row['VH'], row['VL']]], mode='likelihood')
+            df.at[idx, 'ablang_fitness'] = np.sum(mut_res[0]) - wt_score
 
-    model_janus = utils.load_model('JanusDDG_fine_tuned.pth', device)
-    pred_dir, _ = utils.process_and_predict(temp_csv_path, model_janus, model_esm, batch_converter_esm, device)
-    df = df.merge(pd.DataFrame({'id': df[df['mutations'] != "WT"]['id'], 'janus_ddg': pred_dir.values}), on='id', how='left').fillna({'janus_ddg': 0.0})
-    os.remove(temp_csv_path)
+        del ablang_model
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        print(" -> AbLang2 metrics up to date. Skipping model.")
 
     # ---------------------------------------------------------
-    # 8. 7-Pillar Normalization & Global Composite Score
+    # 8. PLM 3: ProtBERT (Evolutionary Fitness)
     # ---------------------------------------------------------
-    df['survives_ddg'] = df['janus_ddg'] >= -1.0
-    df['survives_camsol'] = df['camsol_score'] >= df['camsol_score'].quantile(0.10)
-    df['survival_status'] = df['survives_ddg'] & df['survives_camsol']
+    if 'protbert_fitness' not in df.columns: df['protbert_fitness'] = np.nan
+    mask = df['protbert_fitness'].isna()
     
+    if mask.any():
+        print(f"Loading ProtBERT to score {mask.sum()} missing variants...")
+        from transformers import AutoTokenizer, AutoModelForMaskedLM
+        pb_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")
+        pb_model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert").to(device)
+        pb_model.eval()
+
+        for idx, row in df[mask].iterrows():
+            if row['mutations'] == "WT":
+                df.at[idx, 'protbert_fitness'] = 0.0
+                continue
+                
+            mut_delta_logp = 0.0
+            for m in row['mutations'].split(","):
+                wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+                masked_seq = wt_list.copy()
+                masked_seq[pos] = "[MASK]" 
+                
+                inputs = pb_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
+                with torch.no_grad():
+                    logits = pb_model(**inputs).logits
+                    log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1)
+                    mut_delta_logp += (log_probs[pb_tokenizer.convert_tokens_to_ids(mut_aa)] - 
+                                       log_probs[pb_tokenizer.convert_tokens_to_ids(wt_aa)]).item()
+            df.at[idx, 'protbert_fitness'] = mut_delta_logp
+
+        del pb_model, pb_tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        print(" -> ProtBERT metrics up to date. Skipping model.")
+
+    # ---------------------------------------------------------
+    # 9. PLM 4: ESM-2 (General Fitness) & BINDPRED
+    # ---------------------------------------------------------
+    if 'esm_fitness' not in df.columns: df['esm_fitness'] = np.nan
+    if 'bindpred_kd' not in df.columns: df['bindpred_kd'] = np.nan
+    
+    mask = df['esm_fitness'].isna() | df['bindpred_kd'].isna()
+    
+    if mask.any():
+        print(f"Loading ESM-2 & BINDPRED to score {mask.sum()} missing variants...")
+        import esm
+        from huggingface_hub import hf_hub_download
+        from catboost import CatBoostRegressor
+        
+        model_esm, alphabet_esm = esm.pretrained.esm2_t33_650M_UR50D()
+        model_esm = model_esm.to(device)
+        batch_converter_esm = alphabet_esm.get_batch_converter()
+        model_esm.eval()
+
+        bindpred_model = CatBoostRegressor()
+        bindpred_model.load_model(hf_hub_download(repo_id="hbp5181/BindPred", filename="ESM2_BindPred.cbm"), format="cbm")
+
+        for idx, row in df[mask].iterrows():
+            _, _, batch_tokens = batch_converter_esm([("VH", row['VH']), ("VL", row['VL'])])
+            with torch.no_grad():
+                reps = model_esm(batch_tokens.to(device), repr_layers=[33], return_contacts=False)["representations"][33]
+                df.at[idx, 'bindpred_kd'] = bindpred_model.predict(np.hstack([
+                    reps[0, 1:len(row['VH'])+1].mean(0).cpu().numpy(),
+                    reps[1, 1:len(row['VL'])+1].mean(0).cpu().numpy()
+                ]))
+
+            if row['mutations'] == "WT":
+                df.at[idx, 'esm_fitness'] = 0.0
+            else:
+                mut_delta_logp = 0.0
+                for m in row['mutations'].split(","):
+                    wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+                    masked_seq = wt_list.copy()
+                    masked_seq[pos] = "<mask>"
+                    
+                    _, _, mask_tokens = batch_converter_esm([("seq", "".join(masked_seq))])
+                    with torch.no_grad():
+                        log_probs = torch.log_softmax(model_esm(mask_tokens.to(device))["logits"][0, pos + 1], dim=-1)
+                        mut_delta_logp += (log_probs[alphabet_esm.tok_to_idx[mut_aa]] - log_probs[alphabet_esm.tok_to_idx[wt_aa]]).item()
+                df.at[idx, 'esm_fitness'] = mut_delta_logp
+                
+        del model_esm, bindpred_model
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        print(" -> ESM-2 & BINDPRED metrics up to date. Skipping models.")
+
+    # ---------------------------------------------------------
+    # 10. JanusDDG Scoring
+    # ---------------------------------------------------------
+    if 'janus_ddg' not in df.columns: df['janus_ddg'] = np.nan
+    mask = df['janus_ddg'].isna()
+    
+    if mask.any():
+        print(f"Running JanusDDG for {mask.sum()} missing variants...")
+        janus_src_path = "/home/esigalas/workspace/JanusDDG/src" 
+        if janus_src_path not in sys.path:
+            sys.path.append(janus_src_path)
+        import utils
+        utils.MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models" 
+        
+        temp_csv_path = os.path.join(run_dir, "temp_janus_input.csv")
+        subset_to_compute = df[mask & (df['mutations'] != "WT")]
+        
+        if len(subset_to_compute) > 0:
+            pd.DataFrame({'ID': subset_to_compute['id'], 'Sequence': clean_wt, 
+                          'MTS': subset_to_compute['mutations'].str.replace(",", "_")}).to_csv(temp_csv_path, index=False)
+            
+            import __main__
+            import model as janus_model
+            
+            import esm
+            model_esm, alphabet_esm = esm.pretrained.esm2_t33_650M_UR50D()
+            model_esm = model_esm.to(device)
+            batch_converter_esm = alphabet_esm.get_batch_converter()
+            model_esm.eval()
+            
+            janus_model.device = device
+            setattr(__main__, 'Cross_Attention_DDG', janus_model.Cross_Attention_DDG)
+            setattr(__main__, 'TransformerRegression', janus_model.TransformerRegression)
+            setattr(__main__, 'SinusoidalPositionalEncoding', janus_model.SinusoidalPositionalEncoding)
+
+            model_janus = utils.load_model('JanusDDG_fine_tuned.pth', device)
+            pred_dir, _ = utils.process_and_predict(temp_csv_path, model_janus, model_esm, batch_converter_esm, device)
+            
+            janus_mapping = dict(zip(subset_to_compute['id'], pred_dir.values))
+            df.loc[mask, 'janus_ddg'] = df.loc[mask, 'id'].map(janus_mapping).fillna(0.0)
+            os.remove(temp_csv_path)
+            
+            del model_esm, model_janus
+            gc.collect()
+            torch.cuda.empty_cache()
+        else:
+            df.loc[mask, 'janus_ddg'] = 0.0
+    else:
+        print(" -> JanusDDG metrics up to date. Skipping model.")
+
+    # ---------------------------------------------------------
+    # 11. Adaptive Normalization & Global Composite Score
+    # ---------------------------------------------------------
     def norm(col, invert=False):
+        if col not in df.columns or df[col].isna().all(): return 0.5 
         c_min, c_max = df[col].min(), df[col].max()
         if c_max == c_min: return 0.5
         return (c_max - df[col]) / (c_max - c_min) if invert else (df[col] - c_min) / (c_max - c_min)
 
+    df['pi_delta'] = (df['pI'] - 7.4).abs()
+
     df['camsol_norm'] = norm('camsol_score')
-    df['janus_norm'] = norm('janus_ddg', invert=True)     # Lower is better
-    df['bindpred_norm'] = norm('bindpred_kd', invert=True) # Lower is better
+    df['janus_norm'] = norm('janus_ddg', invert=True)      
+    df['pyrosetta_norm'] = norm('pyrosetta_ddg', invert=True)  
+    df['bindpred_norm'] = norm('bindpred_kd', invert=True) 
     df['esm_norm'] = norm('esm_fitness')
     df['ab_norm'] = norm('antiberty_fitness')
     df['ablang_norm'] = norm('ablang_fitness')
     df['protbert_norm'] = norm('protbert_fitness')
+    df['gravy_norm'] = norm('gravy', invert=True)                 
+    df['charge_asym_norm'] = norm('charge_asymmetry', invert=True) 
+    df['pi_norm'] = norm('pi_delta', invert=False)                 
 
-    # Update the global composite score equation:
-    df['global_composite_score'] = (df['camsol_norm'] + df['janus_norm'] + df['bindpred_norm'] + 
-                                    df['esm_norm'] + df['ab_norm'] + df['ablang_norm'] + df['protbert_norm']) / 7.0
-    
+    active_pillars = 10
+    score_sum = (df['janus_norm'] + df['pyrosetta_norm'] + df['bindpred_norm'] + 
+                 df['esm_norm'] + df['ab_norm'] + df['ablang_norm'] + df['protbert_norm'] +
+                 df['gravy_norm'] + df['charge_asym_norm'] + df['pi_norm'])
+                 
+    if df['camsol_score'].notna().any():
+        score_sum += df['camsol_norm']
+        active_pillars = 11
+        
+    df['global_composite_score'] = score_sum / active_pillars
     df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
-    df.to_csv(os.path.join(run_dir, f"{run_name}_developability_metrics.csv"), index=False)
+    
+    # --- ENFORCE LOGICAL COLUMN GROUPING FOR BACKEND CACHE ---
+    ordered_cols = [
+        'id', 'mutations', 'global_composite_score', 
+        'janus_ddg', 'pyrosetta_ddg'
+    ]
+    if df['camsol_score'].notna().any():
+        ordered_cols.append('camsol_score')
+        
+    ordered_cols.extend([
+        'pI', 'gravy', 'net_charge', 'charge_asymmetry',
+        'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
+        'VH', 'VL'
+    ])
+    
+    df[ordered_cols].to_csv(final_csv_path, index=False)
     
     if torch.cuda.is_available(): torch.cuda.empty_cache()
     return df
@@ -410,7 +585,7 @@ def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: 
     
     # --- MODEL A: AntiFold ---
     if "AntiFold (Antibody-specific)" in gen_models:
-        print(" -> Running AntiFold at Temperature {temp}...")
+        print(f" -> Running AntiFold at Temperature {temp}...")
         
         antifold_cmd = [
             "python", "-m", "antifold.main",
@@ -422,16 +597,22 @@ def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: 
             "--out_dir", run_dir
         ]
         try:
-            # capture_output forces the internal errors to be saved so we can read them
             subprocess.run(antifold_cmd, check=True, capture_output=True, text=True)
+            
+            # AntiFold automatically names its output based on the input PDB and chains
             af_fasta = os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
+            
             if os.path.exists(af_fasta):
                 af_records = list(SeqIO.parse(af_fasta, "fasta"))
+                
+                # Save a clean copy
                 SeqIO.write(af_records, os.path.join(run_dir, f"{run_name}_antifold.fasta"), "fasta")
                 all_raw_records.extend(af_records)
+                
+                # FIX: Delete the messy original AntiFold output so it doesn't cause file confusion later!
+                os.remove(af_fasta)
 
         except subprocess.CalledProcessError as e:
-            # Route the actual crash log to the Streamlit UI and stop the pipeline
             st.error(f"**AntiFold Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
             raise RuntimeError("Phase 1 halted due to AntiFold failure.")
 

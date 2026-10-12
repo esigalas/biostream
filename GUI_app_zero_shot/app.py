@@ -143,37 +143,40 @@ with tab1:
 # ==========================================
 with tab2:
     st.header("2. Biophysical Scoring & Selection")
-    st.markdown("Merge CamSol results, calculate thermodynamic stability via JanusDDG, and filter candidates.")
+    st.markdown("Calculate thermodynamic stability, evaluate optional solubility metrics, and rank all candidates.")
     
     col3, col4 = st.columns(2)
     with col3:
         p2_run_name = st.text_input("Sequence Name (Processed in Phase 1)", value="scFvLA-L2K", key="p2_name")
         p2_base_dir = st.text_input("Workspace Directory", value="./zero-shot_results", key="p2_dir")
     with col4:
-        camsol_upload = st.file_uploader("Upload Intrinsic Solubility Results (CamSol .txt)", type=["txt", "tsv"])
+        # CamSol is now explicitly optional
+        camsol_upload = st.file_uploader("Upload Intrinsic Solubility Results (CamSol .txt) [Optional]", type=["txt", "tsv"])
 
     if st.button("Run Phase 2 (Scoring)", type="primary"):
         run_dir = os.path.join(p2_base_dir, p2_run_name)
-        fasta_path = os.path.join(run_dir, f"{p2_run_name}_camsol_upload.fasta")
+        fasta_path = os.path.join(run_dir, f"{p2_run_name}_camsol_upload.fasta") # Or your generic phase 1 fasta
         
-        if camsol_upload is None:
-            st.error("Please upload the CamSol results file.")
-        elif not os.path.exists(fasta_path):
+        if not os.path.exists(fasta_path):
             st.error("Could not find the Phase 1 FASTA file. Ensure your Run Name and Base Directory are correct.")
         else:
             os.makedirs(run_dir, exist_ok=True)
             
-            # Save the uploaded CamSol file directly into the run directory
-            camsol_path = os.path.join(run_dir, f"{p2_run_name}_camsol.txt")
-            with open(camsol_path, "wb") as f:
-                f.write(camsol_upload.getbuffer())
+            # Save the uploaded CamSol file only if provided
+            if camsol_upload is not None:
+                camsol_path = os.path.join(run_dir, f"{p2_run_name}_camsol.txt")
+                with open(camsol_path, "wb") as f:
+                    f.write(camsol_upload.getbuffer())
+                st.success("CamSol data detected and integrated.")
+            else:
+                st.info("No CamSol data provided. Proceeding without solubility scores.")
                 
             # Dynamically fetch the Wild-Type sequence from the Phase 1 FASTA
             from Bio import SeqIO
             with open(fasta_path, "r") as f:
                 wt_seq = str(next(SeqIO.parse(f, "fasta")).seq)
             
-            with st.spinner("Calculating local JanusDDG stability..."):
+            with st.spinner("Calculating biophysical and structural metrics..."):
                 try:
                     df = score_scfv_variants(run_dir, p2_run_name, wt_seq)
                     st.session_state.scored_df = df
@@ -182,209 +185,125 @@ with tab2:
                     st.error(f"Error during scoring: {e}")
 
     # ---------------------------------------------------------
-    # Interactive Thresholding
+    # Final Export Table & Multi-Metric Radar Chart
     # ---------------------------------------------------------
     if st.session_state.scored_df is not None:
         df = st.session_state.scored_df.copy()
         
         st.markdown("---")
+        st.subheader(f"All Ranked Candidates ({len(df)} found)")
         
-        # Pre-calculate min/max for all sliders
-        camsol_min, camsol_max = float(df['camsol_score'].min()), float(df['camsol_score'].max())
-        ddg_min, ddg_max = float(df['janus_ddg'].min()), float(df['janus_ddg'].max())
-        charge_min, charge_max = float(df['net_charge'].min()), float(df['net_charge'].max())
-        bind_min, bind_max = float(df['bindpred_kd'].min()), float(df['bindpred_kd'].max())
-        
-        col_left, col_right = st.columns(2)
+        has_camsol = 'camsol_score' in df.columns and df['camsol_score'].notna().any()
         
         # ==========================================
-        # 1. READ ALL UI SLIDERS FIRST
+        # 1. Main Data Table & Download Export
         # ==========================================
-        with col_left:
-            st.subheader("1. Stability & Solubility")
-            ddg_threshold = st.slider(
-                "Min. Thermodynamic Stability (JanusDDG ΔΔG)", 
-                min_value=ddg_min - 0.5, max_value=ddg_max + 0.5, value=-1.0, step=0.1
-            )
-            camsol_threshold = st.slider(
-                "Min. Intrinsic Solubility (CamSol Score)", 
-                min_value=camsol_min, max_value=camsol_max, value=float(df['camsol_score'].quantile(0.10)), step=0.05
-            )
-
-        with col_right:
-            st.subheader("2. VH-VL Affinity & Bioprocessing")
-            bindpred_threshold = st.slider(
-                "Max. Dissociation Constant (BINDPRED Log10 Kd)", 
-                min_value=bind_min, max_value=bind_max, value=bind_max, step=0.1,
-                help="Lower values indicate tighter VH-VL interface binding."
-            )
-            charge_range = st.slider(
-                "Acceptable Net Charge Range (pH 7.4)", 
-                min_value=charge_min - 1.0, max_value=charge_max + 1.0, 
-                value=(charge_min, charge_max), step=0.5
-            )
-
-        # ==========================================
-        # 2. CALCULATE GLOBAL SURVIVAL
-        # ==========================================
-        df['survives_ddg'] = df['janus_ddg'] >= ddg_threshold
-        df['survives_camsol'] = df['camsol_score'] >= camsol_threshold
-        df['survives_bind'] = df['bindpred_kd'] <= bindpred_threshold
-        df['survives_charge'] = df['net_charge'].between(charge_range[0], charge_range[1])
-        
-        # The ultimate winners
-        df['survival_status'] = df['survives_ddg'] & df['survives_camsol'] & df['survives_bind'] & df['survives_charge']
-        
-        # Assign 3-tier color categories for Plot 1
-        df['plot1_color'] = 'Fails Local'
-        df.loc[df['survives_ddg'] & df['survives_camsol'], 'plot1_color'] = 'Passes Local (Fails Other)'
-        df.loc[df['survival_status'], 'plot1_color'] = 'Passes All 4 Metrics'
-        
-        # Assign 3-tier color categories for Plot 2
-        df['plot2_color'] = 'Fails Local'
-        df.loc[df['survives_bind'] & df['survives_charge'], 'plot2_color'] = 'Passes Local (Fails Other)'
-        df.loc[df['survival_status'], 'plot2_color'] = 'Passes All 4 Metrics'
-        
-        color_map = {
-            'Passes All 4 Metrics': '#2ca02c',       # Green
-            'Passes Local (Fails Other)': '#7F00FF',#'#1f77b4', # Blue
-            'Fails Local': '#d62728'                 # Red
+        rename_map = {
+            'id': 'Sequence ID', 
+            'mutations': 'Mutations',
+            'global_composite_score': 'Global Score', 
+            'janus_ddg': 'Stability (Janus)',
+            'pyrosetta_ddg': 'Stability (PyRosetta)',
+            'camsol_score': 'Solubility (CamSol)', 
+            'pI': 'Isoelectric Point (pI)',
+            'gravy': 'Hydrophobicity (GRAVY)',
+            'net_charge': 'Net Charge',
+            'charge_asymmetry': 'VH-VL Charge Asym.',
+            'bindpred_kd': 'Affinity (BINDPRED)',
+            'esm_fitness': 'ESM-2 (General)', 
+            'antiberty_fitness': 'AntiBERTy (Ab-Specific)',
+            'ablang_fitness': 'AbLang2 (Paired)',
+            'protbert_fitness': 'ProtBERT (Evolution)',
+            'VH': 'VH Sequence', 
+            'VL': 'VL Sequence'
         }
+        
+        # --- ENFORCE LOGICAL COLUMN GROUPING FOR UI & DOWNLOAD ---
+        download_cols = [
+            'id', 'mutations', 'global_composite_score', 
+            'janus_ddg', 'pyrosetta_ddg'
+        ]
+        if has_camsol:
+            download_cols.append('camsol_score')
+            
+        download_cols.extend([
+            'pI', 'gravy', 'net_charge', 'charge_asymmetry',
+            'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
+            'VH', 'VL'
+        ])
+        
+        download_df = df[download_cols].rename(columns=rename_map)
+        
+        # Filter out the heavy sequence strings for the UI table to keep it clean
+        display_cols = [c for c in download_df.columns if c not in ['VH Sequence', 'VL Sequence']]
+        display_df = download_df[display_cols]
+        
+        st.dataframe(
+            display_df.style.background_gradient(cmap='viridis', subset=['Global Score']),
+            use_container_width=True, hide_index=True
+        )
+        
+        st.download_button(
+            label="Download All Ranked Candidates",
+            data=download_df.to_csv(index=False).encode('utf-8'),
+            file_name=f"{p2_run_name}_all_ranked_candidates.csv",
+            mime='text/csv'
+        )
 
         # ==========================================
-        # 3. RENDER PLOTS BACK INTO COLUMNS
-        # ==========================================
-        with col_left:
-            fig1 = px.scatter(
-                df, x="janus_ddg", y="camsol_score", 
-                color="plot1_color", color_discrete_map=color_map,
-                hover_name="id", hover_data={"mutations": True},
-                labels={"janus_ddg": "Thermodynamic Stability (ΔΔG)", "camsol_score": "Intrinsic Solubility", "plot1_color": ""},
-                opacity=0.8
-            )
-            fig1.add_vline(x=ddg_threshold, line_dash="dash", line_color="gray")
-            fig1.add_hline(y=camsol_threshold, line_dash="dot", line_color="gray")
-            fig1.update_layout(
-                height=500, margin=dict(l=0, r=0, t=10, b=0),
-                legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5)
-            )
-            st.plotly_chart(fig1, use_container_width=True)
-
-        with col_right:
-            fig2 = px.scatter(
-                df, x="net_charge", y="bindpred_kd", 
-                color="plot2_color", color_discrete_map=color_map,
-                hover_name="id", hover_data={"mutations": True},
-                labels={"net_charge": "Net Charge (pH 7.4)", "bindpred_kd": "VH-VL Affinity (Log10 Kd)", "plot2_color": ""},
-                opacity=0.8
-            )
-            fig2.add_hline(y=bindpred_threshold, line_dash="dash", line_color="gray")
-            fig2.add_vline(x=charge_range[0], line_dash="dot", line_color="gray")
-            fig2.add_vline(x=charge_range[1], line_dash="dot", line_color="gray")
-            fig2.update_layout(
-                height=500, margin=dict(l=0, r=0, t=10, b=0),
-                legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5)
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
-        # ==========================================
-        # Final Export Table & Multi-Metric Radar Chart
+        # 2. Multi-Metric Radar Chart (Below Table)
         # ==========================================
         st.markdown("---")
+        st.subheader("Developability Footprint")
+        import plotly.graph_objects as go
         
-        passed_df = df[df['survival_status'] == True].sort_values('global_composite_score', ascending=False).reset_index(drop=True)
-        st.markdown(f"**Top Candidates Passing All Thresholds ({len(passed_df)} found)**")
+        selected_ids = st.multiselect(
+            "Select Variants to Compare:", 
+            options=df['id'], 
+            default=df['id'].head(2).tolist() if len(df) >= 2 else df['id'].tolist()
+        )
         
-        if len(passed_df) > 0:
-            col_radar, col_table = st.columns([1, 2])
+        if selected_ids:
+            radar_fig = go.Figure()
             
-            with col_radar:
-                st.subheader("7-Axis Developability Footprint")
+            # Dynamically build radar categories based on CamSol presence
+            categories = ['Stability (Janus)', 'Stability (PyRosetta)', 'Affinity (BINDPRED)', 
+                          'General (ESM-2)', 'Ab-Specific (AntiBERTy)', 
+                          'Paired-Ab (AbLang2)', 'Evolutionary (ProtBERT)']
+            if has_camsol:
+                categories.insert(0, 'Solubility (CamSol)')
+            
+            for variant_id in selected_ids:
+                v_data = df[df['id'] == variant_id].iloc[0]
                 
-                selected_ids = st.multiselect(
-                    "Select Variants to Compare:", 
-                    options=passed_df['id'], 
-                    default=passed_df['id'].head(2).tolist()
-                )
-                
-                if selected_ids:
-                    radar_fig = go.Figure()
-                    # 7 categories matching our 7 normalizations
-                    categories = [
-                        'Solubility (CamSol)', 'Stability (Janus)', 'Affinity (BINDPRED)', 
-                        'General (ESM-2)', 'Ab-Specific (AntiBERTy)', 
-                        'Paired-Ab (AbLang2)', 'Evolutionary (ProtBERT)'
-                    ]
-                    
-                    for variant_id in selected_ids:
-                        v_data = df[df['id'] == variant_id].iloc[0]
-                        
-                        values = [
-                            v_data.get('camsol_norm', 0.5),
-                            v_data.get('janus_norm', 0.5), 
-                            v_data.get('bindpred_norm', 0.5),
-                            v_data.get('esm_norm', 0.5),
-                            v_data.get('ab_norm', 0.5),
-                            v_data.get('ablang_norm', 0.5),
-                            v_data.get('protbert_norm', 0.5)
-                        ]
-                        
-                        values.append(values[0]) # Close the polygon
-                        cat_closed = categories + [categories[0]]
-                        
-                        radar_fig.add_trace(go.Scatterpolar(
-                            r=values, theta=cat_closed,
-                            fill='toself', name=variant_id,
-                            hoverinfo="text",
-                            text=[f"{val:.2f}" for val in values]
-                        ))
-                        
-                    radar_fig.update_layout(
-                        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-                        showlegend=True, legend=dict(orientation="h", y=-0.2),
-                        margin=dict(l=40, r=40, t=20, b=20), height=400
-                    )
-                    st.plotly_chart(radar_fig, use_container_width=True)
-                else:
-                    st.info("Select a variant to view its developability footprint.")
-
-            with col_table:
-                rename_map = {
-                    'id': 'Sequence ID', 'mutations': 'Mutations',
-                    'global_composite_score': 'Global Score', 
-                    'esm_fitness': 'ESM-2 (General)', 
-                    'antiberty_fitness': 'AntiBERTy (Ab-Specific)',
-                    'ablang_fitness': 'AbLang2 (Paired)',
-                    'protbert_fitness': 'ProtBERT (Evolution)',
-                    'janus_ddg': 'Stability (Janus)',
-                    'camsol_score': 'Solubility (CamSol)', 
-                    'bindpred_kd': 'Affinity (BINDPRED)',
-                    'net_charge': 'Net Charge',
-                    'VH': 'VH Sequence', 'VL': 'VL Sequence'
-                }
-                
-                # REORDERED: All 4 PLMs grouped immediately after the Global Score
-                download_cols = [
-                    'id', 'mutations', 'global_composite_score', 
-                    'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
-                    'janus_ddg', 'camsol_score', 'bindpred_kd', 'net_charge', 
-                    'VH', 'VL'
+                values = [
+                    v_data.get('janus_norm', 0.5),
+                    v_data.get('pyrosetta_norm', 0.5),
+                    v_data.get('bindpred_norm', 0.5),
+                    v_data.get('esm_norm', 0.5),
+                    v_data.get('ab_norm', 0.5),
+                    v_data.get('ablang_norm', 0.5),
+                    v_data.get('protbert_norm', 0.5)
                 ]
+                if has_camsol:
+                    values.insert(0, v_data.get('camsol_norm', 0.5))
                 
-                download_df = passed_df[download_cols].rename(columns=rename_map)
+                values.append(values[0]) # Close the polygon
+                cat_closed = categories + [categories[0]]
                 
-                # Filter out the heavy sequence strings for the UI table
-                display_cols = [c for c in download_df.columns if c not in ['VH Sequence', 'VL Sequence']]
-                display_df = download_df[display_cols]
+                radar_fig.add_trace(go.Scatterpolar(
+                    r=values, theta=cat_closed,
+                    fill='toself', name=variant_id,
+                    hoverinfo="text",
+                    text=[f"{val:.2f}" for val in values]
+                ))
                 
-                st.dataframe(
-                    display_df.style.background_gradient(cmap='viridis', subset=['Global Score']),
-                    use_container_width=True, hide_index=True
-                )
-                
-                st.download_button(
-                    label="Download Filtered Candidates",
-                    data=download_df.to_csv(index=False).encode('utf-8'),
-                    file_name=f"{p2_run_name}_top_candidates.csv",
-                    mime='text/csv'
-                )
+            radar_fig.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                showlegend=True, legend=dict(orientation="h", y=-0.2),
+                margin=dict(l=40, r=40, t=20, b=20), height=500
+            )
+            st.plotly_chart(radar_fig, use_container_width=True)
+        else:
+            st.info("Select a variant to view its developability footprint.")
+
