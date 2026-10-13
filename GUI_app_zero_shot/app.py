@@ -196,24 +196,34 @@ with tab2:
         has_camsol = 'camsol_score' in df.columns and df['camsol_score'].notna().any()
         
         # ==========================================
-        # 1. Main Data Table & Download Export
+        # Main Data Table & Download Export
         # ==========================================
         rename_map = {
             'id': 'Sequence ID', 
             'mutations': 'Mutations',
-            'global_composite_score': 'Global Score', 
-            'janus_ddg': 'Stability (Janus)',
-            'pyrosetta_ddg': 'Stability (PyRosetta)',
-            'camsol_score': 'Solubility (CamSol)', 
+            'global_composite_score': 'Global Composite Score', 
+            
+            # Structural Thermodynamics
+            'janus_ddg': 'Stability ΔΔG (Janus)',
+            'pyrosetta_ddg': 'Stability ΔΔG (PyRosetta)',
+            
+            # Sequence Biophysics
+            'camsol_score': 'Intrinsic Solubility (CamSol)', 
             'pI': 'Isoelectric Point (pI)',
-            'gravy': 'Hydrophobicity (GRAVY)',
-            'net_charge': 'Net Charge',
-            'charge_asymmetry': 'VH-VL Charge Asym.',
-            'bindpred_kd': 'Affinity (BINDPRED)',
-            'esm_fitness': 'ESM-2 (General)', 
-            'antiberty_fitness': 'AntiBERTy (Ab-Specific)',
-            'ablang_fitness': 'AbLang2 (Paired)',
-            'protbert_fitness': 'ProtBERT (Evolution)',
+            'gravy': 'Hydrophobicity Index (GRAVY)',
+            'net_charge': 'Net Charge (pH 7.4)',
+            'charge_asymmetry': 'VH-VL Charge Delta',
+            
+            # Interface Affinity
+            'bindpred_kd': 'Affinity Log10 Kd (BINDPRED)',
+            
+            # Deep Learning Language Models
+            'esm_fitness': 'ΔLog-Likelihood (ESM-2 General)', 
+            'antiberty_fitness': 'ΔLog-Likelihood (AntiBERTy)',
+            'ablang_fitness': 'ΔLog-Likelihood (AbLang2 Paired)',
+            'protbert_fitness': 'ΔLog-Likelihood (ProtBERT)',
+            
+            # Raw Data
             'VH': 'VH Sequence', 
             'VL': 'VL Sequence'
         }
@@ -239,7 +249,7 @@ with tab2:
         display_df = download_df[display_cols]
         
         st.dataframe(
-            display_df.style.background_gradient(cmap='viridis', subset=['Global Score']),
+            display_df.style.background_gradient(cmap='viridis', subset=['Global Composite Score']),
             use_container_width=True, hide_index=True
         )
         
@@ -267,12 +277,14 @@ with tab2:
             radar_fig = go.Figure()
             
             # Dynamically build radar categories based on CamSol presence
-            categories = ['Stability (Janus)', 'Stability (PyRosetta)', 'Affinity (BINDPRED)', 
-                          'General (ESM-2)', 'Ab-Specific (AntiBERTy)', 
-                          'Paired-Ab (AbLang2)', 'Evolutionary (ProtBERT)']
+            categories = ['Stability (Janus ΔΔG)', 'Stability (PyRosetta ΔΔG)', 
+                          'Affinity (Log10 Kd)', 'ESM-2 (ΔLL)', 
+                          'AntiBERTy (ΔLL)', 'AbLang2 (ΔLL)', 
+                          'ProtBERT (ΔLL)', 'Hydrophobicity (GRAVY)', 
+                          'Charge Asymmetry', 'Colloidal (pI)']
             if has_camsol:
                 categories.insert(0, 'Solubility (CamSol)')
-            
+    
             for variant_id in selected_ids:
                 v_data = df[df['id'] == variant_id].iloc[0]
                 
