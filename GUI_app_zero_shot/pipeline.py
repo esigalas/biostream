@@ -25,6 +25,7 @@ import gc
 import glob
 import streamlit as st
 import esm
+import json
 
 def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     print(f"--- Phase 2: Scoring Variants for {run_name} ---")
@@ -35,13 +36,23 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     raw_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
     camsol_txt_path = os.path.join(run_dir, f"{run_name}_camsol.txt")
     final_csv_path = os.path.join(run_dir, f"{run_name}_developability_metrics.csv")
+    metadata_path = os.path.join(run_dir, f"{run_name}_metadata.json")
     
     if not os.path.exists(raw_fasta_path):
         raise FileNotFoundError(f"Cannot find {raw_fasta_path}. Run Phase 1 first.")
+    
+    # --- LOAD METADATA ---
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Metadata missing. Please re-run Phase 1 for {run_name} to generate the manifest.")
         
+    with open(metadata_path, "r") as f:
+        meta = json.load(f)
+        vh_len = meta["vh_len"]
+        
+    print(f" -> Loaded run manifest. Splitting domains at VH length: {vh_len} aa")
+
     records = list(SeqIO.parse(raw_fasta_path, "fasta"))
     clean_wt = wt_sequence.replace(":", "").replace("/", "")
-    vh_len = len(clean_wt) // 2
     
     variants = []
     master_fasta_mapping = []
@@ -361,9 +372,80 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         torch.cuda.empty_cache()
     else:
         print(" -> ESM-2 & BINDPRED metrics up to date. Skipping models.")
+    
+    # ---------------------------------------------------------
+    # 10. PLM 5: POET-2 (OpenProtein.AI Evolutionary Fitness)
+    # ---------------------------------------------------------
+    if 'poet2_fitness' not in df.columns: df['poet2_fitness'] = np.nan
+    mask = df['poet2_fitness'].isna()
+    
+    if mask.any():
+        print(f"Calling OpenProtein API (POET-2) to score {mask.sum()} missing variants...")
+        
+        try:
+            import openprotein
+            
+            # 1. Authenticate
+            op_user = os.environ.get("OPENPROTEIN_USERNAME")
+            op_pass = os.environ.get("OPENPROTEIN_PASSWORD")
+            session = openprotein.connect(username=op_user, password=op_pass)
+            
+            # Gather WT and variants (WT must be first for relative scoring)
+            seqs = [clean_wt]
+            index_mapping = []
+            
+            for idx, row in df[mask].iterrows():
+                if row['mutations'] != "WT":
+                    seqs.append(row['VH'] + row['VL'])
+                    index_mapping.append(idx)
+                    
+            if len(seqs) > 1:
+                # 2. Create MSA exactly as the tutorial outlines
+                print(" -> Creating MSA...")
+                msa = session.align.create_msa(clean_wt.encode())
+                msa.wait()
+                
+                # 3. Sample Prompt
+                print(" -> Generating Evolutionary Prompt...")
+                prompt = msa.sample_prompt(num_ensemble_prompts=1, random_seed=42)
+                prompt.wait()
+                
+                # 4. Score Sequences
+                print(f" -> Submitting PoET scoring job for {len(seqs)} sequences...")
+                poet = session.embedding.get_model("poet")
+                scorejob = poet.score(prompt=prompt.prompt_id, sequences=seqs)
+                score_results = scorejob.wait()
+                
+                # 5. Process Results
+                # NB: one score per prompt. We used 1 ensemble prompt, so results are in index 0.
+                scores = score_results[0]
+                
+                # Helper to safely extract the numeric score regardless of API return type
+                def get_val(s):
+                    if hasattr(s, 'score'): return s.score
+                    if hasattr(s, 'log_likelihood'): return s.log_likelihood
+                    if isinstance(s, dict) and 'log_likelihood' in s: return s['log_likelihood']
+                    return float(s)
+                
+                wt_score = get_val(scores[0])
+                
+                for idx, mut_score_obj in zip(index_mapping, scores[1:]):
+                    df.at[idx, 'poet2_fitness'] = get_val(mut_score_obj) - wt_score
+                    
+                if "WT" in df.loc[mask, 'mutations'].values:
+                    df.loc[mask & (df['mutations'] == "WT"), 'poet2_fitness'] = 0.0
+                    
+                print(" -> POET API scoring complete.")
+            else:
+                df.loc[mask & (df['mutations'] == "WT"), 'poet2_fitness'] = 0.0
+                
+        except Exception as e:
+            print(f" -> WARNING: OpenProtein API call failed: {e}")
+    else:
+        print(" -> POET metrics up to date. Skipping API call.")
 
     # ---------------------------------------------------------
-    # 10. JanusDDG Scoring
+    # 11. JanusDDG Scoring
     # ---------------------------------------------------------
     if 'janus_ddg' not in df.columns: df['janus_ddg'] = np.nan
     mask = df['janus_ddg'].isna()
@@ -413,7 +495,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         print(" -> JanusDDG metrics up to date. Skipping model.")
 
     # ---------------------------------------------------------
-    # 11. Adaptive Normalization & Global Composite Score
+    # 12. Adaptive Normalization & Global Composite Score
     # ---------------------------------------------------------
     def norm(col, invert=False):
         if col not in df.columns or df[col].isna().all(): return 0.5 
@@ -431,22 +513,20 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     df['ab_norm'] = norm('antiberty_fitness')
     df['ablang_norm'] = norm('ablang_fitness')
     df['protbert_norm'] = norm('protbert_fitness')
+    df['poet2_norm'] = norm('poet2_fitness') 
     df['gravy_norm'] = norm('gravy', invert=True)                 
     df['charge_asym_norm'] = norm('charge_asymmetry', invert=True) 
     df['pi_norm'] = norm('pi_delta', invert=False)                 
 
-    active_pillars = 10
-    score_sum = (df['janus_norm'] + df['pyrosetta_norm'] + df['bindpred_norm'] + 
-                 df['esm_norm'] + df['ab_norm'] + df['ablang_norm'] + df['protbert_norm'] +
-                 df['gravy_norm'] + df['charge_asym_norm'] + df['pi_norm'])
-                 
-    if df['camsol_score'].notna().any():
-        score_sum += df['camsol_norm']
-        active_pillars = 11
-        
-    df['global_composite_score'] = score_sum / active_pillars
-    df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
+    # --- DYNAMIC COMPOSITE CALCULATION ---
+    # Automatically find all columns ending in '_norm'
+    norm_columns = [c for c in df.columns if c.endswith('_norm')]
     
+    # Calculate the mean across however many pillars exist
+    df['global_composite_score'] = df[norm_columns].mean(axis=1)
+    
+    df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
+
     # --- ENFORCE LOGICAL COLUMN GROUPING FOR BACKEND CACHE ---
     ordered_cols = [
         'id', 'mutations', 'global_composite_score', 
@@ -457,7 +537,8 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         
     ordered_cols.extend([
         'pI', 'gravy', 'net_charge', 'charge_asymmetry',
-        'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
+        'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness',
+        'protbert_fitness', 'poet2_fitness',
         'VH', 'VL'
     ])
     
@@ -467,8 +548,9 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     return df
 
 def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: str, run_name: str, 
+                                     vh_len: int, vl_len: int, 
                                      gen_models=["AntiFold (Antibody-specific)"], num_seqs=100, temp=0.2):
-    
+
     # 1. Create a dedicated workspace for this specific run
     run_dir = os.path.join(base_output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -622,7 +704,6 @@ def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: 
     
     if ("ProteinMPNN (Diverse)" in gen_models) or ("ThermoMPNN (ddG-Driven)" in gen_models) or ("ProteinMPNN (Soluble)" in gen_models) or ("ESM-C (Evolutionary LM)" in gen_models) or ("AbLang2 (Antibody LM)" in gen_models):
         from abnumber import Chain
-        import json
         
         vh_chain = Chain(vh_seq, scheme='chothia')
         vl_chain = Chain(vl_seq, scheme='chothia')
@@ -966,5 +1047,14 @@ def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: 
     SeqIO.write(cleaned_records, camsol_fasta_path, "fasta")
     print(f"Step 5 Complete: Pooled {len(cleaned_records)} unique variants across {len(gen_models)} models.")
     
+    metadata_path = os.path.join(run_dir, f"{run_name}_metadata.json")
+    run_metadata = {
+        "vh_len": vh_len,
+        "vl_len": vl_len
+    }
+
+    with open(metadata_path, "w") as f:
+        json.dump(run_metadata, f)
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
