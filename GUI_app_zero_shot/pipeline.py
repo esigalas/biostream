@@ -109,8 +109,13 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
                             return (c_max - df[col]) / (c_max - c_min) if invert else (df[col] - c_min) / (c_max - c_min)
                             
                         df['camsol_norm'] = norm_cache('camsol_score')
-                        df['janus_norm'] = norm_cache('janus_ddg', invert=True)      
-                        df['pyrosetta_norm'] = norm_cache('pyrosetta_ddg', invert=True) 
+                        df['janus_norm'] = norm_cache('janus_ddg', invert=False)      
+                        
+                        # Clip extreme PyRosetta steric clashes (+200 to +1600 REU) so they don't compress the 0-1 scale
+                        df['pyrosetta_clipped'] = df['pyrosetta_ddg'].clip(upper=25.0)
+                        df['pyrosetta_norm'] = norm_cache('pyrosetta_clipped', invert=True)
+                        df.drop(columns=['pyrosetta_clipped'], inplace=True)
+
                         df['bindpred_norm'] = norm_cache('bindpred_kd', invert=True) 
                         df['esm_norm'] = norm_cache('esm_fitness')
                         df['ab_norm'] = norm_cache('antiberty_fitness')
@@ -266,16 +271,15 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         import ablang2
         ablang_model = ablang2.pretrained("ablang2-paired", random_init=False) 
         
-        wt_res = ablang_model([[clean_wt[:vh_len], clean_wt[vh_len:]]], mode='likelihood')
-        wt_score = np.sum(wt_res[0]) 
+        wt_score = ablang_model([[clean_wt[:vh_len], clean_wt[vh_len:]]], mode='pseudo_log_likelihood')[0]
         
         for idx, row in df[mask].iterrows():
             if row['mutations'] == "WT":
                 df.at[idx, 'ablang_fitness'] = 0.0
                 continue
                 
-            mut_res = ablang_model([[row['VH'], row['VL']]], mode='likelihood')
-            df.at[idx, 'ablang_fitness'] = np.sum(mut_res[0]) - wt_score
+            mut_score = ablang_model([[row['VH'], row['VL']]], mode='pseudo_log_likelihood')[0]
+            df.at[idx, 'ablang_fitness'] = float(mut_score - wt_score)
 
         del ablang_model
         gc.collect()
@@ -504,23 +508,30 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         return (c_max - df[col]) / (c_max - c_min) if invert else (df[col] - c_min) / (c_max - c_min)
 
     df['pi_delta'] = (df['pI'] - 7.4).abs()
+    
+    # Clip extreme PyRosetta steric clashes (+200 to +1600 REU) so they don't compress the 0-1 scale
+    df['_pyrosetta_clipped'] = df['pyrosetta_ddg'].clip(upper=25.0)
 
-    df['camsol_norm'] = norm('camsol_score')
-    df['janus_norm'] = norm('janus_ddg', invert=True)      
-    df['pyrosetta_norm'] = norm('pyrosetta_ddg', invert=True)  
-    df['bindpred_norm'] = norm('bindpred_kd', invert=True) 
-    df['esm_norm'] = norm('esm_fitness')
-    df['ab_norm'] = norm('antiberty_fitness')
-    df['ablang_norm'] = norm('ablang_fitness')
-    df['protbert_norm'] = norm('protbert_fitness')
-    df['poet2_norm'] = norm('poet2_fitness') 
-    df['gravy_norm'] = norm('gravy', invert=True)                 
-    df['charge_asym_norm'] = norm('charge_asymmetry', invert=True) 
-    df['pi_norm'] = norm('pi_delta', invert=False)                 
-
+    df['camsol_norm'] = norm('camsol_score', invert=False)          # Higher = More soluble
+    df['janus_norm'] = norm('janus_ddg', invert=False)              # FIX: Higher (>0) = More stable in raw JanusDDG
+    df['pyrosetta_norm'] = norm('_pyrosetta_clipped', invert=True)  # Lower (<0) = More stable in PyRosetta
+    df['bindpred_norm'] = norm('bindpred_kd', invert=True)          # Change to False if bindpred_kd values are positive!
+    df['esm_norm'] = norm('esm_fitness', invert=False)              # Higher (>0) = Better fitness
+    df['ab_norm'] = norm('antiberty_fitness', invert=False)         # Higher (>0) = Better fitness
+    df['ablang_norm'] = norm('ablang_fitness', invert=False)        # Higher (>0) = Better fitness
+    df['protbert_norm'] = norm('protbert_fitness', invert=False)    # Higher (>0) = Better fitness
+    df['poet2_norm'] = norm('poet2_fitness', invert=False)          # Higher (>0) = Better fitness
+    df['gravy_norm'] = norm('gravy', invert=True)                   # Lower (<0) = More hydrophilic
+    df['charge_asym_norm'] = norm('charge_asymmetry', invert=True)  # Lower (closer to 0) = Less dipole
+    df['pi_norm'] = norm('pi_delta', invert=False)                  # Higher distance from pH 7.4 = Better repulsion
+    
+    df.drop(columns=['_pyrosetta_clipped'], inplace=True)
     # --- DYNAMIC COMPOSITE CALCULATION ---
-    # Automatically find all columns ending in '_norm'
-    norm_columns = [c for c in df.columns if c.endswith('_norm')]
+    # Only average over active, non-empty normalized columns (excludes poet2_norm if POET-2 was skipped)
+    norm_columns = [
+        c for c in df.columns 
+        if c.endswith('_norm') and not df[c.replace('_norm', '_fitness').replace('ab_fitness', 'antiberty_fitness')].isna().all()
+    ]
     
     # Calculate the mean across however many pillars exist
     df['global_composite_score'] = df[norm_columns].mean(axis=1)
@@ -840,9 +851,10 @@ def run_scfv_developability_pipeline(vh_seq: str, vl_seq: str, base_output_dir: 
                 description=""
             )
             thermo_records.append(new_record)
-            if thermo_records:
-                SeqIO.write(thermo_records, os.path.join(run_dir, f"{run_name}_thermompnn.fasta"), "fasta")
-                all_raw_records.extend(thermo_records)
+
+        if thermo_records:
+            SeqIO.write(thermo_records, os.path.join(run_dir, f"{run_name}_thermompnn.fasta"), "fasta")
+            all_raw_records.extend(thermo_records)
     
     # --- MODEL D: ProteinMPNN (Soluble) ---
     if "ProteinMPNN (Soluble)" in gen_models:
