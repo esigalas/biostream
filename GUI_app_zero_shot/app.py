@@ -52,15 +52,22 @@ with tab1:
             st.error("Please provide both VH and VL sequences.")
         elif not gen_models:
             st.error("Please select at least one generative model.")
+            
         else:
             with st.spinner("Running Phase 1 Ensemble (ESMFold -> PyRosetta -> Generators)..."):
-                # Pass the new ensemble arguments to the pipeline
+                
+                # Clean the inputs first so the lengths match the actual amino acids
+                vh_clean = vh_seq.strip()
+                vl_clean = vl_seq.strip()
+                
+                # Pass the dynamically calculated lengths into the pipeline
                 run_scfv_developability_pipeline(
-                    vh_seq.strip(), vl_seq.strip(), base_dir, run_name, 
+                    vh_clean, vl_clean, base_dir, run_name, 
+                    vh_len=len(vh_clean),
+                    vl_len=len(vl_clean),
                     gen_models=gen_models, num_seqs=num_seqs, temp=temp
                 )
-                st.success("Phase 1 Complete! Sequences pooled and deduplicated.")
-                
+                st.success("Phase 1 Complete! Sequences pooled and deduplicated.")                
     # 2. The Persistent Download Block
     fasta_path = os.path.join(base_dir, run_name, f"{run_name}_camsol_upload.fasta")
     pdb_path = os.path.join(base_dir, run_name, f"{run_name}_relaxed.pdb")
