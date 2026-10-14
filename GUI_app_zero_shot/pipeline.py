@@ -210,12 +210,12 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
                 if row['mutations'] == "WT":
                     df.at[idx, 'pyrosetta_ddg'] = 0.0
                     continue
-                    
+
                 mut_pose = wt_pose.clone()
                 for m in row['mutations'].split(","):
                     pos, mut_aa = int(m[1:-1]), m[-1]
                     mutate_residue(mut_pose, pos, mut_aa, pack_scorefxn=scorefxn)
-                    
+
                 df.at[idx, 'pyrosetta_ddg'] = scorefxn(mut_pose) - wt_energy
         else:
             df['pyrosetta_ddg'] = 0.0
