@@ -203,7 +203,7 @@ with tab2:
         has_camsol = 'camsol_score' in df.columns and df['camsol_score'].notna().any()
         
         # ==========================================
-        # Main Data Table & Download Export
+        # 1. Main Data Table & Download Export
         # ==========================================
         rename_map = {
             'id': 'Sequence ID', 
@@ -266,9 +266,150 @@ with tab2:
             file_name=f"{p2_run_name}_all_ranked_candidates.csv",
             mime='text/csv'
         )
+        
+        # ==========================================
+        # 2. Multi-Gate Aggregation Triage & 4D Landscape
+        # ==========================================
+        st.markdown("---")
+        st.subheader("🔬 Anti-Aggregation Multi-Gate Triage & Landscape")
+        
+        # Isolate the Wild-Type baseline row for relative comparisons
+        wt_rows = df[df['mutations'] == 'WT']
+        wt_row = wt_rows.iloc[0] if not wt_rows.empty else df.iloc[0]
+        
+        with st.expander("⚙️ Configure Anti-Aggregation Biophysical Gates (Filter Candidates)", expanded=True):
+            st.markdown("Filter the ensemble using orthogonal constraints relative to your **Wild-Type (WT)** baseline:")
+            f_col1, f_col2, f_col3 = st.columns(3)
+            
+            with f_col1:
+                st.markdown("**1. Conformational & Interface**")
+                max_rosetta = st.slider(
+                    "Max PyRosetta ΔΔG (REU)", 
+                    min_value=-20.0, max_value=100.0, value=10.0, step=1.0,
+                    help="Removes severe steric clashes (+200 to +1600 REU) so you can see the true landscape."
+                )
+                max_janus = st.slider(
+                    "Max Janus ΔΔG (kcal/mol)", 
+                    min_value=-5.0, max_value=5.0, value=0.5, step=0.1,
+                    help="Negative values indicate stabilizing mutations."
+                )
+                strict_interface = st.checkbox(
+                    "Require Equal/Better VH-VL Affinity (BINDPRED ≤ WT)", value=False
+                )
+                
+            with f_col2:
+                st.markdown("**2. Colloidal & Electrostatic**")
+                improve_solubility = st.checkbox(
+                    f"Improve Hydrophobicity (GRAVY ≤ WT: {wt_row.get('gravy', 0):.2f})", value=True
+                )
+                if has_camsol:
+                    improve_camsol = st.checkbox(
+                        f"Improve Intrinsic Solubility (CamSol ≥ WT: {wt_row.get('camsol_score', 0):.2f})", value=True
+                    )
+                else:
+                    improve_camsol = False
+                reduce_dipole = st.checkbox(
+                    f"Reduce/Maintain VH-VL Charge Dipole (≤ WT: {wt_row.get('charge_asymmetry', 0):.2f})", value=False
+                )
+                
+            with f_col3:
+                st.markdown("**3. Evolutionary Guardrails**")
+                min_ablang = st.slider(
+                    "Min AbLang2 Paired ΔLL", 
+                    min_value=-10.0, max_value=5.0, value=-1.0, step=0.5,
+                    help="Ensures mutations do not violate paired antibody germline rules."
+                )
+                min_esm = st.slider(
+                    "Min ESM-2 ΔLL", 
+                    min_value=-150.0, max_value=20.0, value=-10.0, step=1.0
+                )
+
+        # Apply the boolean masks
+        filtered_df = df.copy()
+        if 'pyrosetta_ddg' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['pyrosetta_ddg'] <= max_rosetta]
+        if 'janus_ddg' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['janus_ddg'] <= max_janus]
+        if strict_interface and 'bindpred_kd' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['bindpred_kd'] <= wt_row['bindpred_kd']]
+        if improve_solubility and 'gravy' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['gravy'] <= wt_row['gravy']]
+        if improve_camsol and has_camsol:
+            filtered_df = filtered_df[filtered_df['camsol_score'] >= wt_row['camsol_score']]
+        if reduce_dipole and 'charge_asymmetry' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['charge_asymmetry'] <= wt_row['charge_asymmetry']]
+        if 'ablang_fitness' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['ablang_fitness'] >= min_ablang]
+        if 'esm_fitness' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['esm_fitness'] >= min_esm]
+
+        # Always keep WT in the plot for visual reference
+        if 'WT' not in filtered_df['mutations'].values and not wt_rows.empty:
+            filtered_df = pd.concat([wt_rows, filtered_df], ignore_index=True)
+
+        st.markdown(f"**🎯 Surviving Anti-Aggregation Candidates:** `{len(filtered_df)}` out of `{len(df)}` total variants (including WT)")
+
+        # --- Interactive 4D Plot Controls (X, Y, Color, Size) ---
+        metric_options = [c for c in download_cols if c not in ['id', 'mutations', 'VH', 'VL'] and c in df.columns]
+        
+        ax_col1, ax_col2, ax_col3, ax_col4 = st.columns(4)
+        with ax_col1:
+            x_axis = st.selectbox("X-Axis (e.g., Stability)", options=metric_options, index=metric_options.index('pyrosetta_ddg') if 'pyrosetta_ddg' in metric_options else 0)
+        with ax_col2:
+            y_axis = st.selectbox("Y-Axis (e.g., Antibody PLM)", options=metric_options, index=metric_options.index('ablang_fitness') if 'ablang_fitness' in metric_options else 1)
+        with ax_col3:
+            default_color = 'camsol_score' if has_camsol else 'gravy'
+            color_axis = st.selectbox("Color (e.g., Solubility)", options=metric_options, index=metric_options.index(default_color) if default_color in metric_options else 0)
+        with ax_col4:
+            size_axis = st.selectbox("Bubble Size", options=["Uniform"] + metric_options, index=0)
+
+        if not filtered_df.empty:
+            plot_data = filtered_df.copy()
+            
+            # Scale bubble size safely to positive numbers if a metric is selected
+            if size_axis != "Uniform":
+                s_min, s_max = plot_data[size_axis].min(), plot_data[size_axis].max()
+                if s_max > s_min:
+                    plot_data['_bubble_size'] = 8 + 20 * (plot_data[size_axis] - s_min) / (s_max - s_min)
+                else:
+                    plot_data['_bubble_size'] = 12
+            else:
+                plot_data['_bubble_size'] = 10
+
+            fig_scatter = px.scatter(
+                plot_data,
+                x=x_axis, 
+                y=y_axis,
+                color=color_axis,
+                size='_bubble_size',
+                hover_name='id',
+                hover_data=['mutations', 'global_composite_score', 'janus_ddg', 'gravy', 'charge_asymmetry'],
+                color_continuous_scale='Viridis',
+                labels={
+                    x_axis: rename_map.get(x_axis, x_axis),
+                    y_axis: rename_map.get(y_axis, y_axis),
+                    color_axis: rename_map.get(color_axis, color_axis)
+                },
+                title=f"Filtered Developability Landscape ({len(plot_data)} Candidates)"
+            )
+            
+            # Highlight the exact Wild-Type coordinates with red crosshairs
+            wt_x = wt_row.get(x_axis, 0)
+            wt_y = wt_row.get(y_axis, 0)
+            fig_scatter.add_hline(y=wt_y, line_dash="dash", line_color="#FF4B4B", opacity=0.7, annotation_text="WT Baseline")
+            fig_scatter.add_vline(x=wt_x, line_dash="dash", line_color="#FF4B4B", opacity=0.7, annotation_text="WT Baseline")
+            
+            st.plotly_chart(fig_scatter, use_container_width=True)
+            
+            # Show the shortlisted table of surviving candidates right below the chart
+            with st.expander(f"📋 View Shortlisted Anti-Aggregation Candidates ({len(filtered_df)} variants)", expanded=False):
+                shortlist_df = filtered_df[download_cols].rename(columns=rename_map)
+                st.dataframe(shortlist_df[display_cols], use_container_width=True, hide_index=True)
+        else:
+            st.warning("No variants passed all filters! Try relaxing one of the sliders above.")
 
         # ==========================================
-        # 2. Multi-Metric Radar Chart (Below Table)
+        # 3. Multi-Metric Radar Chart (Below Table)
         # ==========================================
         st.markdown("---")
         st.subheader("Developability Footprint")
