@@ -94,7 +94,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
             # --- FAST CAMSOL UPDATE ---
             if 'camsol_score' in df.columns and df['camsol_score'].isna().all() and os.path.exists(camsol_txt_path):
                 # Check if all other metrics are present (meaning ONLY camsol is missing)
-                expected_compute_metrics = ['janus_ddg', 'pyrosetta_ddg', 'bindpred_kd', 'net_charge', 'pI', 'gravy', 'charge_asymmetry', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness']
+                expected_compute_metrics = ['janus_ddg', 'pyrosetta_ddg', 'bindpred_kd', 'net_charge', 'pI', 'gravy', 'charge_asymmetry', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness', 'esmc_fitness']
                 if all(m in df.columns for m in expected_compute_metrics) and not df[expected_compute_metrics].isna().any().any():
                     print(" -> Cache Hit for all sequences! New CamSol data detected. Performing fast update...")
                     camsol_df = pd.read_csv(camsol_txt_path, sep='\t')
@@ -118,6 +118,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
 
                         df['bindpred_norm'] = norm_cache('bindpred_kd', invert=True) 
                         df['esm_norm'] = norm_cache('esm_fitness')
+                        df['esmc_norm'] = norm_cache('esmc_fitness')
                         df['ab_norm'] = norm_cache('antiberty_fitness')
                         df['ablang_norm'] = norm_cache('ablang_fitness')
                         df['protbert_norm'] = norm_cache('protbert_fitness')
@@ -130,9 +131,9 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
                         score_sum = (df['janus_norm'] + df['pyrosetta_norm'] + df['bindpred_norm'] + 
                                      df['esm_norm'] + df['ab_norm'] + df['ablang_norm'] + 
                                      df['protbert_norm'] + df['gravy_norm'] + df['charge_asym_norm'] + 
-                                     df['pi_norm'] + df['camsol_norm'])
+                                     df['pi_norm'] + df['camsol_norm'] + df['esmc_norm'])
                         
-                        df['global_composite_score'] = score_sum / 11.0
+                        df['global_composite_score'] = score_sum / 12.0
                         
                         df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
                         cols_to_save = [c for c in df.columns if not c.endswith('_norm') and c != 'pi_delta']
@@ -447,9 +448,45 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
             print(f" -> WARNING: OpenProtein API call failed: {e}")
     else:
         print(" -> POET metrics up to date. Skipping API call.")
+    
+    # ---------------------------------------------------------
+    # 11. PLM 5: ESM-C (Biohub 300M via Isolated Env)
+    # ---------------------------------------------------------
+    if 'esmc_fitness' not in df.columns: df['esmc_fitness'] = np.nan
+    mask = df['esmc_fitness'].isna()
+    
+    if mask.any():
+        print(f"Running ESM-C in isolated env to score {mask.sum()} missing variants...")
+        temp_in_csv = os.path.join(run_dir, "temp_esmc_in.csv")
+        temp_out_csv = os.path.join(run_dir, "temp_esmc_out.csv")
+        
+        df.loc[mask, ['id', 'mutations']].to_csv(temp_in_csv, index=False)
+        
+        esmc_score_cmd = [
+            "conda", "run", "-n", "esmc_env",
+            "python", "run_esmc_scoring.py",
+            "--wt_seq", clean_wt,
+            "--input_csv", temp_in_csv,
+            "--output_csv", temp_out_csv
+        ]
+        
+        try:
+            subprocess.run(esmc_score_cmd, check=True, capture_output=True, text=True)
+            if os.path.exists(temp_out_csv):
+                esmc_res = pd.read_csv(temp_out_csv)
+                esmc_map = dict(zip(esmc_res['id'], esmc_res['esmc_fitness']))
+                df.loc[mask, 'esmc_fitness'] = df.loc[mask, 'id'].map(esmc_map)
+                os.remove(temp_out_csv)
+            if os.path.exists(temp_in_csv):
+                os.remove(temp_in_csv)
+            print(" -> ESM-C scoring complete.")
+        except subprocess.CalledProcessError as e:
+            print(f" -> WARNING: ESM-C scoring failed:\n{e.stderr}")
+    else:
+        print(" -> ESM-C metrics up to date. Skipping model.")
 
     # ---------------------------------------------------------
-    # 11. JanusDDG Scoring
+    # 12. JanusDDG Scoring
     # ---------------------------------------------------------
     if 'janus_ddg' not in df.columns: df['janus_ddg'] = np.nan
     mask = df['janus_ddg'].isna()
@@ -499,7 +536,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
         print(" -> JanusDDG metrics up to date. Skipping model.")
 
     # ---------------------------------------------------------
-    # 12. Adaptive Normalization & Global Composite Score
+    # 13. Adaptive Normalization & Global Composite Score
     # ---------------------------------------------------------
     def norm(col, invert=False):
         if col not in df.columns or df[col].isna().all(): 
@@ -523,6 +560,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     df['ablang_norm'] = norm('ablang_fitness', invert=False)        # Higher (>0) = Better fitness
     df['protbert_norm'] = norm('protbert_fitness', invert=False)    # Higher (>0) = Better fitness
     df['poet2_norm'] = norm('poet2_fitness', invert=False)          # Higher (>0) = Better fitness
+    df['esmc_norm'] = norm('esmc_fitness', invert=False)            # Higher (>0) = Better fitness 
     df['gravy_norm'] = norm('gravy', invert=True)                   # Lower (<0) = More hydrophilic
     df['charge_asym_norm'] = norm('charge_asymmetry', invert=True)  # Lower (closer to 0) = Less dipole
     df['pi_norm'] = norm('pi_delta', invert=False)                  # Higher distance from pH 7.4 = Better repulsion
@@ -549,7 +587,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     ordered_cols.extend([
         'pI', 'gravy', 'net_charge', 'charge_asymmetry',
         'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness',
-        'protbert_fitness', 'poet2_fitness',
+        'protbert_fitness', 'poet2_fitness', 'esmc_fitness',
         'VH', 'VL'
     ])
     

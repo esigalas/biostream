@@ -225,7 +225,8 @@ with tab2:
             'bindpred_kd': 'Affinity Log10 Kd (BINDPRED)',
             
             # Deep Learning Language Models
-            'esm_fitness': 'ΔLog-Likelihood (ESM-2 General)', 
+            'esm_fitness': 'ΔLog-Likelihood (ESM-2 General)',
+            'esmc_fitness': 'ΔLog-Likelihood (ESM-C)',
             'antiberty_fitness': 'ΔLog-Likelihood (AntiBERTy)',
             'ablang_fitness': 'ΔLog-Likelihood (AbLang2 Paired)',
             'protbert_fitness': 'ΔLog-Likelihood (ProtBERT)',
@@ -245,9 +246,12 @@ with tab2:
             
         download_cols.extend([
             'pI', 'gravy', 'net_charge', 'charge_asymmetry',
-            'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
+            'bindpred_kd', 'esm_fitness', 'esmc_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
             'VH', 'VL'
         ])
+        
+        # Guard against missing columns if session_state holds an older run
+        download_cols = [c for c in download_cols if c in df.columns]
         
         download_df = df[download_cols].rename(columns=rename_map)
         
@@ -439,7 +443,7 @@ with tab2:
             # Dynamically build radar categories based on CamSol presence
             categories = [
                 'Stability (Janus ΔΔG)', 'Stability (PyRosetta ΔΔG)', 
-                'Affinity (Log10 Kd)', 'ESM-2 (ΔLL)', 
+                'Affinity (Log10 Kd)', 'ESM-2 (ΔLL)', 'ESM-C (ΔLL)',
                 'AntiBERTy (ΔLL)', 'AbLang2 (ΔLL)', 
                 'ProtBERT (ΔLL)', 'Hydrophobicity (GRAVY)', 
                 'Charge Asymmetry', 'Colloidal (pI)'
@@ -456,6 +460,7 @@ with tab2:
                     v_data.get('pyrosetta_norm', 0.5),
                     v_data.get('bindpred_norm', 0.5),
                     v_data.get('esm_norm', 0.5),
+                    v_data.get('esmc_norm', 0.5),
                     v_data.get('ab_norm', 0.5),
                     v_data.get('ablang_norm', 0.5),
                     v_data.get('protbert_norm', 0.5),
