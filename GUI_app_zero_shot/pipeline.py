@@ -502,9 +502,11 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     # 12. Adaptive Normalization & Global Composite Score
     # ---------------------------------------------------------
     def norm(col, invert=False):
-        if col not in df.columns or df[col].isna().all(): return 0.5 
+        if col not in df.columns or df[col].isna().all(): 
+            return np.nan  # Return NaN if a metric wasn't run so it doesn't skew the average
         c_min, c_max = df[col].min(), df[col].max()
-        if c_max == c_min: return 0.5
+        if c_max == c_min: 
+            return 0.5
         return (c_max - df[col]) / (c_max - c_min) if invert else (df[col] - c_min) / (c_max - c_min)
 
     df['pi_delta'] = (df['pI'] - 7.4).abs()
@@ -513,9 +515,9 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     df['_pyrosetta_clipped'] = df['pyrosetta_ddg'].clip(upper=25.0)
 
     df['camsol_norm'] = norm('camsol_score', invert=False)          # Higher = More soluble
-    df['janus_norm'] = norm('janus_ddg', invert=False)              # FIX: Higher (>0) = More stable in raw JanusDDG
+    df['janus_norm'] = norm('janus_ddg', invert=False)              # Higher (>0) = More stable in raw JanusDDG
     df['pyrosetta_norm'] = norm('_pyrosetta_clipped', invert=True)  # Lower (<0) = More stable in PyRosetta
-    df['bindpred_norm'] = norm('bindpred_kd', invert=True)          # Change to False if bindpred_kd values are positive!
+    df['bindpred_norm'] = norm('bindpred_kd', invert=True)          # Lower Log10 Kd = Tighter binding
     df['esm_norm'] = norm('esm_fitness', invert=False)              # Higher (>0) = Better fitness
     df['ab_norm'] = norm('antiberty_fitness', invert=False)         # Higher (>0) = Better fitness
     df['ablang_norm'] = norm('ablang_fitness', invert=False)        # Higher (>0) = Better fitness
@@ -524,17 +526,15 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     df['gravy_norm'] = norm('gravy', invert=True)                   # Lower (<0) = More hydrophilic
     df['charge_asym_norm'] = norm('charge_asymmetry', invert=True)  # Lower (closer to 0) = Less dipole
     df['pi_norm'] = norm('pi_delta', invert=False)                  # Higher distance from pH 7.4 = Better repulsion
-    
+
     df.drop(columns=['_pyrosetta_clipped'], inplace=True)
-    # --- DYNAMIC COMPOSITE CALCULATION ---
-    # Only average over active, non-empty normalized columns (excludes poet2_norm if POET-2 was skipped)
-    norm_columns = [
-        c for c in df.columns 
-        if c.endswith('_norm') and not df[c.replace('_norm', '_fitness').replace('ab_fitness', 'antiberty_fitness')].isna().all()
-    ]
-    
-    # Calculate the mean across however many pillars exist
+
+    # Calculate the mean across all active '_norm' columns (pandas automatically skips NaN columns)
+    norm_columns = [c for c in df.columns if c.endswith('_norm')]
     df['global_composite_score'] = df[norm_columns].mean(axis=1)
+    
+    # Fill any NaN normalized columns with 0.5 afterward so the Radar Chart never breaks
+    df[norm_columns] = df[norm_columns].fillna(0.5)
     
     df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
 
