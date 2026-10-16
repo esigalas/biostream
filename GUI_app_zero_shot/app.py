@@ -284,17 +284,18 @@ with tab2:
             with f_col1:
                 st.markdown("**1. Conformational & Interface**")
                 max_rosetta = st.slider(
-                    "Max PyRosetta ΔΔG (REU)", 
-                    min_value=-20.0, max_value=100.0, value=10.0, step=1.0,
-                    help="Removes severe steric clashes (+200 to +1600 REU) so you can see the true landscape."
+                    "Max PyRosetta ΔΔG (REU) [Lower = Better]", 
+                    min_value=-15.0, max_value=25.0, value=10.0, step=0.5,
+                    help="In PyRosetta, negative (< 0) is stabilizing. Variants above 25.0 REU have severe steric clashes and receive a 0.0 normalized score."
                 )
-                max_janus = st.slider(
-                    "Max Janus ΔΔG (kcal/mol)", 
-                    min_value=-5.0, max_value=5.0, value=0.5, step=0.1,
-                    help="Negative values indicate stabilizing mutations."
+                # FIX 1: Changed from max_janus (<=) to min_janus (>=) because raw JanusDDG is Positive = Stabilizing
+                min_janus = st.slider(
+                    "Min Janus ΔΔG (kcal/mol) [Higher = Better]", 
+                    min_value=-5.0, max_value=5.0, value=-0.5, step=0.1,
+                    help="In raw JanusDDG, positive (> 0) is stabilizing. Setting to -0.5 keeps neutral and stabilizing variants."
                 )
                 strict_interface = st.checkbox(
-                    "Require Equal/Better VH-VL Affinity (BINDPRED ≤ WT)", value=False
+                    f"Require Equal/Better VH-VL Affinity (BINDPRED ≤ WT: {wt_row.get('bindpred_kd', 0):.2f})", value=False
                 )
                 
             with f_col2:
@@ -329,7 +330,8 @@ with tab2:
         if 'pyrosetta_ddg' in filtered_df.columns:
             filtered_df = filtered_df[filtered_df['pyrosetta_ddg'] <= max_rosetta]
         if 'janus_ddg' in filtered_df.columns:
-            filtered_df = filtered_df[filtered_df['janus_ddg'] <= max_janus]
+            # FIX 1: Keep variants >= min_janus (neutral and positive/stabilizing)
+            filtered_df = filtered_df[filtered_df['janus_ddg'] >= min_janus]
         if strict_interface and 'bindpred_kd' in filtered_df.columns:
             filtered_df = filtered_df[filtered_df['bindpred_kd'] <= wt_row['bindpred_kd']]
         if improve_solubility and 'gravy' in filtered_df.columns:
@@ -405,6 +407,12 @@ with tab2:
             with st.expander(f"📋 View Shortlisted Anti-Aggregation Candidates ({len(filtered_df)} variants)", expanded=False):
                 shortlist_df = filtered_df[download_cols].rename(columns=rename_map)
                 st.dataframe(shortlist_df[display_cols], use_container_width=True, hide_index=True)
+                st.download_button(
+                    label="⬇️ Download Shortlisted Candidates CSV",
+                    data=shortlist_df.to_csv(index=False).encode('utf-8'),
+                    file_name=f"{p2_run_name}_shortlisted_candidates.csv",
+                    mime='text/csv'
+                )
         else:
             st.warning("No variants passed all filters! Try relaxing one of the sliders above.")
 
@@ -413,29 +421,36 @@ with tab2:
         # ==========================================
         st.markdown("---")
         st.subheader("Developability Footprint")
-        import plotly.graph_objects as go
+        
+        # Default to comparing Wild-Type against the #1 top surviving mutant
+        wt_id = wt_row['id']
+        non_wt_survivors = [vid for vid in filtered_df['id'].tolist() if vid != wt_id]
+        default_radar_ids = [wt_id] + non_wt_survivors[:1] if non_wt_survivors else [wt_id]
         
         selected_ids = st.multiselect(
-            "Select Variants to Compare:", 
-            options=df['id'], 
-            default=df['id'].head(2).tolist() if len(df) >= 2 else df['id'].tolist()
+            "Select Variants to Compare (Normalized 0 to 1, where 1 = Best in Cohort):", 
+            options=df['id'].tolist(), 
+            default=default_radar_ids
         )
         
         if selected_ids:
             radar_fig = go.Figure()
             
             # Dynamically build radar categories based on CamSol presence
-            categories = ['Stability (Janus ΔΔG)', 'Stability (PyRosetta ΔΔG)', 
-                          'Affinity (Log10 Kd)', 'ESM-2 (ΔLL)', 
-                          'AntiBERTy (ΔLL)', 'AbLang2 (ΔLL)', 
-                          'ProtBERT (ΔLL)', 'Hydrophobicity (GRAVY)', 
-                          'Charge Asymmetry', 'Colloidal (pI)']
+            categories = [
+                'Stability (Janus ΔΔG)', 'Stability (PyRosetta ΔΔG)', 
+                'Affinity (Log10 Kd)', 'ESM-2 (ΔLL)', 
+                'AntiBERTy (ΔLL)', 'AbLang2 (ΔLL)', 
+                'ProtBERT (ΔLL)', 'Hydrophobicity (GRAVY)', 
+                'Charge Asymmetry', 'Colloidal (pI)'
+            ]
             if has_camsol:
                 categories.insert(0, 'Solubility (CamSol)')
     
             for variant_id in selected_ids:
                 v_data = df[df['id'] == variant_id].iloc[0]
                 
+                # FIX 2: Added gravy_norm, charge_asym_norm, and pi_norm to match categories 1-to-1
                 values = [
                     v_data.get('janus_norm', 0.5),
                     v_data.get('pyrosetta_norm', 0.5),
@@ -443,7 +458,10 @@ with tab2:
                     v_data.get('esm_norm', 0.5),
                     v_data.get('ab_norm', 0.5),
                     v_data.get('ablang_norm', 0.5),
-                    v_data.get('protbert_norm', 0.5)
+                    v_data.get('protbert_norm', 0.5),
+                    v_data.get('gravy_norm', 0.5),
+                    v_data.get('charge_asym_norm', 0.5),
+                    v_data.get('pi_norm', 0.5)
                 ]
                 if has_camsol:
                     values.insert(0, v_data.get('camsol_norm', 0.5))
@@ -454,8 +472,8 @@ with tab2:
                 radar_fig.add_trace(go.Scatterpolar(
                     r=values, theta=cat_closed,
                     fill='toself', name=variant_id,
-                    hoverinfo="text",
-                    text=[f"{val:.2f}" for val in values]
+                    hoverinfo="text+name",
+                    text=[f"{cat}: {val:.2f}" for cat, val in zip(cat_closed, values)]
                 ))
                 
             radar_fig.update_layout(
@@ -466,4 +484,3 @@ with tab2:
             st.plotly_chart(radar_fig, use_container_width=True)
         else:
             st.info("Select a variant to view its developability footprint.")
-
