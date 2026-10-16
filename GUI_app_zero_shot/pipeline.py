@@ -58,7 +58,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     master_fasta_mapping = []
     
     for i, record in enumerate(records):
-        unique_id = f"{run_name}_WT" if i == 0 else f"{run_name}_sample_{i}"
+        unique_id = f"{run_name}_WT" if i == 0 else record.id
         seq = str(record.seq).replace(":", "").replace("/", "")
         
         master_fasta_mapping.append({"id": unique_id, "seq": seq})
@@ -384,7 +384,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     if 'poet2_fitness' not in df.columns: df['poet2_fitness'] = np.nan
     mask = df['poet2_fitness'].isna()
     
-    if mask.any():
+    if False:
         print(f"Calling OpenProtein API (POET-2) to score {mask.sum()} missing variants...")
         
         try:
