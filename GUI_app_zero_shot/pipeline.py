@@ -120,7 +120,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
                         df['esm_norm'] = norm_cache('esm_fitness')
                         df['esmc_norm'] = norm_cache('esmc_fitness')
                         df['ab_norm'] = norm_cache('antiberty_fitness')
-                        df['ablang_norm'] = norm_cache('ablang_fitness')
+                        df['ablang_norm'] = norm_cache('ablang_fitness', invert=True)
                         df['protbert_norm'] = norm_cache('protbert_fitness')
                         df['gravy_norm'] = norm_cache('gravy', invert=True)
                         df['charge_asym_norm'] = norm_cache('charge_asymmetry', invert=True)
@@ -557,7 +557,7 @@ def score_scfv_variants(run_dir: str, run_name: str, wt_sequence: str):
     df['bindpred_norm'] = norm('bindpred_kd', invert=True)          # Lower Log10 Kd = Tighter binding
     df['esm_norm'] = norm('esm_fitness', invert=False)              # Higher (>0) = Better fitness
     df['ab_norm'] = norm('antiberty_fitness', invert=False)         # Higher (>0) = Better fitness
-    df['ablang_norm'] = norm('ablang_fitness', invert=False)        # Higher (>0) = Better fitness
+    df['ablang_norm'] = norm('ablang_fitness', invert=True)        # Lower (<0) = Better fitness
     df['protbert_norm'] = norm('protbert_fitness', invert=False)    # Higher (>0) = Better fitness
     df['poet2_norm'] = norm('poet2_fitness', invert=False)          # Higher (>0) = Better fitness
     df['esmc_norm'] = norm('esmc_fitness', invert=False)            # Higher (>0) = Better fitness 
