@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import os
-from pipeline import run_scfv_developability_pipeline, score_scfv_variants
+from pipeline import run_universal_developability_pipeline, score_universal_variants
 import py3Dmol
 from stmol import showmol
 import plotly.graph_objects as go
@@ -21,21 +21,67 @@ tab1, tab2 = st.tabs(["Phase 1: Generation", "Phase 2: Evaluation"])
 # TAB 1: PHASE 1 (Generation)
 # ==========================================
 with tab1:
-    st.header("1. Structural Generation & Inverse Folding")
-    st.markdown("Predict 3D topology, relax coordinates, and generate framework mutations using an ensemble of models.")
+    st.header("1. Universal Structural Generation & Inverse Folding")
+    st.markdown("Design and generate developable mutations across any protein format (scFv, IgG/Fab, Bispecifics, VHH-Fc, or Enzymes) using a unified FASTA input.")
     
     col1, col2 = st.columns(2)
     with col1:
-        run_name = st.text_input("Sequence Name", value="scFvLA-L2K")
+        run_name = st.text_input("Sequence / Campaign Name", value="Target_Design_01")
         base_dir = st.text_input("Workspace Directory", value="./zero-shot_results")
         
-        # NEW: Ensemble UI Controls
+        # --- EXPLICIT FORMAT SELECTOR (All Formats Included) ---
+        protein_format = st.selectbox(
+            "Protein Format Type:",
+            options=[
+                "scFv (Single-chain Fv)",
+                "Standard Monoclonal Antibody (IgG / Fab)",
+                "scFv-Fc Dimer",
+                "VHH-Fc / Single-Domain Dimer",
+                "Bispecific Fab-scFv",
+                "Bispecific IgG (Asymmetric Heavy/Light Chains)",
+                "Monomeric Enzyme / Non-Antibody",
+                "Custom Multi-Chain Complex"
+            ],
+            help="Defines how the pipeline handles chain order, domain splitting, CDR masking, and model compatibility."
+        )
+        
+        # Classify format capabilities to filter compatible models automatically
+        paired_fv_formats = [
+            "scFv (Single-chain Fv)",
+            "Standard Monoclonal Antibody (IgG / Fab)",
+            "scFv-Fc Dimer"
+        ]
+        is_paired_fv = protein_format in paired_fv_formats
+        is_enzyme = "Enzyme" in protein_format
+        
         st.markdown("**Ensemble Settings**")
+        
+        # AntiFold & AbLang2-Paired require a paired VH + VL Fv structure
+        if is_paired_fv:
+            available_models = [
+                "AntiFold (Antibody-specific)", 
+                "ProteinMPNN (Diverse)", 
+                "ProteinMPNN (Soluble)", 
+                "ThermoMPNN (ddG-Driven)", 
+                "ESM-C (Evolutionary LM)", 
+                "AbLang2 (Antibody LM)"
+            ]
+            default_models = ["AntiFold (Antibody-specific)"]
+        else:
+            available_models = [
+                "ProteinMPNN (Diverse)", 
+                "ProteinMPNN (Soluble)", 
+                "ThermoMPNN (ddG-Driven)", 
+                "ESM-C (Evolutionary LM)"
+            ]
+            default_models = ["ProteinMPNN (Soluble)"]
+        
         gen_models = st.multiselect(
             "Generative Models to Run:",
-            options=["AntiFold (Antibody-specific)", "ProteinMPNN (Diverse)", "ProteinMPNN (Soluble)", "ThermoMPNN (ddG-Driven)", "ESM-C (Evolutionary LM)", "AbLang2 (Antibody LM)"],
-            default=["AntiFold (Antibody-specific)"]
+            options=available_models,
+            default=default_models
         )
+        
         col_s1, col_s2 = st.columns(2)
         with col_s1:
             num_seqs = st.number_input("Sequences per model", min_value=10, max_value=500, value=100, step=50)
@@ -43,31 +89,131 @@ with tab1:
             temp = st.slider("Sampling Temperature", 0.1, 1.0, 0.2, step=0.1)
 
     with col2:
-        vh_seq = st.text_area("VH Sequence")
-        vl_seq = st.text_area("VL Sequence")
+        st.markdown("**Unified Multi-Chain FASTA Input**")
+        
+        # --- FORMAT-SPECIFIC FASTA TEMPLATES & INSTRUCTIONS ---
+        if is_paired_fv:
+            st.caption("Provide **2 FASTA records**: `>VH` (Heavy Chain variable region) and `>VL` (Light Chain variable region).")
+            default_fasta = (
+                ">VH\n"
+                "DIKLQQSGAELARPGASVKMSCKTSGYTFTRYTMHWVKQRPGQGLEWIGYINPSRGYTNYNQKFKDKATLTTDKSSSTAYMQLSSLTSEDSAVYYCARYYDDHYCLDYWGQGTTLTVSS\n"
+                ">VL\n"
+                "DIQLTQSPAIMSASPGEKVTMTCRASSSVSYMNWYQQKSGTSPKRWIYDTSKVASGVPYRFSGSGSGTSYSLTISSMEAEDAATYYCQQWSSNPLTFGAGTKLELK"
+            )
+            expected_chains_msg = "2 records (>VH and >VL)"
+        elif "VHH-Fc" in protein_format:
+            st.caption("Provide **1 FASTA record** (`>VHH`) for a symmetric VHH dimer, or **2 records** (`>VHH_A`, `>VHH_B`) for biparatopic/asymmetric VHHs.")
+            default_fasta = (
+                ">VHH\n"
+                "QVQLVESGGGLVQAGGSLRLSCAASGRTFSSYAMGWFRQAPGKEREFVAAISWSGGSTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAADRRGVGASTLGPFDYWGQGTQVTVSS"
+            )
+            expected_chains_msg = "1 or 2 records (>VHH)"
+        elif "Bispecific" in protein_format:
+            st.caption("Provide each variable domain as a separate FASTA record (e.g., `>VH_1`, `>VL_1`, `>VH_2`, `>VL_2`).")
+            default_fasta = (
+                ">VH_1\n"
+                "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYCSRWGGDGFYAMDYWGQGTLVTVSS\n"
+                ">VL_1\n"
+                "DIQMTQSPSSLSASVGDRVTITCRASQDVNTAVAWYQQKPGKAPKLLIYSASFLYSGVPSRFSGSRSGTDFTLTISSLQPEDFATYYCQQHYTTPPTFGQGTKVEIK\n"
+                ">VH_2\n"
+                "DIKLQQSGAELARPGASVKMSCKTSGYTFTRYTMHWVKQRPGQGLEWIGYINPSRGYTNYNQKFKDKATLTTDKSSSTAYMQLSSLTSEDSAVYYCARYYDDHYCLDYWGQGTTLTVSS\n"
+                ">VL_2\n"
+                "DIQLTQSPAIMSASPGEKVTMTCRASSSVSYMNWYQQKSGTSPKRWIYDTSKVASGVPYRFSGSGSGTSYSLTISSMEAEDAATYYCQQWSSNPLTFGAGTKLELK"
+            )
+            expected_chains_msg = "2 to 4 records (>VH_1, >VL_1, >VH_2, >VL_2)"
+        elif is_enzyme:
+            st.caption("Provide **1 FASTA record** (`>Chain_A`) for your monomeric enzyme or protein.")
+            default_fasta = (
+                ">Chain_A\n"
+                "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRLELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL"
+            )
+            expected_chains_msg = "1 record (>Chain_A)"
+        else:
+            st.caption("Provide 1 or more FASTA records (`>Chain_A`, `>Chain_B`, ...) in your desired complex order.")
+            default_fasta = ">Chain_A\nQVQLVQSGAEVKKPGASVKVSCKASGYTFT...\n>Chain_B\nDIQMTQSPSSLSASVGDRVTITCRASQSIS..."
+            expected_chains_msg = "1+ records"
+
+        fasta_input = st.text_area("Input Sequences (FASTA format):", value=default_fasta, height=230)
+
+        # --- LIVE FASTA PARSER & ROLE VALIDATOR ---
+        from io import StringIO
+        from Bio import SeqIO
+        
+        parsed_chains = {}
+        chain_roles = {}
+        valid_fasta = False
+        
+        if fasta_input.strip():
+            try:
+                records = list(SeqIO.parse(StringIO(fasta_input.strip()), "fasta"))
+                if records:
+                    # For 2-chain paired Fv formats (scFv, IgG, scFv-Fc), guarantee Chain A = VH and Chain B = VL
+                    if is_paired_fv and len(records) == 2:
+                        h0, h1 = records[0].id.upper(), records[1].id.upper()
+                        if ("VL" in h0 or "LIGHT" in h0) and ("VH" in h1 or "HEAVY" in h1):
+                            records = [records[1], records[0]] # Swap so VH is always Chain A
+                        parsed_chains['A'] = str(records[0].seq).strip().replace(":", "").replace("/", "")
+                        parsed_chains['B'] = str(records[1].seq).strip().replace(":", "").replace("/", "")
+                        chain_roles = {'A': 'VH', 'B': 'VL'}
+                        valid_fasta = True
+                    else:
+                        # General N-chain assignment (A, B, C, D...) preserving header role tags
+                        for i, rec in enumerate(records):
+                            chain_letter = chr(65 + i)
+                            clean_s = str(rec.seq).strip().replace(":", "").replace("/", "")
+                            parsed_chains[chain_letter] = clean_s
+                            
+                            h_up = rec.id.upper()
+                            if "VHH" in h_up:
+                                role = "VHH"
+                            elif "VH" in h_up or "HEAVY" in h_up:
+                                role = "VH"
+                            elif "VL" in h_up or "LIGHT" in h_up:
+                                role = "VL"
+                            else:
+                                role = rec.id.strip()
+                            chain_roles[chain_letter] = role
+                        
+                        # Validate expected chain counts per format
+                        if is_paired_fv and len(records) != 2:
+                            valid_fasta = False
+                        elif is_enzyme and len(records) != 1:
+                            valid_fasta = False
+                        else:
+                            valid_fasta = True
+                            
+                    if valid_fasta:
+                        summary_parts = [f"**Chain {k}** (`{chain_roles[k]}`): `{len(v)} aa`" for k, v in parsed_chains.items()]
+                        st.caption("✅ **Parsed Chains:** " + " | ".join(summary_parts))
+                    else:
+                        st.warning(f"⚠️ `{protein_format}` expects **{expected_chains_msg}**, but `{len(records)}` record(s) were found.")
+                else:
+                    st.warning("⚠️ No valid FASTA headers (`>`) detected.")
+            except Exception as ex:
+                st.error(f"FASTA parsing error: {ex}")
 
     # 1. The Execution Block
-    if st.button("Run Phase 1 (Ensemble)", type="primary"):
-        if not vh_seq or not vl_seq:
-            st.error("Please provide both VH and VL sequences.")
+    if st.button("Run Phase 1 (Universal Ensemble)", type="primary"):
+        if not valid_fasta or not parsed_chains:
+            st.error(f"Please provide valid FASTA sequences ({expected_chains_msg}) for `{protein_format}`.")
         elif not gen_models:
             st.error("Please select at least one generative model.")
-            
         else:
-            with st.spinner("Running Phase 1 Ensemble (ESMFold -> PyRosetta -> Generators)..."):
+            with st.spinner(f"Running Phase 1 ({protein_format}: Multi-Chain ESMFold -> PyRosetta -> Generators)..."):
+                from pipeline import run_universal_developability_pipeline
                 
-                # Clean the inputs first so the lengths match the actual amino acids
-                vh_clean = vh_seq.strip()
-                vl_clean = vl_seq.strip()
-                
-                # Pass the dynamically calculated lengths into the pipeline
-                run_scfv_developability_pipeline(
-                    vh_clean, vl_clean, base_dir, run_name, 
-                    vh_len=len(vh_clean),
-                    vl_len=len(vl_clean),
-                    gen_models=gen_models, num_seqs=num_seqs, temp=temp
+                run_universal_developability_pipeline(
+                    chains=parsed_chains,
+                    chain_roles=chain_roles,
+                    base_output_dir=base_dir,
+                    run_name=run_name,
+                    protein_format=protein_format,
+                    gen_models=gen_models,
+                    num_seqs=num_seqs,
+                    temp=temp
                 )
-                st.success("Phase 1 Complete! Sequences pooled and deduplicated.")                
+                st.success("Phase 1 Universal Ensemble Complete! Sequences pooled and deduplicated.")
+
     # 2. The Persistent Download Block
     fasta_path = os.path.join(base_dir, run_name, f"{run_name}_camsol_upload.fasta")
     pdb_path = os.path.join(base_dir, run_name, f"{run_name}_relaxed.pdb")
@@ -88,7 +234,7 @@ with tab1:
         
         st.info("Upload the downloaded FASTA file to the CamSol web server to calculate intrinsic solubility.\n\n🔗 [Open Cambridge CamSol Web Server](https://www-cohsoftware.ch.cam.ac.uk/index.php/camsolintrinsic)")
 
-    # 3. Interactive 3D Structure Viewer
+    # 3. Interactive Multi-Chain 3D Structure Viewer
     if os.path.exists(pdb_path):
         st.markdown("---")
         st.subheader("🧬 3D Structure Viewer (PyRosetta Relaxed)")
@@ -107,14 +253,19 @@ with tab1:
         view = py3Dmol.view(width=800, height=500)
         view.addModel(pdb_string, "pdb")
         
-        # Base cartoon style
-        view.setStyle({'chain': 'A'}, {'cartoon': {'color': '#1f77b4'}})
-        view.setStyle({'chain': 'B'}, {'cartoon': {'color': '#ff7f0e'}})
-        
-        # Overlay sidechain sticks if toggled
-        if show_sticks:
-            view.addStyle({'chain': 'A'}, {'stick': {'colorscheme': 'blueCarbon', 'radius': 0.15}})
-            view.addStyle({'chain': 'B'}, {'stick': {'colorscheme': 'orangeCarbon', 'radius': 0.15}})
+        # Support up to 6 distinct chains (A-F) for Bispecifics and Multimers
+        chain_palette = [
+            ('A', '#1f77b4', 'blueCarbon'),
+            ('B', '#ff7f0e', 'orangeCarbon'),
+            ('C', '#2ca02c', 'greenCarbon'),
+            ('D', '#d62728', 'redCarbon'),
+            ('E', '#9467bd', 'purpleCarbon'),
+            ('F', '#17becf', 'cyanCarbon')
+        ]
+        for c_id, hex_color, stick_scheme in chain_palette:
+            view.setStyle({'chain': c_id}, {'cartoon': {'color': hex_color}})
+            if show_sticks:
+                view.addStyle({'chain': c_id}, {'stick': {'colorscheme': stick_scheme, 'radius': 0.15}})
             
         # Overlay semi-transparent surface if toggled
         if show_surface:
@@ -185,7 +336,7 @@ with tab2:
             
             with st.spinner("Calculating biophysical and structural metrics..."):
                 try:
-                    df = score_scfv_variants(run_dir, p2_run_name, wt_seq)
+                    df = score_universal_variants(run_dir, p2_run_name, wt_seq)
                     st.session_state.scored_df = df
                     st.success("Scoring Complete!")
                 except Exception as e:
