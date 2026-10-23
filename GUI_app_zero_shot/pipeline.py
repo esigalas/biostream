@@ -104,6 +104,156 @@ FORMAT_WEIGHTS = {
     }
 }
 
+def parse_custom_fixed_string(custom_str: str, chain_lengths: dict) -> dict:
+    """
+    Parses user string like 'A: 1-10, 45; B: 15-25' into 1-indexed sets per chain.
+    """
+    custom_map = {c: set() for c in chain_lengths}
+    if not custom_str or not custom_str.strip():
+        return custom_map
+
+    for block in custom_str.split(";"):
+        block = block.strip()
+        if not block or ":" not in block:
+            continue
+        c_part, ranges_part = block.split(":", 1)
+        c_id = c_part.strip().upper()
+        if c_id not in custom_map:
+            continue
+        for token in ranges_part.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                try:
+                    s, e = map(int, token.split("-", 1))
+                    custom_map[c_id].update(range(max(1, s), min(chain_lengths[c_id], e) + 1))
+                except ValueError:
+                    pass
+            else:
+                try:
+                    pos = int(token)
+                    if 1 <= pos <= chain_lengths[c_id]:
+                        custom_map[c_id].add(pos)
+                except ValueError:
+                    pass
+    return custom_map
+
+
+def build_unified_frozen_positions(
+    chains: dict,
+    chain_roles: dict,
+    frozen_imgt_regions: list,
+    custom_fixed_residues: str,
+    freeze_native_cys: bool
+):
+    """
+    Returns:
+      - fixed_positions_map: dict {chain_id: sorted list of 1-based frozen indices}
+      - antifold_mutable_regions_str: space-separated IMGT region string for AntiFold
+    """
+    chain_lengths = {k: len(v) for k, v in chains.items()}
+    custom_map = parse_custom_fixed_string(custom_fixed_residues, chain_lengths)
+    fixed_positions_map = {}
+
+    try:
+        from abnumber import Chain as AbChain
+    except ImportError:
+        AbChain = None
+        print(" -> WARNING: abnumber not installed. Cannot parse IMGT regions.")
+
+    for c_id, c_seq in chains.items():
+        role = chain_roles.get(c_id, "")
+        frozen_set = set(custom_map.get(c_id, set()))
+
+        # 1. Freeze Native Cysteines if enabled
+        if freeze_native_cys:
+            for idx_0, aa in enumerate(c_seq):
+                if aa == "C":
+                    frozen_set.add(idx_0 + 1)
+
+        # 2. Freeze user-selected IMGT regions on antibody chains
+        if role in ["VH", "VL", "VHH"] and AbChain is not None and frozen_imgt_regions:
+            try:
+                ab = AbChain(c_seq, scheme='imgt')
+                region_seq_map = {
+                    "FR1": ab.fr1_seq,
+                    "CDR1": ab.cdr1_seq,
+                    "FR2": ab.fr2_seq,
+                    "CDR2": ab.cdr2_seq,
+                    "FR3": ab.fr3_seq,
+                    "CDR3": ab.cdr3_seq,
+                    "FR4": ab.fr4_seq
+                }
+                # Track cumulative offset across contiguous IMGT regions for exact indexing
+                search_start = 0
+                for reg_name in ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]:
+                    r_seq = region_seq_map.get(reg_name, "")
+                    if r_seq:
+                        pos = c_seq.find(r_seq, search_start)
+                        if pos != -1:
+                            if reg_name in frozen_imgt_regions:
+                                frozen_set.update(range(pos + 1, pos + 1 + len(r_seq)))
+                            search_start = pos + len(r_seq)
+            except Exception as e:
+                print(f" -> WARNING: abnumber parsing failed for Chain {c_id}: {e}")
+
+        fixed_positions_map[c_id] = sorted(list(frozen_set))
+
+    # Build matching AntiFold --regions string (AntiFold expects MUTABLE regions)
+    all_imgt = ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]
+    mutable_imgt = [r for r in all_imgt if r not in (frozen_imgt_regions or [])]
+    antifold_tokens = []
+    for r in mutable_imgt:
+        if r.startswith("FR"):
+            idx_num = r[-1]
+            antifold_tokens.extend([f"FWH{idx_num}", f"FWL{idx_num}"])
+        elif r.startswith("CDR"):
+            idx_num = r[-1]
+            antifold_tokens.extend([f"CDRH{idx_num}", f"CDRL{idx_num}"])
+    antifold_mutable_regions_str = " ".join(antifold_tokens) if antifold_tokens else "FWL FWH"
+
+    return fixed_positions_map, antifold_mutable_regions_str
+
+
+def enforce_mutation_cap_and_filters(
+    candidate_seq: str,
+    wt_seq: str,
+    global_frozen_1idx: set,
+    omit_aas: list,
+    max_muts_per_seq: int,
+    rng: np.random.Generator
+) -> str:
+    """
+    1. Reverts any mutation at a frozen position or into a banned amino acid (omit_aas).
+    2. If the remaining mutation count exceeds max_muts_per_seq, subsamples down to max_muts_per_seq.
+    """
+    if len(candidate_seq) != len(wt_seq):
+        return wt_seq
+
+    cand_list = list(candidate_seq)
+    omit_set = set(omit_aas or [])
+    valid_diff_indices = []
+
+    for i, (wt_aa, mut_aa) in enumerate(zip(wt_seq, cand_list)):
+        pos_1idx = i + 1
+        if wt_aa != mut_aa:
+            # Revert if position is frozen or mutated into a banned AA
+            if pos_1idx in global_frozen_1idx or mut_aa in omit_set:
+                cand_list[i] = wt_aa
+            else:
+                valid_diff_indices.append(i)
+
+    # Cap total simultaneous mutations per variant
+    if len(valid_diff_indices) > max_muts_per_seq:
+        keep_indices = set(rng.choice(valid_diff_indices, size=max_muts_per_seq, replace=False))
+        for i in valid_diff_indices:
+            if i not in keep_indices:
+                cand_list[i] = wt_seq[i]
+
+    return "".join(cand_list)
+
+
 def run_universal_developability_pipeline(
     chains: dict, 
     chain_roles: dict, 
@@ -112,7 +262,14 @@ def run_universal_developability_pipeline(
     protein_format: str,
     gen_models: list = None, 
     num_seqs: int = 100, 
-    temp: float = 0.2
+    temp: float = 0.2,
+    frozen_imgt_regions: list = None,
+    custom_fixed_residues: str = "",
+    freeze_native_cys: bool = True,
+    omit_aas: list = None,
+    max_muts_per_seq: int = 5,
+    mpnn_backbone_noise: float = 0.02,
+    thermo_ddg_cutoff: float = -0.3
 ):
     """
     Universal Phase 1 pipeline supporting N-chain complexes, antibodies, and enzymes.
@@ -121,6 +278,10 @@ def run_universal_developability_pipeline(
     """
     if gen_models is None:
         gen_models = []
+    if frozen_imgt_regions is None:
+        frozen_imgt_regions = ["CDR1", "CDR2", "CDR3"]
+    if omit_aas is None:
+        omit_aas = ["C"]
 
     run_dir = os.path.join(base_output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -129,9 +290,23 @@ def run_universal_developability_pipeline(
     relaxed_pdb_path = os.path.join(run_dir, f"{run_name}_relaxed.pdb")
     metadata_path = os.path.join(run_dir, f"{run_name}_metadata.json")
 
-    print(f"Starting Universal Pipeline for: {run_name} (Format: {protein_format})")
-    print(f"Workspace initialized at: {run_dir}")
-    
+    # Compute unified frozen positions across all chains
+    fixed_positions_map, antifold_regions_str = build_unified_frozen_positions(
+        chains=chains,
+        chain_roles=chain_roles,
+        frozen_imgt_regions=frozen_imgt_regions,
+        custom_fixed_residues=custom_fixed_residues,
+        freeze_native_cys=freeze_native_cys
+    )
+
+    # Convert per-chain 1-indexed frozen positions into global concatenated 1-indexed set
+    global_frozen_1idx = set()
+    offset = 0
+    for c_id, c_seq in chains.items():
+        for local_pos in fixed_positions_map.get(c_id, []):
+            global_frozen_1idx.add(offset + local_pos)
+        offset += len(c_seq)
+
     # ---------------------------------------------------------
     # STEP 1: Save Run Manifest & Metadata
     # ---------------------------------------------------------
@@ -139,11 +314,20 @@ def run_universal_developability_pipeline(
     run_metadata = {
         "protein_format": protein_format,
         "chain_lengths": chain_lengths,
-        "chain_roles": chain_roles
+        "chain_roles": chain_roles,
+        "frozen_imgt_regions": frozen_imgt_regions,
+        "custom_fixed_residues": custom_fixed_residues,
+        "freeze_native_cys": freeze_native_cys,
+        "omit_aas": omit_aas,
+        "max_muts_per_seq": max_muts_per_seq,
+        "mpnn_backbone_noise": mpnn_backbone_noise,
+        "thermo_ddg_cutoff": thermo_ddg_cutoff,
+        "fixed_positions_map": fixed_positions_map
     }
     with open(metadata_path, "w") as f:
         json.dump(run_metadata, f, indent=4)
-    print(f" -> Saved run metadata. Chains: {chain_lengths}")
+    print(f" -> Saved run metadata. Frozen residue counts per chain: "
+          f"{ {k: len(v) for k, v in fixed_positions_map.items()} }")
 
     # ---------------------------------------------------------
     # STEP 2: N-Chain Structure Prediction (ESMFold Multimer Fix)
@@ -262,28 +446,28 @@ def run_universal_developability_pipeline(
         pose.clear()
         del pose
 
+
     # ---------------------------------------------------------
-    # STEP 4: Generative Ensemble (Format-Aware Routing)
+    # STEP 4: Generative Ensemble (Unified Masking & Settings)
     # ---------------------------------------------------------
     print(f"Step 4: Running Generative Ensemble: {gen_models}")
     all_raw_records = []
     
     is_paired_antibody = len(chains) >= 2 and any(r in ['VH', 'VL', 'VHH'] for r in chain_roles.values())
-    primary_chain_key = list(chains.keys())[0]
     clean_wt_full = "".join(chains.values())
 
-    # --- MODEL A: AntiFold (Antibody-Specific Fv Generator) ---
+    # --- MODEL A: AntiFold ---
     if "AntiFold (Antibody-specific)" in gen_models and is_paired_antibody:
-        print(" -> Running AntiFold...")
+        print(f" -> Running AntiFold on mutable regions: {antifold_regions_str}")
         ch_heavy = [k for k, v in chain_roles.items() if v in ['VH', 'VHH']][0]
         ch_light = [k for k, v in chain_roles.items() if v == 'VL']
-        ch_light_id = ch_light[0] if ch_light else ch_heavy # Fallback
+        ch_light_id = ch_light[0] if ch_light else ch_heavy
         
         antifold_cmd = [
             "python", "-m", "antifold.main",
             "--pdb_file", relaxed_pdb_path,
             "--heavy_chain", ch_heavy, "--light_chain", ch_light_id,
-            "--regions", "FWL FWH",
+            "--regions", antifold_regions_str,
             "--num_seq_per_target", str(num_seqs),
             "--sampling_temp", str(temp),
             "--out_dir", run_dir
@@ -298,89 +482,46 @@ def run_universal_developability_pipeline(
         except subprocess.CalledProcessError as e:
             print(f" -> WARNING: AntiFold failed: {e.stderr}")
 
-    # --- DYNAMIC CDR / REGION MASKING FOR MPNN ---
+    # --- EXPORT UNIFIED MASKING JSONL FOR PROTEINMPNN / THERMOMPNN ---
     fixed_json_path = os.path.join(run_dir, "fixed_positions.jsonl")
     has_mpnn = any("ProteinMPNN" in m or "ThermoMPNN" in m for m in gen_models)
     
     if has_mpnn:
-        fixed_dict = {}
         pdb_basename = os.path.splitext(os.path.basename(relaxed_pdb_path))[0]
-        fixed_positions_map = {}
-        
-        try:
-            from abnumber import Chain as AbChain
-        except ImportError:
-            AbChain = None
-            print(" -> WARNING: abnumber not installed. Cannot mask CDRs.")
-            
-        for c_id, c_seq in chains.items():
-            role = chain_roles.get(c_id, "")
-            fixed_res = []
-            
-            # If it's an antibody chain, freeze Frameworks and unmask CDRs
-            if role in ["VH", "VL", "VHH"] and AbChain is not None:
-                try:
-                    ab = AbChain(c_seq, scheme='imgt')
-                    cdr_seqs = [ab.cdr1_seq, ab.cdr2_seq, ab.cdr3_seq]
-                    mutable_indices = set()
-                    
-                    # Find exact substring matches for CDRs to map 1-based indices
-                    for cdr in cdr_seqs:
-                        if cdr:
-                            start = c_seq.find(cdr)
-                            if start != -1:
-                                mutable_indices.update(range(start + 1, start + 1 + len(cdr)))
-                                
-                    # Freeze all residues that are NOT in the mutable CDR set
-                    fixed_res = [i for i in range(1, len(c_seq) + 1) if i not in mutable_indices]
-                except Exception as e:
-                    print(f" -> WARNING: abnumber parsing failed for Chain {c_id}: {e}")
-                    fixed_res = [] # Fallback to fully mutable if parsing fails
-            else:
-                # If it's an enzyme or non-antibody, default to fully mutable
-                fixed_res = []
-                
-            fixed_positions_map[c_id] = fixed_res
-            
-        fixed_dict[pdb_basename] = fixed_positions_map
-        
+        fixed_dict = {pdb_basename: fixed_positions_map}
         with open(fixed_json_path, 'w') as f:
             f.write(json.dumps(fixed_dict) + "\n")
-        
-        print(f" -> Generated MPNN masking file at {fixed_json_path}")
-
-        # Example ProteinMPNN subprocess call (add your specific path/args here)
-        # mpnn_cmd = ["python", "protein_mpnn_run.py", "--jsonl_path", fixed_json_path, ...]
-        # subprocess.run(mpnn_cmd, check=True)
-        
-    # Additional generator hooks (ProteinMPNN, ThermoMPNN, ESM-C) follow standard multi-chain args...
+        print(f" -> Generated unified MPNN masking file at {fixed_json_path}")
+        # Note: Pass "--omit_AAs", "".join(omit_aas) and "--backbone_noise", str(mpnn_backbone_noise)
+        # to your ProteinMPNN CLI subprocess calls here.
 
     # ---------------------------------------------------------
-    # STEP 5: Pooling and Deduplication
+    # STEP 5: Post-Filtering (Mask Enforcement, Mutation Cap) & Deduplication
     # ---------------------------------------------------------
     camsol_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
-    print(f"Step 5: Pooling candidates -> {camsol_fasta_path}")
+    print(f"Step 5: Enforcing frozen regions, max_muts={max_muts_per_seq}, and pooling -> {camsol_fasta_path}")
     
-    unique_seqs = {}
-    cleaned_records = []
-    
-    wt_record = SeqRecord(Seq(clean_wt_full), id=f"{run_name}_WT", description="")
-    cleaned_records.append(wt_record)
-    unique_seqs[clean_wt_full] = True
+    rng = np.random.default_rng(seed=42)
+    unique_seqs = {clean_wt_full: True}
+    cleaned_records = [SeqRecord(Seq(clean_wt_full), id=f"{run_name}_WT", description="")]
     
     for record in all_raw_records:
-        clean_seq = str(record.seq).replace(":", "").replace("/", "")
-        if clean_seq not in unique_seqs:
-            unique_seqs[clean_seq] = True
-            new_record = SeqRecord(
-                Seq(clean_seq), 
-                id=record.id,  # Keeps the original FASTA ID
-                description=""
-            )
-            cleaned_records.append(new_record)
+        raw_seq = str(record.seq).replace(":", "").replace("/", "")
+        # Enforce exact user-defined frozen positions, banned AAs, and max mutation count
+        filtered_seq = enforce_mutation_cap_and_filters(
+            candidate_seq=raw_seq,
+            wt_seq=clean_wt_full,
+            global_frozen_1idx=global_frozen_1idx,
+            omit_aas=omit_aas,
+            max_muts_per_seq=max_muts_per_seq,
+            rng=rng
+        )
+        if filtered_seq not in unique_seqs:
+            unique_seqs[filtered_seq] = True
+            cleaned_records.append(SeqRecord(Seq(filtered_seq), id=record.id, description=""))
 
     SeqIO.write(cleaned_records, camsol_fasta_path, "fasta")
-    print(f"Step 5 Complete: Pooled {len(cleaned_records)} unique variants.")
+    print(f"Step 5 Complete: Pooled {len(cleaned_records)} unique, constraint-verified variants.")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

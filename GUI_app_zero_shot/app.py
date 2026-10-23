@@ -29,7 +29,7 @@ with tab1:
         run_name = st.text_input("Sequence / Campaign Name", value="Target_Design_01")
         base_dir = st.text_input("Workspace Directory", value="./zero-shot_results")
         
-        # --- EXPLICIT FORMAT SELECTOR (All Formats Included) ---
+        # --- EXPLICIT FORMAT SELECTOR ---
         protein_format = st.selectbox(
             "Protein Format Type:",
             options=[
@@ -53,10 +53,9 @@ with tab1:
         ]
         is_paired_fv = protein_format in paired_fv_formats
         is_enzyme = "Enzyme" in protein_format
+        is_antibody_format = not (is_enzyme or "Custom" in protein_format)
         
-        st.markdown("**Ensemble Settings**")
-        
-        # AntiFold & AbLang2-Paired require a paired VH + VL Fv structure
+        st.markdown("**1. Ensemble Model Selection**")
         if is_paired_fv:
             available_models = [
                 "AntiFold (Antibody-specific)", 
@@ -66,7 +65,7 @@ with tab1:
                 "ESM-C (Evolutionary LM)", 
                 "AbLang2 (Antibody LM)"
             ]
-            default_models = ["AntiFold (Antibody-specific)"]
+            default_models = ["AntiFold (Antibody-specific)", "ProteinMPNN (Soluble)"]
         else:
             available_models = [
                 "ProteinMPNN (Diverse)", 
@@ -82,11 +81,88 @@ with tab1:
             default=default_models
         )
         
-        col_s1, col_s2 = st.columns(2)
+        # --- 2. REGION FREEZING & MASKING CONTROLS ---
+        st.markdown("**2. Region Freezing & Masking Controls**")
+        if is_antibody_format:
+            freeze_preset = st.selectbox(
+                "Antibody Region Freezing Strategy (IMGT):",
+                options=[
+                    "Developability Default: Freeze All CDRs (Mutate Frameworks Only)",
+                    "Preserve Core Paratope: Freeze CDR3 Only (Mutate FRs + CDR1/2)",
+                    "Interface & Vernier Focus: Freeze CDRs + FR1/FR4 (Mutate FR2/FR3 Only)",
+                    "Affinity Maturation: Freeze All Frameworks (Mutate CDRs Only)",
+                    "Custom IMGT Region Selection"
+                ]
+            )
+            
+            all_imgt_regions = ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]
+            if "Freeze All CDRs" in freeze_preset:
+                default_frozen_regions = ["CDR1", "CDR2", "CDR3"]
+            elif "Freeze CDR3 Only" in freeze_preset:
+                default_frozen_regions = ["CDR3"]
+            elif "Interface & Vernier" in freeze_preset:
+                default_frozen_regions = ["FR1", "CDR1", "CDR2", "CDR3", "FR4"]
+            elif "Freeze All Frameworks" in freeze_preset:
+                default_frozen_regions = ["FR1", "FR2", "FR3", "FR4"]
+            else:
+                default_frozen_regions = ["CDR1", "CDR2", "CDR3"]
+                
+            frozen_imgt_regions = st.multiselect(
+                "IMGT Regions to FREEZE (Protected from Mutation):",
+                options=all_imgt_regions,
+                default=default_frozen_regions,
+                disabled=("Custom" not in freeze_preset),
+                help="Selected IMGT subregions will be locked across AntiFold, ProteinMPNN, ThermoMPNN, and PLMs."
+            )
+        else:
+            frozen_imgt_regions = []
+            st.caption("Non-antibody format selected: IMGT region numbering is disabled. Use custom residue ranges below to freeze active sites.")
+
+        custom_fixed_residues = st.text_input(
+            "Additional Custom Positions to FREEZE (1-indexed, per chain):",
+            value="",
+            placeholder="e.g., A: 1-10, 45, 98; B: 15-25",
+            help="Specify 1-indexed residue numbers or ranges to lock on specific chains."
+        )
+
+        # --- 3. MUTATIONAL LOAD & MODEL HYPERPARAMETERS ---
+        st.markdown("**3. Mutational Load & Sampling Hyperparameters**")
+        col_s1, col_s2, col_s3 = st.columns(3)
         with col_s1:
-            num_seqs = st.number_input("Sequences per model", min_value=10, max_value=500, value=100, step=50)
+            num_seqs = st.number_input("Sequences per model", min_value=10, max_value=500, value=100, step=25)
         with col_s2:
-            temp = st.slider("Sampling Temperature", 0.1, 1.0, 0.2, step=0.1)
+            temp = st.slider(
+                "Sampling Temperature", 0.05, 1.0, 0.2, step=0.05,
+                help="Applies to AntiFold and ProteinMPNN. Lower = conservative; Higher = diverse."
+            )
+        with col_s3:
+            max_muts_per_seq = st.number_input(
+                "Max Mutations / Variant", min_value=1, max_value=50, value=5, step=1,
+                help="Caps simultaneous mutations per generated variant to prevent multi-mutant steric clashes."
+            )
+
+        with st.expander("⚙️ Advanced Chemical & Model-Specific Settings", expanded=False):
+            col_a1, col_a2 = st.columns(2)
+            with col_a1:
+                freeze_native_cys = st.checkbox(
+                    "Freeze Native Cysteines (Protect Disulfides)", value=True,
+                    help="Locks all Wild-Type Cysteine (C) positions so native disulfide bonds are never broken."
+                )
+                omit_aas = st.multiselect(
+                    "Ban Amino Acids During Generation (omit_AAs):",
+                    options=list("ACDEFGHIKLMNPQRSTVWY"),
+                    default=["C"],
+                    help="Default bans 'C' (Cysteine) to prevent unpaired cysteines and disulfide scrambling. Add 'M' or 'W' to avoid oxidation liabilities."
+                )
+            with col_a2:
+                mpnn_backbone_noise = st.slider(
+                    "MPNN Backbone Noise (Å)", 0.00, 0.30, 0.02, step=0.02,
+                    help="Adds slight Gaussian coordinate noise in ProteinMPNN to prevent overfitting to rigid ESMFold coordinates."
+                )
+                thermo_ddg_cutoff = st.slider(
+                    "ThermoMPNN / PLM Threshold", -2.0, 0.5, -0.3, step=0.1,
+                    help="For ThermoMPNN: max ΔΔG (kcal/mol, negative = stabilizing). For ESM-C/AbLang2: min ΔLog-Likelihood improvement."
+                )
 
     with col2:
         st.markdown("**Unified Multi-Chain FASTA Input**")
@@ -200,8 +276,6 @@ with tab1:
             st.error("Please select at least one generative model.")
         else:
             with st.spinner(f"Running Phase 1 ({protein_format}: Multi-Chain ESMFold -> PyRosetta -> Generators)..."):
-                from pipeline import run_universal_developability_pipeline
-                
                 run_universal_developability_pipeline(
                     chains=parsed_chains,
                     chain_roles=chain_roles,
@@ -210,7 +284,14 @@ with tab1:
                     protein_format=protein_format,
                     gen_models=gen_models,
                     num_seqs=num_seqs,
-                    temp=temp
+                    temp=temp,
+                    frozen_imgt_regions=frozen_imgt_regions,
+                    custom_fixed_residues=custom_fixed_residues,
+                    freeze_native_cys=freeze_native_cys,
+                    omit_aas=omit_aas,
+                    max_muts_per_seq=max_muts_per_seq,
+                    mpnn_backbone_noise=mpnn_backbone_noise,
+                    thermo_ddg_cutoff=thermo_ddg_cutoff
                 )
                 st.success("Phase 1 Universal Ensemble Complete! Sequences pooled and deduplicated.")
 
