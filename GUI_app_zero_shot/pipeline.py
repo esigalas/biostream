@@ -963,7 +963,8 @@ def run_universal_developability_pipeline(
 
 def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     """
-    Universal Phase 2 scoring engine handling biophysics, PyRosetta, and PLMs.
+    Universal Phase 2 scoring engine handling N-chain biophysics, PyRosetta,
+    per-domain PLMs, and the Agnostic Gated + Invariant developability score.
     """
     print(f"--- Phase 2: Scoring Universal Variants for {run_name} ---")
     
@@ -979,31 +980,60 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         meta = json.load(f)
         chain_lengths = meta["chain_lengths"]
         chain_roles = meta["chain_roles"]
-        protein_format = meta.get("protein_format", "scFv")
+        protein_format = meta.get("protein_format", "scFv (Single-chain Fv)")
 
     records = list(SeqIO.parse(raw_fasta_path, "fasta"))
     clean_wt = wt_sequence.replace(":", "").replace("/", "")
     wt_list = list(clean_wt)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Precompute 0-based global chain bounds and antibody design units (supports 2-chain Fv, VHH, 4-chain Bispecifics)
+    chain_bounds = {}  # {c_id: (start_0idx, end_0idx, role)}
+    curr_idx = 0
+    for c_id, c_len in chain_lengths.items():
+        chain_bounds[c_id] = (curr_idx, curr_idx + c_len, chain_roles.get(c_id, ""))
+        curr_idx += c_len
+
+    vh_chains = [k for k, v in chain_roles.items() if v == 'VH']
+    vl_chains = [k for k, v in chain_roles.items() if v == 'VL']
+    vhh_chains = [k for k, v in chain_roles.items() if v == 'VHH']
+
+    paired_fv_units = [
+        (vh_chains[i], vl_chains[i]) for i in range(min(len(vh_chains), len(vl_chains)))
+    ]
+    all_antibody_units = list(paired_fv_units)
+    for extra_vh in vh_chains[len(vl_chains):]:
+        all_antibody_units.append((extra_vh, None))
+    for vhh_c in vhh_chains:
+        all_antibody_units.append((vhh_c, None))
+
+    has_paired_fv = len(paired_fv_units) > 0
+    has_any_ab_domain = len(all_antibody_units) > 0
+
+    def slice_chain(full_seq_str: str, c_id: str) -> str:
+        s_idx, e_idx, _ = chain_bounds[c_id]
+        return full_seq_str[s_idx:e_idx]
+
+    # Helper to map a global 0-based residue index to (chain_id, local_0idx, role)
+    def map_global_to_chain(global_0idx: int):
+        for c_id, (s_idx, e_idx, role) in chain_bounds.items():
+            if s_idx <= global_0idx < e_idx:
+                return c_id, global_0idx - s_idx, role
+        return None, None, ""
+
     # ---------------------------------------------------------
-    # 1. Parse Sequences & Extract Sub-domains (VH/VL)
+    # 1. Parse Sequences & Extract Primary Sub-domains (VH/VL)
     # ---------------------------------------------------------
     variants = []
     for i, record in enumerate(records):
-        unique_id = f"{run_name}_WT" if i == 0 else record.id  # Reads the true ID
+        unique_id = f"{run_name}_WT" if i == 0 else record.id
         seq = str(record.seq).replace(":", "").replace("/", "")
         
-        # Slicing VH and VL dynamically based on chain metadata
-        current_idx = 0
-        vh_seq, vl_seq = None, None
-        for c_id, c_len in chain_lengths.items():
-            role = chain_roles.get(c_id, "")
-            if role in ["VH", "VHH"]: 
-                vh_seq = seq[current_idx : current_idx + c_len]
-            if role == "VL": 
-                vl_seq = seq[current_idx : current_idx + c_len]
-            current_idx += c_len
+        # Store primary VH/VHH and VL for table display (multi-arm scoring uses slice_chain directly)
+        primary_vh_id = vh_chains[0] if vh_chains else (vhh_chains[0] if vhh_chains else None)
+        primary_vl_id = vl_chains[0] if vl_chains else None
+        vh_seq = slice_chain(seq, primary_vh_id) if primary_vh_id else None
+        vl_seq = slice_chain(seq, primary_vl_id) if primary_vl_id else None
         
         # Calculate mutations relative to WT
         mutations = []
@@ -1032,10 +1062,19 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         try:
             cached_df = pd.read_csv(final_csv_path)
             # Drop previous normalized/composite columns so they get cleanly recomputed
-            cols_to_drop = [c for c in cached_df.columns if c.endswith('_norm') or c in ['global_composite_score', 'pi_delta', 'protein_format', 'num_mutations']]
+            cols_to_drop = [
+                c for c in cached_df.columns
+                if c.endswith('_norm') or c.startswith('z_') or c.startswith('raw_') or c in [
+                    'global_composite_score', 'agnostic_gated_score', 'legacy_linear_score',
+                    'passed_all_gates', 'gate_status', 'source_model',
+                    'pi_delta', 'protein_format', 'num_mutations'
+                ]
+            ]
             cached_df = cached_df.drop(columns=cols_to_drop, errors='ignore')
-            
-            df = df.merge(cached_df.drop(columns=['mutations', 'full_sequence', 'VH', 'VL'], errors='ignore'), on='id', how='left')
+            df = df.merge(
+                cached_df.drop(columns=['mutations', 'full_sequence', 'VH', 'VL'], errors='ignore'),
+                on='id', how='left'
+            )
             print(f" -> Cache loaded. Evaluating missing metrics for {len(df)} sequences...")
         except Exception as e:
             print(f" -> Could not verify cache: {e}. Recomputing from scratch...")
@@ -1112,27 +1151,35 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             print(f" -> CamSol successfully verified and mapped ({matched_count}/{len(df)} variants).")
 
     # ---------------------------------------------------------
-    # 4. Sequence Biophysics (pI, GRAVY, Net Charge, Asymmetry)
+    # 4. Sequence Biophysics (pI, GRAVY, Net Charge, Multi-Arm Asymmetry)
     # ---------------------------------------------------------
     if 'pI' not in df.columns: df['pI'] = np.nan
     if 'gravy' not in df.columns: df['gravy'] = np.nan
     if 'net_charge' not in df.columns: df['net_charge'] = np.nan
     if 'charge_asymmetry' not in df.columns: df['charge_asymmetry'] = np.nan
     
-    mask = df['pI'].isna() | df['gravy'].isna() | df['net_charge'].isna()
+    mask = df['pI'].isna() | df['gravy'].isna() | df['net_charge'].isna() | (has_paired_fv & df['charge_asymmetry'].isna())
     if mask.any():
-        print(f"Calculating basic sequence biophysics for {mask.sum()} variants...")
+        print(f"Calculating sequence biophysics for {mask.sum()} variants...")
         for idx, row in df[mask].iterrows():
-            full_analysis = ProteinAnalysis(row['full_sequence'])
+            full_seq_str = row['full_sequence']
+            full_analysis = ProteinAnalysis(full_seq_str)
             df.at[idx, 'net_charge'] = full_analysis.charge_at_pH(7.4)
             df.at[idx, 'pI'] = full_analysis.isoelectric_point()
             df.at[idx, 'gravy'] = full_analysis.gravy()
             
-            # Asymmetry strictly requires VH and VL
-            if row['VH'] and row['VL']:
-                vh_analysis = ProteinAnalysis(row['VH'])
-                vl_analysis = ProteinAnalysis(row['VL'])
-                df.at[idx, 'charge_asymmetry'] = abs(vh_analysis.charge_at_pH(7.4) - vl_analysis.charge_at_pH(7.4))
+            # Compute mean VH-VL dipole across all paired Fv arms (supports both 2-chain Fv and 4-chain Bispecifics)
+            if has_paired_fv:
+                arm_dipoles = []
+                for h_id, l_id in paired_fv_units:
+                    h_s = slice_chain(full_seq_str, h_id)
+                    l_s = slice_chain(full_seq_str, l_id)
+                    if h_s and l_s:
+                        q_h = ProteinAnalysis(h_s).charge_at_pH(7.4)
+                        q_l = ProteinAnalysis(l_s).charge_at_pH(7.4)
+                        arm_dipoles.append(abs(q_h - q_l))
+                if arm_dipoles:
+                    df.at[idx, 'charge_asymmetry'] = float(np.mean(arm_dipoles))
     else:
         print(" -> Sequence biophysics up to date.")
         
@@ -1152,7 +1199,6 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             safe_init_pyrosetta()  
             import pyrosetta
             from pyrosetta.toolbox import mutate_residue 
-            import gc # Import garbage collector
 
             wt_pose = pyrosetta.pose_from_file(relaxed_pdb_path)
             scorefxn = pyrosetta.get_fa_scorefxn()
@@ -1176,7 +1222,6 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                             if mut_pose.residue(pos).name3() == "CYS" and mut_pose.residue(pos).has_variant_type(pyrosetta.rosetta.core.chemical.DISULFIDE):
                                 print(f" -> Skipping {m}: Protects C++ core from disulfide segfault.")
                                 continue
-                                
                             mutate_residue(mut_pose, pos, mut_aa, pack_scorefxn=scorefxn)
                         else:
                             print(f" -> Skipping {m}: Out of bounds")
@@ -1200,19 +1245,19 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         print(" -> PyRosetta metrics up to date. Skipping model.")
         
     # ---------------------------------------------------------
-    # 6. PLM 1: AntiBERTy (Antibody-Specific Fitness)
+    # 6. PLM 1: AntiBERTy (Per-Chain Antibody Fitness — Safe for 4-Chain Bispecifics)
     # ---------------------------------------------------------
-    is_antibody = "Enzyme" not in protein_format
-    if is_antibody:
+    if has_any_ab_domain:
         if 'antiberty_fitness' not in df.columns: df['antiberty_fitness'] = np.nan
         mask = df['antiberty_fitness'].isna()
         
         if mask.any():
-            print(f"Loading AntiBERTy to score {mask.sum()} missing variants...")
-            from transformers import AutoTokenizer, AutoModelForMaskedLM
+            print(f"Loading AntiBERTy to score {mask.sum()} missing antibody variants per domain...")
             ab_tokenizer = AutoTokenizer.from_pretrained("jeffruffolo/AntiBERTy")
             ab_model = AutoModelForMaskedLM.from_pretrained("jeffruffolo/AntiBERTy").to(device)
             ab_model.eval()
+
+            wt_chain_lists = {c_id: list(slice_chain(clean_wt, c_id)) for c_id in chain_lengths}
 
             for idx, row in df[mask].iterrows():
                 if row['mutations'] == "WT":
@@ -1221,19 +1266,28 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     
                 mut_delta_logp = 0.0
                 for m in row['mutations'].split(","):
+                    m = m.strip()
+                    if not m: continue
                     try:
-                        wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
-                        if pos >= len(wt_list): continue
-                        masked_seq = wt_list.copy()
-                        masked_seq[pos] = "[MASK]" 
+                        wt_aa, global_pos_0idx, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+                        c_id, local_pos, role = map_global_to_chain(global_pos_0idx)
+                        if c_id is None or role not in ["VH", "VL", "VHH"]:
+                            continue
+                        masked_chain = wt_chain_lists[c_id].copy()
+                        if local_pos >= len(masked_chain) or len(masked_chain) > 508:
+                            continue
+                        masked_chain[local_pos] = "[MASK]"
                         
-                        inputs = ab_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
+                        inputs = ab_tokenizer(" ".join(masked_chain), return_tensors="pt").to(device)
                         with torch.no_grad():
                             logits = ab_model(**inputs).logits
-                            log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1) 
-                            mut_delta_logp += (log_probs[ab_tokenizer.convert_tokens_to_ids(mut_aa)] - 
-                                               log_probs[ab_tokenizer.convert_tokens_to_ids(wt_aa)]).item()
-                    except Exception: pass
+                            log_probs = torch.log_softmax(logits[0, local_pos + 1], dim=-1)
+                            mut_delta_logp += (
+                                log_probs[ab_tokenizer.convert_tokens_to_ids(mut_aa)] - 
+                                log_probs[ab_tokenizer.convert_tokens_to_ids(wt_aa)]
+                            ).item()
+                    except Exception as ex:
+                        print(f" -> AntiBERTy warning on {m}: {ex}")
                 df.at[idx, 'antiberty_fitness'] = mut_delta_logp
                 
             del ab_model, ab_tokenizer
@@ -1243,35 +1297,44 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             print(" -> AntiBERTy metrics up to date.")
 
     # ---------------------------------------------------------
-    # 7. PLM 2: AbLang2 (Paired Germline Fitness)
+    # 7. PLM 2: AbLang2 (Supports Paired Fv, 4-Chain Bispecifics, and Single-Domain VHH)
     # ---------------------------------------------------------
-    if is_antibody:
+    if has_any_ab_domain:
         if 'ablang_fitness' not in df.columns: df['ablang_fitness'] = np.nan
-        # AbLang2 Strictly requires both VH and VL to be present
-        mask = df['ablang_fitness'].isna() & df['VH'].notna() & df['VL'].notna()
+        mask = df['ablang_fitness'].isna()
         
         if mask.any():
-            print(f"Loading AbLang2 to score {mask.sum()} missing paired variants...")
+            print(f"Loading AbLang2 to score {mask.sum()} missing variants across {len(all_antibody_units)} antibody unit(s)...")
             import ablang2
             ablang_model = ablang2.pretrained("ablang2-paired", random_init=False) 
             
-            # Use the first row's VH/VL as the WT reference
-            ref_row = df.iloc[0]
-            wt_score = ablang_model([[ref_row['VH'], ref_row['VL']]], mode='pseudo_log_likelihood')[0]
+            # Precompute WT baseline score for each antibody unit
+            wt_unit_scores = []
+            for h_id, l_id in all_antibody_units:
+                wt_h = slice_chain(clean_wt, h_id)
+                wt_l = slice_chain(clean_wt, l_id) if l_id is not None else ""
+                wt_unit_scores.append(float(ablang_model([[wt_h, wt_l]], mode='pseudo_log_likelihood')[0]))
             
             for idx, row in df[mask].iterrows():
                 if row['mutations'] == "WT":
                     df.at[idx, 'ablang_fitness'] = 0.0
                     continue
                     
-                mut_score = ablang_model([[row['VH'], row['VL']]], mode='pseudo_log_likelihood')[0]
-                df.at[idx, 'ablang_fitness'] = float(mut_score - wt_score)
+                full_s = row['full_sequence']
+                total_ablang_delta = 0.0
+                for unit_idx, (h_id, l_id) in enumerate(all_antibody_units):
+                    mut_h = slice_chain(full_s, h_id)
+                    mut_l = slice_chain(full_s, l_id) if l_id is not None else ""
+                    mut_s = float(ablang_model([[mut_h, mut_l]], mode='pseudo_log_likelihood')[0])
+                    total_ablang_delta += (mut_s - wt_unit_scores[unit_idx])
+                    
+                df.at[idx, 'ablang_fitness'] = total_ablang_delta
 
             del ablang_model
             gc.collect()
             torch.cuda.empty_cache()
         else:
-            print(" -> AbLang2 metrics up to date or incompatible format.")
+            print(" -> AbLang2 metrics up to date.")
 
     # ---------------------------------------------------------
     # 8. PLM 3: ProtBERT (Evolutionary Fitness)
@@ -1281,7 +1344,6 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     
     if mask.any():
         print(f"Loading ProtBERT to score {mask.sum()} missing variants...")
-        from transformers import AutoTokenizer, AutoModelForMaskedLM
         pb_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")
         pb_model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert").to(device)
         pb_model.eval()
@@ -1293,6 +1355,8 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                 
             mut_delta_logp = 0.0
             for m in row['mutations'].split(","):
+                m = m.strip()
+                if not m: continue
                 try:
                     wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
                     if pos >= len(wt_list): continue
@@ -1303,8 +1367,10 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     with torch.no_grad():
                         logits = pb_model(**inputs).logits
                         log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1)
-                        mut_delta_logp += (log_probs[pb_tokenizer.convert_tokens_to_ids(mut_aa)] - 
-                                           log_probs[pb_tokenizer.convert_tokens_to_ids(wt_aa)]).item()
+                        mut_delta_logp += (
+                            log_probs[pb_tokenizer.convert_tokens_to_ids(mut_aa)] - 
+                            log_probs[pb_tokenizer.convert_tokens_to_ids(wt_aa)]
+                        ).item()
                 except Exception: pass
             df.at[idx, 'protbert_fitness'] = mut_delta_logp
 
@@ -1315,12 +1381,15 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         print(" -> ProtBERT metrics up to date.")
 
     # ---------------------------------------------------------
-    # 9. PLM 4: ESM-2 (General Fitness) & BINDPRED
+    # 9. PLM 4: ESM-2 (General Fitness) & Multi-Arm BINDPRED
     # ---------------------------------------------------------
     if 'esm_fitness' not in df.columns: df['esm_fitness'] = np.nan
     if 'bindpred_kd' not in df.columns: df['bindpred_kd'] = np.nan
     
-    mask = df['esm_fitness'].isna() | df['bindpred_kd'].isna()
+    # Separate masks so VHHs/Enzymes (where bindpred_kd is NaN) don't invalidate the ESM-2 cache!
+    mask_esm = df['esm_fitness'].isna()
+    mask_bp = df['bindpred_kd'].isna() if has_paired_fv else pd.Series(False, index=df.index)
+    mask = mask_esm | mask_bp
     
     if mask.any():
         print(f"Loading ESM-2 & BINDPRED to score {mask.sum()} missing variants...")
@@ -1333,37 +1402,58 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         batch_converter_esm = alphabet_esm.get_batch_converter()
         model_esm.eval()
 
-        bindpred_model = CatBoostRegressor()
-        bindpred_model.load_model(hf_hub_download(repo_id="hbp5181/BindPred", filename="ESM2_BindPred.cbm"), format="cbm")
+        bindpred_model = None
+        if mask_bp.any():
+            bindpred_model = CatBoostRegressor()
+            bindpred_model.load_model(
+                hf_hub_download(repo_id="hbp5181/BindPred", filename="ESM2_BindPred.cbm"),
+                format="cbm"
+            )
 
         for idx, row in df[mask].iterrows():
-            # BINDPRED strictly requires paired Fv (VH + VL)
-            if row['VH'] and row['VL']:
-                _, _, batch_tokens = batch_converter_esm([("VH", row['VH']), ("VL", row['VL'])])
-                with torch.no_grad():
-                    reps = model_esm(batch_tokens.to(device), repr_layers=[33], return_contacts=False)["representations"][33]
-                    df.at[idx, 'bindpred_kd'] = bindpred_model.predict(np.hstack([
-                        reps[0, 1:len(row['VH'])+1].mean(0).cpu().numpy(),
-                        reps[1, 1:len(row['VL'])+1].mean(0).cpu().numpy()
-                    ]))
-
-            if row['mutations'] == "WT":
-                df.at[idx, 'esm_fitness'] = 0.0
-            else:
-                mut_delta_logp = 0.0
-                for m in row['mutations'].split(","):
-                    try:
-                        wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
-                        if pos >= len(wt_list): continue
-                        masked_seq = wt_list.copy()
-                        masked_seq[pos] = "<mask>"
-                        
-                        _, _, mask_tokens = batch_converter_esm([("seq", "".join(masked_seq))])
+            full_s = row['full_sequence']
+            # 1. Multi-Arm BINDPRED (Evaluates all paired VH-VL arms in Fvs and Bispecifics)
+            if mask_bp.loc[idx] and bindpred_model is not None:
+                arm_kds = []
+                for h_id, l_id in paired_fv_units:
+                    h_s = slice_chain(full_s, h_id)
+                    l_s = slice_chain(full_s, l_id)
+                    if h_s and l_s:
+                        _, _, batch_tokens = batch_converter_esm([("VH", h_s), ("VL", l_s)])
                         with torch.no_grad():
-                            log_probs = torch.log_softmax(model_esm(mask_tokens.to(device))["logits"][0, pos + 1], dim=-1)
-                            mut_delta_logp += (log_probs[alphabet_esm.tok_to_idx[mut_aa]] - log_probs[alphabet_esm.tok_to_idx[wt_aa]]).item()
-                    except Exception: pass
-                df.at[idx, 'esm_fitness'] = mut_delta_logp
+                            reps = model_esm(batch_tokens.to(device), repr_layers=[33], return_contacts=False)["representations"][33]
+                            pred_kd = bindpred_model.predict(np.hstack([
+                                reps[0, 1:len(h_s)+1].mean(0).cpu().numpy(),
+                                reps[1, 1:len(l_s)+1].mean(0).cpu().numpy()
+                            ]))
+                            arm_kds.append(float(pred_kd))
+                if arm_kds:
+                    df.at[idx, 'bindpred_kd'] = float(np.mean(arm_kds))
+
+            # 2. ESM-2 Masked-Marginal Log-Likelihood
+            if mask_esm.loc[idx]:
+                if row['mutations'] == "WT":
+                    df.at[idx, 'esm_fitness'] = 0.0
+                else:
+                    mut_delta_logp = 0.0
+                    for m in row['mutations'].split(","):
+                        m = m.strip()
+                        if not m: continue
+                        try:
+                            wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+                            if pos >= len(wt_list): continue
+                            masked_seq = wt_list.copy()
+                            masked_seq[pos] = "<mask>"
+                            
+                            _, _, mask_tokens = batch_converter_esm([("seq", "".join(masked_seq))])
+                            with torch.no_grad():
+                                log_probs = torch.log_softmax(model_esm(mask_tokens.to(device))["logits"][0, pos + 1], dim=-1)
+                                mut_delta_logp += (
+                                    log_probs[alphabet_esm.tok_to_idx[mut_aa]] -
+                                    log_probs[alphabet_esm.tok_to_idx[wt_aa]]
+                                ).item()
+                        except Exception: pass
+                    df.at[idx, 'esm_fitness'] = mut_delta_logp
                 
         del model_esm, bindpred_model
         gc.collect()
@@ -1372,7 +1462,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         print(" -> ESM-2 & BINDPRED metrics up to date.")
 
     # ---------------------------------------------------------
-    # 10. PLM 5: POET-2 (OpenProtein.AI API)
+    # 10. PLM 5: POET-2 (OpenProtein.AI API — Disabled by Default)
     # ---------------------------------------------------------
     if 'poet2_fitness' not in df.columns: df['poet2_fitness'] = np.nan
     mask = df['poet2_fitness'].isna()
@@ -1545,7 +1635,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             df[col] = np.nan
 
     # ---------------------------------------------------------
-    # 13. Empirically Calibrated Normalization & Composite Score
+    # 13. Legacy Global Composite Score AND Agnostic Gated Score
     # ---------------------------------------------------------
     def norm(col_or_series, invert=False):
         s = df[col_or_series] if isinstance(col_or_series, str) else col_or_series
@@ -1554,17 +1644,26 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         c_min, c_max = s.min(), s.max()
         if c_max == c_min:
             return pd.Series(0.5, index=df.index)
-        res = (c_max - s) / (c_max - c_min) if invert else (s - c_min) / (c_max - c_min)
-        return res
+        return (c_max - s) / (c_max - c_min) if invert else (s - c_min) / (c_max - c_min)
 
-    # Save format and mutation count directly into the CSV for easy benchmarking
+    def zscore_series(s: pd.Series) -> pd.Series:
+        valid = s.dropna()
+        if len(valid) <= 1 or valid.nunique() <= 1:
+            return pd.Series(0.0, index=s.index)
+        std = valid.std(ddof=0)
+        return ((s - valid.mean()) / (std if std > 1e-9 else 1.0)).fillna(0.0)
+
     df['protein_format'] = protein_format
     df['num_mutations'] = df['mutations'].apply(
         lambda m: 0 if str(m).strip() in ['WT', 'nan', ''] else len(str(m).split(','))
     )
-    mut_counts = df['num_mutations'].clip(lower=1)
+    df['source_model'] = df['id'].apply(
+        lambda s: "WT" if str(s).endswith("_WT") else (
+            "Consensus (" + str(s).split("_")[0] + "+)" if "+" in str(s) else str(s).split("_")[0]
+        )
+    )
 
-    # 1. Normalize Intrinsic & Thermodynamic Metrics
+    # --- A. Min-Max Normalized Pillars (0..1) ---
     df['camsol_norm']      = norm(df.get('camsol_score'), invert=False)
     df['janus_norm']       = norm(df.get('janus_ddg'), invert=False)
     df['pi_norm']          = norm(df.get('pi_delta'), invert=False)
@@ -1572,17 +1671,14 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     df['net_charge_norm']  = norm(df.get('net_charge'), invert=False)
     df['gravy_norm']       = norm(df.get('gravy'), invert=True)
     df['bindpred_norm']    = norm(df.get('bindpred_kd'), invert=True)
+    df['pyrosetta_norm']   = norm(df.get('pyrosetta_ddg'), invert=True)
+    df['esm_norm']         = norm(df.get('esm_fitness'), invert=False)
+    df['esmc_norm']        = norm(df.get('esmc_fitness'), invert=False)
+    df['ab_norm']          = norm(df.get('antiberty_fitness'), invert=False)
+    df['ablang_norm']      = norm(df.get('ablang_fitness'), invert=True)
+    df['protbert_norm']    = norm(df.get('protbert_fitness'), invert=False)
 
-    # 2. Normalize PyRosetta & PLMs (Per-Mutation Normalized)
-    df['pyrosetta_norm'] = norm(df['pyrosetta_ddg'] / mut_counts, invert=True)
-    df['esm_norm']       = norm(df['esm_fitness'] / mut_counts, invert=False) if 'esm_fitness' in df.columns else np.nan
-    df['esmc_norm']      = norm(df['esmc_fitness'] / mut_counts, invert=False) if 'esmc_fitness' in df.columns else np.nan
-    df['ab_norm']        = norm(df['antiberty_fitness'] / mut_counts, invert=False) if 'antiberty_fitness' in df.columns else np.nan
-    df['ablang_norm']    = norm(df.get('ablang_fitness'), invert=True) if 'ablang_fitness' in df.columns else np.nan
-    df['protbert_norm']  = norm(df['protbert_fitness'] / mut_counts, invert=False) if 'protbert_fitness' in df.columns else np.nan
-
-    # 3. Look up weights for the current protein format (fallback to scFv if unknown)
-    # NOTE: Ensure FORMAT_WEIGHTS dictionary is defined at the top of pipeline.py
+    # --- B. Legacy Format-Specific Weighted Composite Score (0..1) ---
     active_weights = FORMAT_WEIGHTS.get(protein_format, FORMAT_WEIGHTS["scFv (Single-chain Fv)"])
 
     # 4. Compute weighted average across all available (non-NaN) metrics for this format
@@ -1596,17 +1692,86 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
 
     df['global_composite_score'] = weighted_sum / max(total_weight, 1e-6)
 
-    df = df.sort_values('global_composite_score', ascending=False).reset_index(drop=True)
+    # --- C. Agnostic Gated + Invariant Score (Zero-Shot Z-Score Architecture) ---
+    wt_rows = df[df['mutations'] == "WT"]
+    wt_ref = wt_rows.iloc[0] if not wt_rows.empty else df.iloc[0]
+
+    def get_delta_vs_wt(col_name: str) -> pd.Series:
+        if col_name not in df.columns or df[col_name].isna().all():
+            return pd.Series(0.0, index=df.index)
+        wt_val = wt_ref[col_name] if pd.notna(wt_ref.get(col_name, np.nan)) else 0.0
+        return (df[col_name] - float(wt_val)).fillna(0.0)
+
+    raw_pyrosetta  = get_delta_vs_wt('pyrosetta_ddg')
+    raw_bindpred   = get_delta_vs_wt('bindpred_kd')
+    raw_dipole     = get_delta_vs_wt('charge_asymmetry')
+    raw_pi_delta   = get_delta_vs_wt('pi_delta')
+    raw_camsol     = get_delta_vs_wt('camsol_score')
+    raw_esm        = get_delta_vs_wt('esm_fitness')
+    raw_janus      = get_delta_vs_wt('janus_ddg')
+
+    # Within-campaign Z-scores for the Invariant Core & Downside Folding Hinges
+    z_pyrosetta    = zscore_series(raw_pyrosetta)
+    z_bindpred     = zscore_series(raw_bindpred)
+    z_dipole       = zscore_series(raw_dipole)
+    z_pi_delta     = zscore_series(raw_pi_delta)
+    z_num_muts     = zscore_series(df['num_mutations'].astype(float))
+
+    z_hinge_esm    = zscore_series(np.minimum(0.0, raw_esm))
+    z_hinge_janus  = zscore_series(np.minimum(0.0, raw_janus))
+    z_hinge_camsol = zscore_series(np.minimum(0.0, raw_camsol))
+
+    # Non-Compensatory Biophysical Gates
+    clash_fail     = ((z_pyrosetta > 0.67) & (raw_pyrosetta > 0.0)) | (raw_pyrosetta > 5.0)
+    interface_fail = has_paired_fv & (z_bindpred > 0.67) & (raw_bindpred > 0.0)
+    unfold_fail    = (raw_esm < -10.0) | (raw_janus < -0.5)
+
+    df['passed_all_gates'] = ~(clash_fail | interface_fail | unfold_fail)
+    df['gate_status'] = [
+        "PASS" if p else "FAIL (" + "+".join(
+            (["3D_Clash"] if c else []) +
+            (["Interface_Kd"] if i else []) +
+            (["1D_Unfolding"] if u else [])
+        ) + ")"
+        for p, c, i, u in zip(df['passed_all_gates'], clash_fail, interface_fail, unfold_fail)
+    ]
+
+    invariant_core = (
+        -0.30 * z_pyrosetta +
+        -0.25 * z_bindpred +
+        -0.20 * z_dipole +
+        +0.15 * z_pi_delta +
+        -0.10 * z_num_muts
+    )
+    downside_hinge = (
+        +0.25 * z_hinge_esm +
+        +0.15 * z_hinge_janus +
+        +0.10 * z_hinge_camsol
+    )
+    gate_penalty = -0.50 * (
+        clash_fail.astype(float) + interface_fail.astype(float) + unfold_fail.astype(float)
+    )
+
+    df['agnostic_gated_score'] = invariant_core + downside_hinge + gate_penalty
+    df['agnostic_gated_norm']  = norm(df['agnostic_gated_score'], invert=False)
+
+    # Sort primarily by gate pass + agnostic_gated_score (both scores remain side-by-side in the CSV)
+    df = df.sort_values(
+        by=['passed_all_gates', 'agnostic_gated_score'],
+        ascending=[False, False]
+    ).reset_index(drop=True)
     
     # 5. Clean up columns for the final CSV layout
     ordered_cols = [
-        'id', 'mutations', 'protein_format', 'num_mutations', 'global_composite_score',
+        'id', 'source_model', 'mutations', 'protein_format', 'num_mutations',
+        'agnostic_gated_score', 'global_composite_score', 'passed_all_gates', 'gate_status',
         'janus_ddg', 'pyrosetta_ddg', 'camsol_score', 'pI', 'pi_delta', 'gravy', 'net_charge',
         'charge_asymmetry', 'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 
         'ablang_fitness', 'protbert_fitness', 'poet2_fitness', 'esmc_fitness', 'full_sequence'
     ]
-    # Retain the norms for plotting, plus the original sequences if requested
-    cols_to_save = [c for c in ordered_cols if c in df.columns] + [c for c in df.columns if c.endswith('_norm') or c in ['VH', 'VL']]
+    cols_to_save = [c for c in ordered_cols if c in df.columns] + [
+        c for c in df.columns if c.endswith('_norm') or c in ['VH', 'VL']
+    ]
     
     df[cols_to_save].to_csv(final_csv_path, index=False)
     print(f"Scoring complete for format '{protein_format}'. Results saved to {final_csv_path}")

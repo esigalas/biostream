@@ -395,7 +395,7 @@ with tab2:
 
     if st.button("Run Phase 2 (Scoring)", type="primary"):
         run_dir = os.path.join(p2_base_dir, p2_run_name)
-        fasta_path = os.path.join(run_dir, f"{p2_run_name}_camsol_upload.fasta") # Or your generic phase 1 fasta
+        fasta_path = os.path.join(run_dir, f"{p2_run_name}_camsol_upload.fasta")
         
         if not os.path.exists(fasta_path):
             st.error("Could not find the Phase 1 FASTA file. Ensure your Run Name and Base Directory are correct.")
@@ -440,8 +440,12 @@ with tab2:
         # ==========================================
         rename_map = {
             'id': 'Sequence ID', 
+            'source_model': 'Generator Model',
             'mutations': 'Mutations',
-            'global_composite_score': 'Global Composite Score', 
+            'agnostic_gated_score': 'Agnostic Gated Score',
+            'global_composite_score': 'Global Composite Score (Legacy)',
+            'passed_all_gates': 'Passed All Gates',
+            'gate_status': 'Biophysical Gate Status',
             
             # Structural Thermodynamics
             'janus_ddg': 'Stability ΔΔG (Janus)',
@@ -471,7 +475,8 @@ with tab2:
         
         # --- ENFORCE LOGICAL COLUMN GROUPING FOR UI & DOWNLOAD ---
         download_cols = [
-            'id', 'mutations', 'global_composite_score', 
+            'id', 'source_model', 'mutations', 
+            'agnostic_gated_score', 'global_composite_score', 'passed_all_gates', 'gate_status',
             'janus_ddg', 'pyrosetta_ddg'
         ]
         if has_camsol:
@@ -488,12 +493,12 @@ with tab2:
         
         download_df = df[download_cols].rename(columns=rename_map)
         
-        # Filter out the heavy sequence strings for the UI table to keep it clean
+        # Filter out heavy sequence strings for the UI table to keep it clean
         display_cols = [c for c in download_df.columns if c not in ['VH Sequence', 'VL Sequence']]
         display_df = download_df[display_cols]
         
         st.dataframe(
-            display_df.style.background_gradient(cmap='viridis', subset=['Global Composite Score']),
+            display_df.style.background_gradient(cmap='viridis', subset=['Agnostic Gated Score']),
             use_container_width=True, hide_index=True
         )
         
@@ -523,7 +528,7 @@ with tab2:
                 max_rosetta = st.slider(
                     "Max PyRosetta ΔΔG (REU) [Lower = Better]", 
                     min_value=-15.0, max_value=25.0, value=10.0, step=0.5,
-                    help="In PyRosetta, negative (< 0) is stabilizing. Variants above 25.0 REU have severe steric clashes and receive a 0.0 normalized score."
+                    help="In PyRosetta, negative (< 0) is stabilizing. Variants above 25.0 REU have severe steric clashes."
                 )
                 # FIX 1: Changed from max_janus (<=) to min_janus (>=) because raw JanusDDG is Positive = Stabilizing
                 min_janus = st.slider(
@@ -588,7 +593,7 @@ with tab2:
 
         st.markdown(f"**🎯 Surviving Anti-Aggregation Candidates:** `{len(filtered_df)}` out of `{len(df)}` total variants (including WT)")
 
-        # --- Interactive 4D Plot Controls (X, Y, Color, Size) ---
+        # --- Interactive 4D Plot Controls ---
         metric_options = [c for c in download_cols if c not in ['id', 'mutations', 'VH', 'VL'] and c in df.columns]
         
         ax_col1, ax_col2, ax_col3, ax_col4 = st.columns(4)
@@ -597,8 +602,8 @@ with tab2:
         with ax_col2:
             y_axis = st.selectbox("Y-Axis (e.g., Antibody PLM)", options=metric_options, index=metric_options.index('ablang_fitness') if 'ablang_fitness' in metric_options else 1)
         with ax_col3:
-            default_color = 'camsol_score' if has_camsol else 'gravy'
-            color_axis = st.selectbox("Color (e.g., Solubility)", options=metric_options, index=metric_options.index(default_color) if default_color in metric_options else 0)
+            default_color = 'agnostic_gated_score' if 'agnostic_gated_score' in metric_options else ('camsol_score' if has_camsol else 'gravy')
+            color_axis = st.selectbox("Color (e.g., Agnostic Score)", options=metric_options, index=metric_options.index(default_color) if default_color in metric_options else 0)
         with ax_col4:
             size_axis = st.selectbox("Bubble Size", options=["Uniform"] + metric_options, index=0)
 
@@ -622,7 +627,7 @@ with tab2:
                 color=color_axis,
                 size='_bubble_size',
                 hover_name='id',
-                hover_data=['mutations', 'global_composite_score', 'janus_ddg', 'gravy', 'charge_asymmetry'],
+                hover_data=['mutations', 'agnostic_gated_score', 'gate_status', 'source_model', 'pyrosetta_ddg'],
                 color_continuous_scale='Viridis',
                 labels={
                     x_axis: rename_map.get(x_axis, x_axis),
@@ -654,7 +659,7 @@ with tab2:
             st.warning("No variants passed all filters! Try relaxing one of the sliders above.")
 
         # ==========================================
-        # 3. Multi-Metric Radar Chart (Below Table)
+        # 3. Multi-Metric Radar Chart
         # ==========================================
         st.markdown("---")
         st.subheader("Developability Footprint")
@@ -687,7 +692,6 @@ with tab2:
             for variant_id in selected_ids:
                 v_data = df[df['id'] == variant_id].iloc[0]
                 
-                # FIX 2: Added gravy_norm, charge_asym_norm, and pi_norm to match categories 1-to-1
                 values = [
                     v_data.get('janus_norm', 0.5),
                     v_data.get('pyrosetta_norm', 0.5),
@@ -704,7 +708,7 @@ with tab2:
                 if has_camsol:
                     values.insert(0, v_data.get('camsol_norm', 0.5))
                 
-                values.append(values[0]) # Close the polygon
+                values.append(values[0])
                 cat_closed = categories + [categories[0]]
                 
                 radar_fig.add_trace(go.Scatterpolar(
