@@ -216,17 +216,11 @@ def build_unified_frozen_positions(
     return fixed_positions_map, antifold_mutable_regions_str
 
 
-def enforce_mutation_cap_and_filters(
-    candidate_seq: str,
-    wt_seq: str,
-    global_frozen_1idx: set,
-    omit_aas: list,
-    max_muts_per_seq: int,
-    rng: np.random.Generator
-) -> str:
+def enforce_mutation_cap_and_filters(candidate_seq: str, wt_seq: str, global_frozen_1idx: set, omit_aas: list, max_muts_per_seq: int, rng: np.random.Generator) -> str:
     """
     1. Reverts any mutation at a frozen position or into a banned amino acid (omit_aas).
-    2. If the remaining mutation count exceeds max_muts_per_seq, subsamples down to max_muts_per_seq.
+    2. If the remaining mutation count exceeds max_muts_per_seq (e.g., from AntiFold/MPNN),
+       subsamples to a target count distributed uniformly between 1 and max_muts_per_seq.
     """
     if len(candidate_seq) != len(wt_seq):
         return wt_seq
@@ -238,21 +232,78 @@ def enforce_mutation_cap_and_filters(
     for i, (wt_aa, mut_aa) in enumerate(zip(wt_seq, cand_list)):
         pos_1idx = i + 1
         if wt_aa != mut_aa:
-            # Revert if position is frozen or mutated into a banned AA
             if pos_1idx in global_frozen_1idx or mut_aa in omit_set:
                 cand_list[i] = wt_aa
             else:
                 valid_diff_indices.append(i)
 
-    # Cap total simultaneous mutations per variant
+    # Spread multi-mutant sequences evenly across [1 .. max_muts_per_seq]
     if len(valid_diff_indices) > max_muts_per_seq:
-        keep_indices = set(rng.choice(valid_diff_indices, size=max_muts_per_seq, replace=False))
+        target_k = int(rng.integers(1, max_muts_per_seq + 1))
+        keep_indices = set(rng.choice(valid_diff_indices, size=target_k, replace=False))
         for i in valid_diff_indices:
             if i not in keep_indices:
                 cand_list[i] = wt_seq[i]
 
     return "".join(cand_list)
 
+def build_single_and_combo_records(sorted_single_muts: list, clean_wt_full: str, model_prefix: str, num_seqs: int, max_muts_per_seq: int, rng: np.random.Generator) -> list:
+    """
+    Given a ranked list of single mutations [{'pos' (or 'global_pos'): int, 'wt_aa': str, 'mut_aa': str}, ...]:
+      - First half of num_seqs: top single-point mutations (1 mutation each)
+      - Second half of num_seqs: combinations of 2..max_muts_per_seq non-overlapping top mutations
+    """
+    records = []
+    if not sorted_single_muts:
+        return records
+
+    n_singles = num_seqs if max_muts_per_seq <= 1 else max(1, num_seqs // 2)
+    n_combos = max(0, num_seqs - n_singles)
+
+    # 1. Top Single Mutants (1 mutation)
+    for i, m in enumerate(sorted_single_muts[:n_singles]):
+        pos = m.get('global_pos', m.get('pos'))
+        mut_seq = list(clean_wt_full)
+        if pos is not None and 0 <= pos < len(mut_seq):
+            mut_seq[pos] = m['mut_aa']
+            mut_tag = f"{m['wt_aa']}{pos+1}{m['mut_aa']}"
+            records.append(SeqRecord(
+                Seq("".join(mut_seq)),
+                id=f"{model_prefix}_{mut_tag}_rank{i+1}",
+                description=""
+            ))
+
+    # 2. Multi-Mutant Combinations (2 to max_muts_per_seq mutations from top pool)
+    best_per_pos = []
+    seen_pos = set()
+    for m in sorted_single_muts:
+        pos = m.get('global_pos', m.get('pos'))
+        if pos is not None and pos not in seen_pos:
+            seen_pos.add(pos)
+            best_per_pos.append(m)
+
+    pool = best_per_pos[:min(len(best_per_pos), 30)]  # Combine from top 30 mutable positions
+    if n_combos > 0 and len(pool) >= 2:
+        max_k = min(max_muts_per_seq, len(pool))
+        for c_idx in range(n_combos):
+            k = int(rng.integers(2, max_k + 1))
+            chosen_indices = rng.choice(len(pool), size=k, replace=False)
+            chosen = sorted([pool[idx] for idx in chosen_indices], key=lambda x: x.get('global_pos', x.get('pos')))
+            
+            mut_seq = list(clean_wt_full)
+            tags = []
+            for m in chosen:
+                pos = m.get('global_pos', m.get('pos'))
+                mut_seq[pos] = m['mut_aa']
+                tags.append(f"{m['wt_aa']}{pos+1}{m['mut_aa']}")
+                
+            records.append(SeqRecord(
+                Seq("".join(mut_seq)),
+                id=f"{model_prefix}_combo{k}mut_{'-'.join(tags)}_c{c_idx+1}",
+                description=""
+            ))
+
+    return records
 
 def run_universal_developability_pipeline(
     chains: dict, 
@@ -452,83 +503,112 @@ def run_universal_developability_pipeline(
     # ---------------------------------------------------------
     print(f"Step 4: Running Generative Ensemble: {gen_models}")
     all_raw_records = []
-    
+    rng = np.random.default_rng(seed=42)
     clean_wt_full = "".join(chains.values())
 
-    # Dynamic chain strings for N-chain compatibility (1-chain enzymes, 2-chain Fv, 4-chain bispecifics)
+    # Dynamic chain strings for N-chain compatibility (1-chain VHH/Enzyme, 2-chain Fv, 4-chain Bispecific)
     mpnn_chains_str = " ".join(chains.keys())    # e.g., "A", "A B", or "A B C D"
     thermo_chains_str = "".join(chains.keys())   # e.g., "A", "AB", or "ABCD"
     combined_frozen_0idx = {p - 1 for p in global_frozen_1idx}
 
-    # Identify explicit (VH, VL) pairs from chain_roles for paired antibody models (AntiFold & AbLang2)
+    # Build a list of antibody design units:
+    #   - Paired Fv arm: (vh_chain_id, vl_chain_id)
+    #   - Single-domain VHH/unpaired VH arm: (vhh_chain_id, None)
     vh_chains = [k for k, v in chain_roles.items() if v == 'VH']
     vl_chains = [k for k, v in chain_roles.items() if v == 'VL']
-    has_vh_vl_pair = (len(vh_chains) > 0 and len(vl_chains) > 0)
+    vhh_chains = [k for k, v in chain_roles.items() if v == 'VHH']
 
-    # Helper to splice mutated VH and VL sequences back into the full N-chain complex
-    def splice_pair_into_full_complex(mut_vh_str: str, mut_vl_str: str, h_key: str, l_key: str) -> str:
-        full_parts = []
-        for c_key, wt_c_seq in chains.items():
-            if c_key == h_key:
-                full_parts.append(mut_vh_str)
-            elif c_key == l_key:
-                full_parts.append(mut_vl_str)
-            else:
-                full_parts.append(wt_c_seq)
-        return "".join(full_parts)
+    antibody_units = []
+    for idx_pair in range(min(len(vh_chains), len(vl_chains))):
+        antibody_units.append((vh_chains[idx_pair], vl_chains[idx_pair]))
+    # Any remaining unpaired VH chains or VHH chains run in single-domain mode
+    for extra_vh in vh_chains[len(vl_chains):]:
+        antibody_units.append((extra_vh, None))
+    for vhh_c in vhh_chains:
+        antibody_units.append((vhh_c, None))
 
-    # --- MODEL A: AntiFold ---
+    # Helper to splice mutated chain(s) back into the full N-chain complex
+    def splice_chains_into_full_complex(chain_updates: dict) -> str:
+        return "".join([chain_updates.get(c_key, wt_c_seq) for c_key, wt_c_seq in chains.items()])
+
+    # --- MODEL A: AntiFold (Supports Paired VH/VL and Single-Domain VHH) ---
     if "AntiFold (Antibody-specific)" in gen_models:
-        if not has_vh_vl_pair:
-            print(" -> WARNING: AntiFold requires both a VH and a VL chain. Skipping AntiFold.")
+        if not antibody_units:
+            print(" -> WARNING: AntiFold requires at least one VH/VL pair or VHH chain. Skipping AntiFold.")
         else:
-            ch_heavy = vh_chains[0]
-            ch_light = vl_chains[0]
-            len_h = len(chains[ch_heavy])
-            len_l = len(chains[ch_light])
-            print(f" -> Running AntiFold on Chains ({ch_heavy}=VH, {ch_light}=VL), mutable regions: {antifold_regions_str}")
-            
-            antifold_cmd = [
-                "python", "-m", "antifold.main",
-                "--pdb_file", relaxed_pdb_path,
-                "--heavy_chain", ch_heavy, "--light_chain", ch_light,
-                "--regions", antifold_regions_str,
-                "--num_seq_per_target", str(num_seqs),
-                "--sampling_temp", str(temp),
-                "--out_dir", run_dir
-            ]
-            try:
-                subprocess.run(antifold_cmd, check=True, capture_output=True, text=True)
-                af_fasta = os.path.join(run_dir, f"{run_name}_relaxed_{ch_heavy}{ch_light}.fasta")
-                if not os.path.exists(af_fasta):
-                    af_fasta = os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
-                    
-                if os.path.exists(af_fasta):
-                    raw_af = list(SeqIO.parse(af_fasta, "fasta"))
-                    af_records = []
-                    sample_idx = 1
-                    for rec in raw_af:
-                        s_clean = str(rec.seq).replace(":", "").replace("/", "")
-                        # If AntiFold outputs VH+VL, splice back into full complex so >2-chain formats never break
-                        if len(s_clean) == (len_h + len_l):
-                            s_full = splice_pair_into_full_complex(
-                                s_clean[:len_h], s_clean[len_h:], ch_heavy, ch_light
-                            )
-                        else:
-                            s_full = s_clean
-                            
-                        if s_full == clean_wt_full:
-                            continue
-                        new_af_rec = SeqRecord(Seq(s_full), id=f"AntiFold_sample{sample_idx}", description="")
-                        af_records.append(new_af_rec)
-                        sample_idx += 1
-                        
-                    if af_records:
-                        SeqIO.write(af_records, os.path.join(run_dir, f"{run_name}_antifold.fasta"), "fasta")
-                        all_raw_records.extend(af_records)
-                    os.remove(af_fasta)
-            except subprocess.CalledProcessError as e:
-                print(f" -> WARNING: AntiFold failed: {e.stderr}")
+            af_records = []
+            sample_idx = 1
+            for ch_heavy, ch_light in antibody_units:
+                len_h = len(chains[ch_heavy])
+                
+                if ch_light is not None:
+                    # Paired VH + VL Mode
+                    len_l = len(chains[ch_light])
+                    print(f" -> Running AntiFold (Paired Mode: {ch_heavy}=VH, {ch_light}=VL), regions: {antifold_regions_str}")
+                    antifold_cmd = [
+                        "python", "-m", "antifold.main",
+                        "--pdb_file", relaxed_pdb_path,
+                        "--heavy_chain", ch_heavy, "--light_chain", ch_light,
+                        "--regions", antifold_regions_str,
+                        "--num_seq_per_target", str(num_seqs),
+                        "--sampling_temp", str(temp),
+                        "--out_dir", run_dir
+                    ]
+                    expected_fastas = [
+                        os.path.join(run_dir, f"{run_name}_relaxed_{ch_heavy}{ch_light}.fasta"),
+                        os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
+                    ]
+                else:
+                    # Single-Domain VHH / Nanobody Mode (--nanobody_chain)
+                    # Filter regions string to only heavy-chain IMGT tokens (FWH*, CDRH*)
+                    vhh_regions = " ".join([t for t in antifold_regions_str.split() if "H" in t]) or "FWH1 FWH2 FWH3 FWH4"
+                    print(f" -> Running AntiFold (Nanobody/VHH Mode: Chain {ch_heavy}), regions: {vhh_regions}")
+                    antifold_cmd = [
+                        "python", "-m", "antifold.main",
+                        "--pdb_file", relaxed_pdb_path,
+                        "--nanobody_chain", ch_heavy,
+                        "--regions", vhh_regions,
+                        "--num_seq_per_target", str(num_seqs),
+                        "--sampling_temp", str(temp),
+                        "--out_dir", run_dir
+                    ]
+                    expected_fastas = [
+                        os.path.join(run_dir, f"{run_name}_relaxed_{ch_heavy}.fasta"),
+                        os.path.join(run_dir, f"{run_name}_relaxed_A.fasta")
+                    ]
+
+                try:
+                    subprocess.run(antifold_cmd, check=True, capture_output=True, text=True)
+                    af_fasta = next((p for p in expected_fastas if os.path.exists(p)), None)
+                    if af_fasta is None:
+                        # Fallback glob for any fasta just written by AntiFold
+                        af_candidates = glob.glob(os.path.join(run_dir, f"{run_name}_relaxed_*.fasta"))
+                        af_fasta = af_candidates[0] if af_candidates else None
+
+                    if af_fasta and os.path.exists(af_fasta):
+                        for rec in SeqIO.parse(af_fasta, "fasta"):
+                            s_clean = str(rec.seq).replace(":", "").replace("/", "")
+                            if ch_light is not None and len(s_clean) == (len_h + len(chains[ch_light])):
+                                s_full = splice_chains_into_full_complex({
+                                    ch_heavy: s_clean[:len_h],
+                                    ch_light: s_clean[len_h:]
+                                })
+                            elif ch_light is None and len(s_clean) == len_h:
+                                s_full = splice_chains_into_full_complex({ch_heavy: s_clean})
+                            else:
+                                s_full = s_clean
+
+                            if s_full == clean_wt_full:
+                                continue
+                            af_records.append(SeqRecord(Seq(s_full), id=f"AntiFold_sample{sample_idx}", description=""))
+                            sample_idx += 1
+                        os.remove(af_fasta)
+                except subprocess.CalledProcessError as e:
+                    print(f" -> WARNING: AntiFold failed on chain {ch_heavy}: {e.stderr}")
+
+            if af_records:
+                SeqIO.write(af_records, os.path.join(run_dir, f"{run_name}_antifold.fasta"), "fasta")
+                all_raw_records.extend(af_records)
 
     # --- EXPORT UNIFIED MASKING JSONL FOR PROTEINMPNN / THERMOMPNN ---
     fixed_json_path = os.path.join(run_dir, "fixed_positions.jsonl")
@@ -630,25 +710,17 @@ def run_universal_developability_pipeline(
             
         # Sort by most stabilizing (most negative ddG)
         all_thermo_muts = sorted(all_thermo_muts, key=lambda x: x['ddg'])
-        top_muts = all_thermo_muts[:int(num_seqs)]
-        
-        print(f"    Building {len(top_muts)} guaranteed stabilizing ThermoMPNN candidates...")
-        
-        thermo_records = []
-        for i, m in enumerate(top_muts):
-            mut_seq = list(clean_wt_full)
-            if 0 <= m['pos'] < len(mut_seq):
-                mut_seq[m['pos']] = m['mut_aa']
-                new_record = SeqRecord(
-                    Seq("".join(mut_seq)), 
-                    id=f"ThermoMPNN_{m['wt_aa']}{m['pos']+1}{m['mut_aa']}_rank{i+1}", 
-                    description=""
-                )
-                thermo_records.append(new_record)
+        thermo_records = build_single_and_combo_records(
+            sorted_single_muts=all_thermo_muts,
+            clean_wt_full=clean_wt_full,
+            model_prefix="ThermoMPNN",
+            num_seqs=int(num_seqs),
+            max_muts_per_seq=int(max_muts_per_seq),
+            rng=rng
+        )
         if thermo_records:
             SeqIO.write(thermo_records, os.path.join(run_dir, f"{run_name}_thermompnn.fasta"), "fasta")
             all_raw_records.extend(thermo_records)
-
     # --- MODEL D: ProteinMPNN (Soluble) ---
     if "ProteinMPNN (Soluble)" in gen_models:
         print(f" -> Running ProteinMPNN (Soluble Model) at Temperature {temp} on chains ({mpnn_chains_str})...")
@@ -696,6 +768,7 @@ def run_universal_developability_pipeline(
         print(" -> Running ESM-C Masked-Marginal Probability Generator (Isolated Env)...")
         esmc_fasta = os.path.join(run_dir, f"{run_name}_esmc.fasta")
         cdr_str = ",".join(map(str, sorted(list(combined_frozen_0idx))))
+        omit_set = set(omit_aas or [])
         
         esmc_cmd = [
             "conda", "run", "-n", "esmc_env", 
@@ -709,118 +782,132 @@ def run_universal_developability_pipeline(
             subprocess.run(esmc_cmd, check=True, capture_output=True, text=True)
             if os.path.exists(esmc_fasta):
                 raw_esmc = list(SeqIO.parse(esmc_fasta, "fasta"))
-                esmc_records = []
-                for idx_e, rec in enumerate(raw_esmc, 1):
-                    # Ensure every ESM-C record clearly starts with 'ESMC_'
-                    clean_id = rec.id.replace(",", "").replace(" ", "_")
-                    if not clean_id.upper().startswith("ESMC"):
-                        clean_id = f"ESMC_{clean_id}_rank{idx_e}"
-                    rec.id = clean_id
-                    rec.description = ""
-                    esmc_records.append(rec)
-                SeqIO.write(esmc_records, esmc_fasta, "fasta")
-                all_raw_records.extend(esmc_records)
+                
+                # Extract ranked single point mutations from the ESM-C DMS output
+                esmc_single_muts = []
+                for rec in raw_esmc:
+                    s_clean = str(rec.seq).strip().replace(":", "").replace("/", "")
+                    if len(s_clean) != len(clean_wt_full):
+                        continue
+                    diffs = [
+                        (idx, clean_wt_full[idx], s_clean[idx])
+                        for idx in range(len(clean_wt_full))
+                        if s_clean[idx] != clean_wt_full[idx]
+                    ]
+                    # Keep valid single-point mutations that respect frozen indices and banned AAs
+                    if len(diffs) == 1:
+                        pos, wt_aa, mut_aa = diffs[0]
+                        if pos not in combined_frozen_0idx and mut_aa not in omit_set:
+                            esmc_single_muts.append({
+                                'pos': pos, 'wt_aa': wt_aa, 'mut_aa': mut_aa
+                            })
+
+                # Build 50% single mutants and 50% multi-mutant combinations (2..max_muts_per_seq)
+                esmc_records = build_single_and_combo_records(
+                    sorted_single_muts=esmc_single_muts,
+                    clean_wt_full=clean_wt_full,
+                    model_prefix="ESMC",
+                    num_seqs=int(num_seqs),
+                    max_muts_per_seq=int(max_muts_per_seq),
+                    rng=rng
+                )
+                if esmc_records:
+                    SeqIO.write(esmc_records, esmc_fasta, "fasta")
+                    all_raw_records.extend(esmc_records)
+        
         except subprocess.CalledProcessError as e:
             st.error(f"**ESM-C Subprocess Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
             st.stop()
 
-    # --- MODEL F: AbLang2-Paired ---
+    # --- MODEL F: AbLang2 (Supports Paired VH/VL and Single-Domain VHH) ---
     if "AbLang2 (Antibody LM)" in gen_models:
-        if not has_vh_vl_pair:
-            print(" -> WARNING: AbLang2-Paired requires both a VH and a VL chain. Skipping AbLang2.")
+        if not antibody_units:
+            print(" -> WARNING: AbLang2 requires at least one VH, VL, or VHH chain. Skipping AbLang2.")
         else:
-            ch_heavy = vh_chains[0]
-            ch_light = vl_chains[0]
-            h_seq = chains[ch_heavy]
-            l_seq = chains[ch_light]
-            
-            # 0-indexed frozen sets specific to this VH and VL chain
-            frozen_h_0idx = {p - 1 for p in fixed_positions_map.get(ch_heavy, [])}
-            frozen_l_0idx = {p - 1 for p in fixed_positions_map.get(ch_light, [])}
-            
-            print(f" -> Running AbLang2-Paired on Chains ({ch_heavy}=VH, {ch_light}=VL)...")
+            print(f" -> Running AbLang2 Masked-Marginal Generator across {len(antibody_units)} antibody unit(s)...")
             import ablang2
             import numpy as np
             try:
                 ablang = ablang2.pretrained(model_to_use="ablang2-paired", random_init=False)
                 alphabet = list("ACDEFGHIKLMNPQRSTVWY")
                 omit_set = set(omit_aas or [])
-                h_len = len(h_seq)
                 ablang_muts = []
-                
-                # Iterate over Heavy Chain (VH)
-                for i in range(h_len):
-                    if i in frozen_h_0idx:
-                        continue
-                    wt_aa = h_seq[i]
-                    masked_vh = h_seq[:i] + "*" + h_seq[i+1:]
-                    res = ablang([[masked_vh, l_seq]], mode='probability')
-                    probs = res[0][i]
-                    wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
-                    if wt_idx is None:
-                        continue
-                    wt_prob = probs[wt_idx]
-                    for mut_idx, mut_aa in enumerate(alphabet):
-                        if mut_aa == wt_aa or mut_aa in omit_set:
-                            continue
-                        delta_p = probs[mut_idx] - wt_prob
-                        if delta_p > 0:
-                            ablang_muts.append({
-                                'chain': ch_heavy, 'local_pos': i,
-                                'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
-                            })
 
-                # Iterate over Light Chain (VL)
-                for i in range(len(l_seq)):
-                    if i in frozen_l_0idx:
-                        continue
-                    wt_aa = l_seq[i]
-                    masked_vl = l_seq[:i] + "*" + l_seq[i+1:]
-                    res = ablang([[h_seq, masked_vl]], mode='probability')
-                    probs = res[0][h_len + i]
-                    wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
-                    if wt_idx is None:
-                        continue
-                    wt_prob = probs[wt_idx]
-                    for mut_idx, mut_aa in enumerate(alphabet):
-                        if mut_aa == wt_aa or mut_aa in omit_set:
+                for ch_heavy, ch_light in antibody_units:
+                    h_seq = chains[ch_heavy]
+                    l_seq = chains[ch_light] if ch_light is not None else ""
+                    frozen_h_0idx = {p - 1 for p in fixed_positions_map.get(ch_heavy, [])}
+                    h_len = len(h_seq)
+
+                    # 1. Scan Heavy / VHH Chain (Passing l_seq="" if single-domain VHH)
+                    for i in range(h_len):
+                        if i in frozen_h_0idx:
                             continue
-                        delta_p = probs[mut_idx] - wt_prob
-                        if delta_p > 0:
-                            ablang_muts.append({
-                                'chain': ch_light, 'local_pos': i,
-                                'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
-                            })
+                        wt_aa = h_seq[i]
+                        masked_vh = h_seq[:i] + "*" + h_seq[i+1:]
+                        res = ablang([[masked_vh, l_seq]], mode='probability')
+                        probs = res[0][i]
+                        wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
+                        if wt_idx is None:
+                            continue
+                        wt_prob = probs[wt_idx]
+                        for mut_idx, mut_aa in enumerate(alphabet):
+                            if mut_aa == wt_aa or mut_aa in omit_set:
+                                continue
+                            delta_p = probs[mut_idx] - wt_prob
+                            if delta_p > 0:
+                                ablang_muts.append({
+                                    'chain': ch_heavy, 'local_pos': i,
+                                    'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
+                                })
+
+                    # 2. Scan Light Chain (Only if paired VL exists)
+                    if ch_light is not None:
+                        frozen_l_0idx = {p - 1 for p in fixed_positions_map.get(ch_light, [])}
+                        for i in range(len(l_seq)):
+                            if i in frozen_l_0idx:
+                                continue
+                            wt_aa = l_seq[i]
+                            masked_vl = l_seq[:i] + "*" + l_seq[i+1:]
+                            res = ablang([[h_seq, masked_vl]], mode='probability')
+                            probs = res[0][h_len + i]
+                            wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
+                            if wt_idx is None:
+                                continue
+                            wt_prob = probs[wt_idx]
+                            for mut_idx, mut_aa in enumerate(alphabet):
+                                if mut_aa == wt_aa or mut_aa in omit_set:
+                                    continue
+                                delta_p = probs[mut_idx] - wt_prob
+                                if delta_p > 0:
+                                    ablang_muts.append({
+                                        'chain': ch_light, 'local_pos': i,
+                                        'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
+                                    })
 
                 ablang_muts = sorted(ablang_muts, key=lambda x: x['delta'], reverse=True)
-                top_muts = ablang_muts[:int(num_seqs)]
-                
-                ablang_records = []
-                for i, m in enumerate(top_muts):
-                    mut_h = list(h_seq)
-                    mut_l = list(l_seq)
-                    if m['chain'] == ch_heavy:
-                        mut_h[m['local_pos']] = m['mut_aa']
-                    else:
-                        mut_l[m['local_pos']] = m['mut_aa']
-                        
-                    full_mut_str = splice_pair_into_full_complex(
-                        "".join(mut_h), "".join(mut_l), ch_heavy, ch_light
-                    )
-                    new_record = SeqRecord(
-                        Seq(full_mut_str),
-                        id=f"AbLang2Paired_{m['chain']}_{m['wt_aa']}{m['local_pos']+1}{m['mut_aa']}_rank{i+1}",
-                        description=""
-                    )
-                    ablang_records.append(new_record)
-                    
+                chain_offsets, curr_off = {}, 0
+                    for c_k, c_s in chains.items():
+                        chain_offsets[c_k] = curr_off
+                        curr_off += len(c_s)
+                    for m in ablang_muts:
+                        m['global_pos'] = chain_offsets[m['chain']] + m['local_pos']
+                ablang_records = build_single_and_combo_records(
+                    sorted_single_muts=ablang_muts,
+                    clean_wt_full=clean_wt_full,
+                    model_prefix="AbLang2Paired",
+                    num_seqs=int(num_seqs),
+                    max_muts_per_seq=int(max_muts_per_seq),
+                    rng=rng
+                )
                 if ablang_records:
                     SeqIO.write(ablang_records, os.path.join(run_dir, f"{run_name}_ablang2.fasta"), "fasta")
                     all_raw_records.extend(ablang_records)
-            except Exception as e:
-                st.error(f"**AbLang2-Paired Crashed!**\n\nError Log:\n```\n{str(e)}\n```")
-                st.stop()
 
+            except Exception as e:
+                st.error(f"**AbLang2 Crashed!**\n\nError Log:\n```\n{str(e)}\n```")
+                st.stop()
+                
     # ---------------------------------------------------------
     # STEP 5: Post-Filtering (Mask Enforcement, Mutation Cap) & Deduplication
     # ---------------------------------------------------------
