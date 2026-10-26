@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import streamlit as st
 import pandas as pd
 import numpy as np
 from Bio import SeqIO
@@ -249,7 +250,7 @@ def enforce_mutation_cap_and_filters(candidate_seq: str, wt_seq: str, global_fro
 
 def build_single_and_combo_records(sorted_single_muts: list, clean_wt_full: str, model_prefix: str, num_seqs: int, max_muts_per_seq: int, rng: np.random.Generator) -> list:
     """
-    Given a ranked list of single mutations [{'pos' (or 'global_pos'): int, 'wt_aa': str, 'mut_aa': str}, ...]:
+    Used by ThermoMPNN, ESM-C, and AbLang2:
       - First half of num_seqs: top single-point mutations (1 mutation each)
       - Second half of num_seqs: combinations of 2..max_muts_per_seq non-overlapping top mutations
     """
@@ -504,6 +505,7 @@ def run_universal_developability_pipeline(
     print(f"Step 4: Running Generative Ensemble: {gen_models}")
     all_raw_records = []
     rng = np.random.default_rng(seed=42)
+    
     clean_wt_full = "".join(chains.values())
 
     # Dynamic chain strings for N-chain compatibility (1-chain VHH/Enzyme, 2-chain Fv, 4-chain Bispecific)
@@ -521,13 +523,17 @@ def run_universal_developability_pipeline(
     antibody_units = []
     for idx_pair in range(min(len(vh_chains), len(vl_chains))):
         antibody_units.append((vh_chains[idx_pair], vl_chains[idx_pair]))
-    # Any remaining unpaired VH chains or VHH chains run in single-domain mode
     for extra_vh in vh_chains[len(vl_chains):]:
         antibody_units.append((extra_vh, None))
     for vhh_c in vhh_chains:
         antibody_units.append((vhh_c, None))
 
-    # Helper to splice mutated chain(s) back into the full N-chain complex
+    # Precompute 0-based global chain offsets for multi-chain splicing
+    chain_offsets, curr_off = {}, 0
+    for c_k, c_s in chains.items():
+        chain_offsets[c_k] = curr_off
+        curr_off += len(c_s)
+
     def splice_chains_into_full_complex(chain_updates: dict) -> str:
         return "".join([chain_updates.get(c_key, wt_c_seq) for c_key, wt_c_seq in chains.items()])
 
@@ -542,8 +548,6 @@ def run_universal_developability_pipeline(
                 len_h = len(chains[ch_heavy])
                 
                 if ch_light is not None:
-                    # Paired VH + VL Mode
-                    len_l = len(chains[ch_light])
                     print(f" -> Running AntiFold (Paired Mode: {ch_heavy}=VH, {ch_light}=VL), regions: {antifold_regions_str}")
                     antifold_cmd = [
                         "python", "-m", "antifold.main",
@@ -640,12 +644,14 @@ def run_universal_developability_pipeline(
             "--num_seq_per_target", str(num_seqs),
             "--sampling_temp", str(temp),
             "--batch_size", "1",
-            "--omit_AAs", "".join(omit_aas),
             "--backbone_noise", str(mpnn_backbone_noise)
         ]
+        if omit_aas:
+            mpnn_cmd.extend(["--omit_AAs", "".join(omit_aas)])
+
         try:
             subprocess.run(mpnn_cmd, check=True, capture_output=True, text=True)
-            mpnn_fastas = glob.glob(os.path.join(mpnn_out_dir, "seqs", "*.fa"))
+            mpnn_fastas = glob.glob(os.path.join(mpnn_out_dir, "seqs", f"{pdb_basename}.fa"))
             mpnn_records = []
             sample_idx = 1
             for fa in mpnn_fastas:
@@ -666,7 +672,7 @@ def run_universal_developability_pipeline(
             st.error(f"**ProteinMPNN Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
             raise RuntimeError("Phase 1 halted due to ProteinMPNN failure.")
 
-    # --- MODEL C: ThermoMPNN (ddG-Driven) ---
+    # --- MODEL C: ThermoMPNN (ddG-Driven Single + Multi-Mutant Combos) ---
     if "ThermoMPNN (ddG-Driven)" in gen_models:
         print(f" -> Running ThermoMPNN ddG Generator on chains ({thermo_chains_str})...")
         THERMO_MPNN_SCRIPT = "/home/esigalas/workspace/ThermoMPNN/analysis/custom_inference.py"
@@ -697,6 +703,15 @@ def run_universal_developability_pipeline(
                 pos = int(row['position']) 
                 mut_aa = str(row['mutation']).strip()
                 ddg = float(row['ddG_pred'])
+                
+                # Safeguard if ThermoMPNN CSV uses local per-chain position instead of global 0-index
+                if 'chain' in df_thermo.columns and str(row['chain']).strip() in chain_offsets:
+                    c_key = str(row['chain']).strip()
+                    if (0 <= pos < len(clean_wt_full)) and clean_wt_full[pos] != wt_aa:
+                        cand_global = chain_offsets[c_key] + pos
+                        if 0 <= cand_global < len(clean_wt_full) and clean_wt_full[cand_global] == wt_aa:
+                            pos = cand_global
+
                 if pos in combined_frozen_0idx or mut_aa in omit_set:
                     continue 
                 if ddg < thermo_ddg_cutoff:
@@ -721,6 +736,7 @@ def run_universal_developability_pipeline(
         if thermo_records:
             SeqIO.write(thermo_records, os.path.join(run_dir, f"{run_name}_thermompnn.fasta"), "fasta")
             all_raw_records.extend(thermo_records)
+
     # --- MODEL D: ProteinMPNN (Soluble) ---
     if "ProteinMPNN (Soluble)" in gen_models:
         print(f" -> Running ProteinMPNN (Soluble Model) at Temperature {temp} on chains ({mpnn_chains_str})...")
@@ -737,9 +753,11 @@ def run_universal_developability_pipeline(
             "--sampling_temp", str(temp),
             "--batch_size", "1",
             "--use_soluble_model",
-            "--omit_AAs", "".join(omit_aas),
             "--backbone_noise", str(mpnn_backbone_noise)
         ]
+        if omit_aas:
+            soluble_cmd.extend(["--omit_AAs", "".join(omit_aas)])
+
         try:
             subprocess.run(soluble_cmd, check=True, capture_output=True, text=True)
             soluble_fastas = glob.glob(os.path.join(soluble_out_dir, "seqs", "*.fa"))
@@ -763,7 +781,7 @@ def run_universal_developability_pipeline(
             st.error(f"**ProteinMPNN (Soluble) Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
             st.stop()
 
-    # --- MODEL E: ESM-C ---
+    # --- MODEL E: ESM-C (Single + Multi-Mutant Combos) ---
     if "ESM-C (Evolutionary LM)" in gen_models:
         print(" -> Running ESM-C Masked-Marginal Probability Generator (Isolated Env)...")
         esmc_fasta = os.path.join(run_dir, f"{run_name}_esmc.fasta")
@@ -814,19 +832,17 @@ def run_universal_developability_pipeline(
                 if esmc_records:
                     SeqIO.write(esmc_records, esmc_fasta, "fasta")
                     all_raw_records.extend(esmc_records)
-        
         except subprocess.CalledProcessError as e:
             st.error(f"**ESM-C Subprocess Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
             st.stop()
 
-    # --- MODEL F: AbLang2 (Supports Paired VH/VL and Single-Domain VHH) ---
+    # --- MODEL F: AbLang2 (Supports Paired VH/VL & Single-Domain VHH, Single + Combos) ---
     if "AbLang2 (Antibody LM)" in gen_models:
         if not antibody_units:
             print(" -> WARNING: AbLang2 requires at least one VH, VL, or VHH chain. Skipping AbLang2.")
         else:
             print(f" -> Running AbLang2 Masked-Marginal Generator across {len(antibody_units)} antibody unit(s)...")
             import ablang2
-            import numpy as np
             try:
                 ablang = ablang2.pretrained(model_to_use="ablang2-paired", random_init=False)
                 alphabet = list("ACDEFGHIKLMNPQRSTVWY")
@@ -839,7 +855,7 @@ def run_universal_developability_pipeline(
                     frozen_h_0idx = {p - 1 for p in fixed_positions_map.get(ch_heavy, [])}
                     h_len = len(h_seq)
 
-                    # 1. Scan Heavy / VHH Chain (Passing l_seq="" if single-domain VHH)
+                    # 1. Scan Heavy / VHH Chain
                     for i in range(h_len):
                         if i in frozen_h_0idx:
                             continue
@@ -857,11 +873,11 @@ def run_universal_developability_pipeline(
                             delta_p = probs[mut_idx] - wt_prob
                             if delta_p > 0:
                                 ablang_muts.append({
-                                    'chain': ch_heavy, 'local_pos': i,
+                                    'global_pos': chain_offsets[ch_heavy] + i,
                                     'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
                                 })
 
-                    # 2. Scan Light Chain (Only if paired VL exists)
+                    # 2. Scan Light Chain (if paired VL exists)
                     if ch_light is not None:
                         frozen_l_0idx = {p - 1 for p in fixed_positions_map.get(ch_light, [])}
                         for i in range(len(l_seq)):
@@ -881,17 +897,11 @@ def run_universal_developability_pipeline(
                                 delta_p = probs[mut_idx] - wt_prob
                                 if delta_p > 0:
                                     ablang_muts.append({
-                                        'chain': ch_light, 'local_pos': i,
+                                        'global_pos': chain_offsets[ch_light] + i,
                                         'wt_aa': wt_aa, 'mut_aa': mut_aa, 'delta': delta_p
                                     })
 
                 ablang_muts = sorted(ablang_muts, key=lambda x: x['delta'], reverse=True)
-                chain_offsets, curr_off = {}, 0
-                    for c_k, c_s in chains.items():
-                        chain_offsets[c_k] = curr_off
-                        curr_off += len(c_s)
-                    for m in ablang_muts:
-                        m['global_pos'] = chain_offsets[m['chain']] + m['local_pos']
                 ablang_records = build_single_and_combo_records(
                     sorted_single_muts=ablang_muts,
                     clean_wt_full=clean_wt_full,
@@ -903,18 +913,16 @@ def run_universal_developability_pipeline(
                 if ablang_records:
                     SeqIO.write(ablang_records, os.path.join(run_dir, f"{run_name}_ablang2.fasta"), "fasta")
                     all_raw_records.extend(ablang_records)
-
             except Exception as e:
                 st.error(f"**AbLang2 Crashed!**\n\nError Log:\n```\n{str(e)}\n```")
                 st.stop()
-                
+
     # ---------------------------------------------------------
     # STEP 5: Post-Filtering (Mask Enforcement, Mutation Cap) & Deduplication
     # ---------------------------------------------------------
     camsol_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
     print(f"Step 5: Enforcing frozen regions, max_muts={max_muts_per_seq}, and pooling -> {camsol_fasta_path}")
     
-    rng = np.random.default_rng(seed=42)
     wt_record = SeqRecord(Seq(clean_wt_full), id=f"{run_name}_WT", description="")
     cleaned_records = [wt_record]
     
