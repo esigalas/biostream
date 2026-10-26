@@ -56,7 +56,8 @@ with tab1:
         is_antibody_format = not (is_enzyme or "Custom" in protein_format)
         
         st.markdown("**1. Ensemble Model Selection**")
-        if is_paired_fv:
+        # All 6 models work across Fv, mAb, VHH-Fc, and Bispecific antibody formats
+        if is_antibody_format:
             available_models = [
                 "AntiFold (Antibody-specific)", 
                 "ProteinMPNN (Diverse)", 
