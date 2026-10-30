@@ -703,6 +703,7 @@ def run_universal_developability_pipeline(
                 pos = int(row['position']) 
                 mut_aa = str(row['mutation']).strip()
                 ddg = float(row['ddG_pred'])
+                wt_aa = str(row['wildtype']).strip()
                 
                 # Safeguard if ThermoMPNN CSV uses local per-chain position instead of global 0-index
                 if 'chain' in df_thermo.columns and str(row['chain']).strip() in chain_offsets:
@@ -1675,7 +1676,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     df['esm_norm']         = norm(df.get('esm_fitness'), invert=False)
     df['esmc_norm']        = norm(df.get('esmc_fitness'), invert=False)
     df['ab_norm']          = norm(df.get('antiberty_fitness'), invert=False)
-    df['ablang_norm']      = norm(df.get('ablang_fitness'), invert=True)
+    df['ablang_norm']      = norm(df.get('ablang_fitness'), invert=False)
     df['protbert_norm']    = norm(df.get('protbert_fitness'), invert=False)
 
     # --- B. Legacy Format-Specific Weighted Composite Score (0..1) ---
