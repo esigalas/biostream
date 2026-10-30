@@ -26,7 +26,7 @@ def main():
     alphabet_list = list("ACDEFGHIKLMNPQRSTVWY")
 
     # Load the official Biohub checkpoint (native to modern transformers)
-    hf_id = "biohub/ESMC-300M-hf"
+    hf_id = "biohub/ESMC-600M-hf"
     tokenizer = AutoTokenizer.from_pretrained(hf_id)
     model = AutoModelForMaskedLM.from_pretrained(hf_id).eval()
     mask_token_id = tokenizer.mask_token_id
