@@ -54,34 +54,34 @@ with tab1:
         is_paired_fv = protein_format in paired_fv_formats
         is_enzyme = "Enzyme" in protein_format
         is_antibody_format = not (is_enzyme or "Custom" in protein_format)
-        
+
         st.markdown("**1. Ensemble Model Selection**")
         # All 6 models work across Fv, mAb, VHH-Fc, and Bispecific antibody formats
         if is_antibody_format:
             available_models = [
-                "AntiFold (Antibody-specific)", 
-                "ProteinMPNN (Diverse)", 
-                "ProteinMPNN (Soluble)", 
-                "ThermoMPNN (ddG-Driven)", 
-                "ESM-C (Evolutionary LM)", 
+                "AntiFold (Antibody-specific)",
+                "ProteinMPNN (Diverse)",
+                "ProteinMPNN (Soluble)",
+                "ThermoMPNN (ddG-Driven)",
+                "ESM-C (Evolutionary LM)",
                 "AbLang2 (Antibody LM)"
             ]
             default_models = ["AntiFold (Antibody-specific)", "ProteinMPNN (Soluble)"]
         else:
             available_models = [
-                "ProteinMPNN (Diverse)", 
-                "ProteinMPNN (Soluble)", 
-                "ThermoMPNN (ddG-Driven)", 
+                "ProteinMPNN (Diverse)",
+                "ProteinMPNN (Soluble)",
+                "ThermoMPNN (ddG-Driven)",
                 "ESM-C (Evolutionary LM)"
             ]
             default_models = ["ProteinMPNN (Soluble)"]
-        
+
         gen_models = st.multiselect(
             "Generative Models to Run:",
             options=available_models,
             default=default_models
         )
-        
+
         # --- 2. REGION FREEZING & MASKING CONTROLS ---
         st.markdown("**2. Region Freezing & Masking Controls**")
         if is_antibody_format:
@@ -95,7 +95,6 @@ with tab1:
                     "Custom IMGT Region Selection"
                 ]
             )
-            
             all_imgt_regions = ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]
             if "Freeze All CDRs" in freeze_preset:
                 default_frozen_regions = ["CDR1", "CDR2", "CDR3"]
@@ -107,7 +106,7 @@ with tab1:
                 default_frozen_regions = ["FR1", "FR2", "FR3", "FR4"]
             else:
                 default_frozen_regions = ["CDR1", "CDR2", "CDR3"]
-                
+
             frozen_imgt_regions = st.multiselect(
                 "IMGT Regions to FREEZE (Protected from Mutation):",
                 options=all_imgt_regions,
@@ -173,41 +172,46 @@ with tab1:
             st.caption("Provide **2 FASTA records**: `>VH` (Heavy Chain variable region) and `>VL` (Light Chain variable region).")
             default_fasta = (
                 ">VH\n"
-                "DIKLQQSGAELARPGASVKMSCKTSGYTFTRYTMHWVKQRPGQGLEWIGYINPSRGYTNYNQKFKDKATLTTDKSSSTAYMQLSSLTSEDSAVYYCARYYDDHYCLDYWGQGTTLTVSS\n"
+                "EVQLVESGGGLVQPGGSLRL\n"
                 ">VL\n"
-                "DIQLTQSPAIMSASPGEKVTMTCRASSSVSYMNWYQQKSGTSPKRWIYDTSKVASGVPYRFSGSGSGTSYSLTISSMEAEDAATYYCQQWSSNPLTFGAGTKLELK"
+                "DIQMTQSPSSLSASVGDRVT"
             )
             expected_chains_msg = "2 records (>VH and >VL)"
         elif "VHH-Fc" in protein_format:
             st.caption("Provide **1 FASTA record** (`>VHH`) for a symmetric VHH dimer, or **2 records** (`>VHH_A`, `>VHH_B`) for biparatopic/asymmetric VHHs.")
             default_fasta = (
                 ">VHH\n"
-                "QVQLVESGGGLVQAGGSLRLSCAASGRTFSSYAMGWFRQAPGKEREFVAAISWSGGSTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAADRRGVGASTLGPFDYWGQGTQVTVSS"
+                "QVQLVESGGGLVQAGGSLRL"
             )
             expected_chains_msg = "1 or 2 records (>VHH)"
         elif "Bispecific" in protein_format:
             st.caption("Provide each variable domain as a separate FASTA record (e.g., `>VH_1`, `>VL_1`, `>VH_2`, `>VL_2`).")
             default_fasta = (
                 ">VH_1\n"
-                "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYCSRWGGDGFYAMDYWGQGTLVTVSS\n"
+                "EVQLVESGGGLVQPGGSLRL\n"
                 ">VL_1\n"
-                "DIQMTQSPSSLSASVGDRVTITCRASQDVNTAVAWYQQKPGKAPKLLIYSASFLYSGVPSRFSGSRSGTDFTLTISSLQPEDFATYYCQQHYTTPPTFGQGTKVEIK\n"
+                "DIQMTQSPSSLSASVGDRVT\n"
                 ">VH_2\n"
-                "DIKLQQSGAELARPGASVKMSCKTSGYTFTRYTMHWVKQRPGQGLEWIGYINPSRGYTNYNQKFKDKATLTTDKSSSTAYMQLSSLTSEDSAVYYCARYYDDHYCLDYWGQGTTLTVSS\n"
+                "QVQLVQSGAEVKKPGASVKV\n"
                 ">VL_2\n"
-                "DIQLTQSPAIMSASPGEKVTMTCRASSSVSYMNWYQQKSGTSPKRWIYDTSKVASGVPYRFSGSGSGTSYSLTISSMEAEDAATYYCQQWSSNPLTFGAGTKLELK"
+                "EIVLTQSPGTLSLSPGERAT"
             )
             expected_chains_msg = "2 to 4 records (>VH_1, >VL_1, >VH_2, >VL_2)"
         elif is_enzyme:
             st.caption("Provide **1 FASTA record** (`>Chain_A`) for your monomeric enzyme or protein.")
             default_fasta = (
                 ">Chain_A\n"
-                "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRLELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL"
+                "MKTAYIAKQRQISFVKSHFS"
             )
             expected_chains_msg = "1 record (>Chain_A)"
         else:
             st.caption("Provide 1 or more FASTA records (`>Chain_A`, `>Chain_B`, ...) in your desired complex order.")
-            default_fasta = ">Chain_A\nQVQLVQSGAEVKKPGASVKVSCKASGYTFT...\n>Chain_B\nDIQMTQSPSSLSASVGDRVTITCRASQSIS..."
+            default_fasta = (
+                ">Chain_A\n"
+                "QVQLVQSGAEVKKPGASVKV\n"
+                ">Chain_B\n"
+                "DIQMTQSPSSLSASVGDRVT"
+            )
             expected_chains_msg = "1+ records"
 
         fasta_input = st.text_area("Input Sequences (FASTA format):", value=default_fasta, height=230)
@@ -215,11 +219,10 @@ with tab1:
         # --- LIVE FASTA PARSER & ROLE VALIDATOR ---
         from io import StringIO
         from Bio import SeqIO
-        
         parsed_chains = {}
         chain_roles = {}
         valid_fasta = False
-        
+
         if fasta_input.strip():
             try:
                 records = list(SeqIO.parse(StringIO(fasta_input.strip()), "fasta"))
@@ -228,7 +231,7 @@ with tab1:
                     if is_paired_fv and len(records) == 2:
                         h0, h1 = records[0].id.upper(), records[1].id.upper()
                         if ("VL" in h0 or "LIGHT" in h0) and ("VH" in h1 or "HEAVY" in h1):
-                            records = [records[1], records[0]] # Swap so VH is always Chain A
+                            records = [records[1], records[0]]  # Swap so VH is always Chain A
                         parsed_chains['A'] = str(records[0].seq).strip().replace(":", "").replace("/", "")
                         parsed_chains['B'] = str(records[1].seq).strip().replace(":", "").replace("/", "")
                         chain_roles = {'A': 'VH', 'B': 'VL'}
@@ -239,7 +242,6 @@ with tab1:
                             chain_letter = chr(65 + i)
                             clean_s = str(rec.seq).strip().replace(":", "").replace("/", "")
                             parsed_chains[chain_letter] = clean_s
-                            
                             h_up = rec.id.upper()
                             if "VHH" in h_up:
                                 role = "VHH"
@@ -250,7 +252,7 @@ with tab1:
                             else:
                                 role = rec.id.strip()
                             chain_roles[chain_letter] = role
-                        
+
                         # Validate expected chain counts per format
                         if is_paired_fv and len(records) != 2:
                             valid_fasta = False
@@ -258,7 +260,7 @@ with tab1:
                             valid_fasta = False
                         else:
                             valid_fasta = True
-                            
+
                     if valid_fasta:
                         summary_parts = [f"**Chain {k}** (`{chain_roles[k]}`): `{len(v)} aa`" for k, v in parsed_chains.items()]
                         st.caption("✅ **Parsed Chains:** " + " | ".join(summary_parts))
@@ -294,26 +296,22 @@ with tab1:
                     mpnn_backbone_noise=mpnn_backbone_noise,
                     thermo_ddg_cutoff=thermo_ddg_cutoff
                 )
-                st.success("Phase 1 Universal Ensemble Complete! Sequences pooled and deduplicated.")
+            st.success("Phase 1 Universal Ensemble Complete! Sequences pooled and deduplicated.")
 
     # 2. The Persistent Download Block
     fasta_path = os.path.join(base_dir, run_name, f"{run_name}_camsol_upload.fasta")
     pdb_path = os.path.join(base_dir, run_name, f"{run_name}_relaxed.pdb")
-    
     if os.path.exists(fasta_path):
         st.markdown("---")
         st.subheader("📥 Next Steps: Solubility Prediction")
-        
         with open(fasta_path, "r") as f:
             fasta_data = f.read()
-        
         st.download_button(
             label="⬇️ Download Ensemble FASTA for CamSol",
             data=fasta_data,
             file_name=f"{run_name}_camsol_upload.fasta",
             mime="text/plain"
         )
-        
         st.info("Upload the downloaded FASTA file to the CamSol web server to calculate intrinsic solubility.\n\n🔗 [Open Cambridge CamSol Web Server](https://www-cohsoftware.ch.cam.ac.uk/index.php/camsolintrinsic)")
 
     # 3. Interactive Multi-Chain 3D Structure Viewer
@@ -348,7 +346,7 @@ with tab1:
             view.setStyle({'chain': c_id}, {'cartoon': {'color': hex_color}})
             if show_sticks:
                 view.addStyle({'chain': c_id}, {'stick': {'colorscheme': stick_scheme, 'radius': 0.15}})
-            
+                
         # Overlay semi-transparent surface if toggled
         if show_surface:
             view.addSurface(py3Dmol.VDW, {'opacity': 0.4, 'color': 'white'})
@@ -365,7 +363,7 @@ with tab1:
         }
         """
         unhover_js = """
-        function(atom,viewer) { 
+        function(atom,viewer) {
             if(atom.label) {
                 viewer.removeLabel(atom.label);
                 delete atom.label;
@@ -387,7 +385,7 @@ with tab2:
     
     col3, col4 = st.columns(2)
     with col3:
-        p2_run_name = st.text_input("Sequence Name (Processed in Phase 1)", value="scFvLA-L2K", key="p2_name")
+        p2_run_name = st.text_input("Sequence Name (Processed in Phase 1)", value="Target_Design_01", key="p2_name")
         p2_base_dir = st.text_input("Workspace Directory", value="./zero-shot_results", key="p2_dir")
     with col4:
         # CamSol is now explicitly optional
@@ -419,17 +417,15 @@ with tab2:
                 st.info(f"Using existing CamSol file found in `{run_dir}`.")
             else:
                 st.info("No CamSol data provided. Proceeding without solubility scores.")
-
+                
             # Check for extra or missing sequences in the CamSol file before/during scoring
             if os.path.exists(camsol_path):
                 try:
                     camsol_check_df = pd.read_csv(camsol_path, sep='\t')
                     id_col = 'Name' if 'Name' in camsol_check_df.columns else camsol_check_df.columns[0]
                     camsol_ids = set(camsol_check_df[id_col].astype(str).str.strip().str.lstrip(">"))
-                    
                     extra_in_camsol = camsol_ids - fasta_ids
                     missing_in_camsol = fasta_ids - camsol_ids
-                    
                     if extra_in_camsol or missing_in_camsol:
                         st.warning(
                             f"⚠️ **CamSol / FASTA ID Mismatch Detected:** "
@@ -439,7 +435,7 @@ with tab2:
                         )
                 except Exception as ex:
                     st.warning(f"⚠️ Could not pre-validate CamSol file format: {ex}")
-            
+
             with st.spinner("Calculating biophysical and structural metrics..."):
                 try:
                     df = score_universal_variants(run_dir, p2_run_name, wt_seq)
@@ -465,7 +461,6 @@ with tab2:
     # ---------------------------------------------------------
     if st.session_state.scored_df is not None:
         df = st.session_state.scored_df.copy()
-        
         st.markdown("---")
         st.subheader(f"All Ranked Candidates ({len(df)} found)")
         
@@ -475,58 +470,51 @@ with tab2:
         # 1. Main Data Table & Download Export
         # ==========================================
         rename_map = {
-            'id': 'Sequence ID', 
+            'id': 'Sequence ID',
             'source_model': 'Generator Model',
             'mutations': 'Mutations',
             'agnostic_gated_score': 'Agnostic Gated Score',
             'global_composite_score': 'Global Composite Score (Legacy)',
             'passed_all_gates': 'Passed All Gates',
             'gate_status': 'Biophysical Gate Status',
-            
             # Structural Thermodynamics
             'janus_ddg': 'Stability ΔΔG (Janus)',
             'pyrosetta_ddg': 'Stability ΔΔG (PyRosetta)',
-            
             # Sequence Biophysics
-            'camsol_score': 'Intrinsic Solubility (CamSol)', 
+            'camsol_score': 'Intrinsic Solubility (CamSol)',
             'pI': 'Isoelectric Point (pI)',
             'gravy': 'Hydrophobicity Index (GRAVY)',
             'net_charge': 'Net Charge (pH 7.4)',
             'charge_asymmetry': 'VH-VL Charge Delta',
-            
             # Interface Affinity
             'bindpred_kd': 'Affinity Log10 Kd (BINDPRED)',
-            
             # Deep Learning Language Models
             'esm_fitness': 'ΔLog-Likelihood (ESM-2 General)',
             'esmc_fitness': 'ΔLog-Likelihood (ESM-C)',
             'antiberty_fitness': 'ΔLog-Likelihood (AntiBERTy)',
             'ablang_fitness': 'ΔLog-Likelihood (AbLang2 Paired)',
             'protbert_fitness': 'ΔLog-Likelihood (ProtBERT)',
-            
             # Raw Data
-            'VH': 'VH Sequence', 
+            'VH': 'VH Sequence',
             'VL': 'VL Sequence'
         }
         
         # --- ENFORCE LOGICAL COLUMN GROUPING FOR UI & DOWNLOAD ---
         download_cols = [
-            'id', 'source_model', 'mutations', 
-            'agnostic_gated_score', 'global_composite_score', 'passed_all_gates', 'gate_status',
+            'id', 'source_model', 'mutations', 'agnostic_gated_score',
+            'global_composite_score', 'passed_all_gates', 'gate_status',
             'janus_ddg', 'pyrosetta_ddg'
         ]
         if has_camsol:
             download_cols.append('camsol_score')
-            
         download_cols.extend([
-            'pI', 'gravy', 'net_charge', 'charge_asymmetry',
-            'bindpred_kd', 'esm_fitness', 'esmc_fitness', 'antiberty_fitness', 'ablang_fitness', 'protbert_fitness',
-            'VH', 'VL'
+            'pI', 'gravy', 'net_charge', 'charge_asymmetry', 'bindpred_kd',
+            'esm_fitness', 'esmc_fitness', 'antiberty_fitness',
+            'ablang_fitness', 'protbert_fitness', 'VH', 'VL'
         ])
         
         # Guard against missing columns if session_state holds an older run
         download_cols = [c for c in download_cols if c in df.columns]
-        
         download_df = df[download_cols].rename(columns=rename_map)
         
         # Filter out heavy sequence strings for the UI table to keep it clean
@@ -535,9 +523,9 @@ with tab2:
         
         st.dataframe(
             display_df.style.background_gradient(cmap='viridis', subset=['Agnostic Gated Score']),
-            use_container_width=True, hide_index=True
+            use_container_width=True,
+            hide_index=True
         )
-        
         st.download_button(
             label="Download All Ranked Candidates",
             data=download_df.to_csv(index=False).encode('utf-8'),
@@ -557,67 +545,66 @@ with tab2:
         
         # Verify that WT actually has non-NaN baseline values before enabling relative checkboxes
         wt_camsol_valid = has_camsol and pd.notna(wt_row.get('camsol_score'))
-        wt_gravy_valid  = 'gravy' in df.columns and pd.notna(wt_row.get('gravy'))
-        wt_kd_valid     = 'bindpred_kd' in df.columns and pd.notna(wt_row.get('bindpred_kd'))
+        wt_gravy_valid = 'gravy' in df.columns and pd.notna(wt_row.get('gravy'))
+        wt_kd_valid = 'bindpred_kd' in df.columns and pd.notna(wt_row.get('bindpred_kd'))
         wt_dipole_valid = 'charge_asymmetry' in df.columns and pd.notna(wt_row.get('charge_asymmetry'))
         
         with st.expander("⚙️ Configure Anti-Aggregation Biophysical Gates (Filter Candidates)", expanded=True):
             st.markdown("Filter the ensemble using orthogonal constraints relative to your **Wild-Type (WT)** baseline:")
             f_col1, f_col2, f_col3 = st.columns(3)
-            
             with f_col1:
                 st.markdown("**1. Conformational & Interface**")
                 max_rosetta = st.slider(
-                    "Max PyRosetta ΔΔG (REU) [Lower = Better]", 
+                    "Max PyRosetta ΔΔG (REU) [Lower = Better]",
                     min_value=-15.0, max_value=25.0, value=10.0, step=0.5,
                     help="In PyRosetta, negative (< 0) is stabilizing. Variants above 25.0 REU have severe steric clashes."
                 )
                 min_janus = st.slider(
-                    "Min Janus ΔΔG (kcal/mol) [Higher = Better]", 
+                    "Min Janus ΔΔG (kcal/mol) [Higher = Better]",
                     min_value=-5.0, max_value=5.0, value=-0.5, step=0.1,
                     help="In raw JanusDDG, positive (> 0) is stabilizing. Setting to -0.5 keeps neutral and stabilizing variants."
                 )
                 if wt_kd_valid:
                     strict_interface = st.checkbox(
-                        f"Require Equal/Better VH-VL Affinity (BINDPRED ≤ WT: {wt_row['bindpred_kd']:.2f})", value=False
+                        f"Require Equal/Better VH-VL Affinity (BINDPRED ≤ WT: {wt_row['bindpred_kd']:.2f})",
+                        value=False
                     )
                 else:
                     strict_interface = False
-                
             with f_col2:
                 st.markdown("**2. Colloidal & Electrostatic**")
                 if wt_gravy_valid:
                     improve_solubility = st.checkbox(
-                        f"Improve Hydrophobicity (GRAVY ≤ WT: {wt_row['gravy']:.2f})", value=True
+                        f"Improve Hydrophobicity (GRAVY ≤ WT: {wt_row['gravy']:.2f})",
+                        value=True
                     )
                 else:
                     improve_solubility = False
-
                 if wt_camsol_valid:
                     improve_camsol = st.checkbox(
-                        f"Improve Intrinsic Solubility (CamSol ≥ WT: {wt_row['camsol_score']:.2f})", value=True
+                        f"Improve Intrinsic Solubility (CamSol ≥ WT: {wt_row['camsol_score']:.2f})",
+                        value=True
                     )
                 else:
                     improve_camsol = False
                     if has_camsol:
                         st.caption("⚠️ *CamSol filter disabled (WT score is `NaN`).*")
-
                 if wt_dipole_valid:
                     reduce_dipole = st.checkbox(
-                        f"Reduce/Maintain VH-VL Charge Dipole (≤ WT: {wt_row['charge_asymmetry']:.2f})", value=False
+                        f"Reduce/Maintain VH-VL Charge Dipole (≤ WT: {wt_row['charge_asymmetry']:.2f})",
+                        value=False
                     )
                 else:
                     reduce_dipole = False
-                
             with f_col3:
                 st.markdown("**3. Evolutionary Guardrails**")
                 min_ablang = st.slider(
-                    "Min AbLang2 Paired ΔLL", 
+                    "Min AbLang2 Paired ΔLL",
                     min_value=-10.0, max_value=5.0, value=-1.0, step=0.5,
                     help="Ensures mutations do not violate paired antibody germline rules."
                 )
                 min_esm = st.slider(
-                    "Min ESM-2 ΔLL", 
+                    "Min ESM-2 ΔLL",
                     min_value=-150.0, max_value=20.0, value=-10.0, step=1.0
                 )
 
@@ -649,7 +636,6 @@ with tab2:
 
         # --- Interactive 4D Plot Controls ---
         metric_options = [c for c in download_cols if c not in ['id', 'mutations', 'VH', 'VL'] and c in df.columns]
-        
         ax_col1, ax_col2, ax_col3, ax_col4 = st.columns(4)
         with ax_col1:
             x_axis = st.selectbox("X-Axis (e.g., Stability)", options=metric_options, index=metric_options.index('pyrosetta_ddg') if 'pyrosetta_ddg' in metric_options else 0)
@@ -663,7 +649,6 @@ with tab2:
 
         if not filtered_df.empty:
             plot_data = filtered_df.copy()
-            
             # Scale bubble size safely to positive numbers if a metric is selected
             if size_axis != "Uniform":
                 s_min, s_max = plot_data[size_axis].min(), plot_data[size_axis].max()
@@ -676,7 +661,7 @@ with tab2:
 
             fig_scatter = px.scatter(
                 plot_data,
-                x=x_axis, 
+                x=x_axis,
                 y=y_axis,
                 color=color_axis,
                 size='_bubble_size',
@@ -698,7 +683,7 @@ with tab2:
             fig_scatter.add_vline(x=wt_x, line_dash="dash", line_color="#FF4B4B", opacity=0.7, annotation_text="WT Baseline")
             
             st.plotly_chart(fig_scatter, use_container_width=True)
-            
+
             # Show the shortlisted table of surviving candidates right below the chart
             with st.expander(f"📋 View Shortlisted Anti-Aggregation Candidates ({len(filtered_df)} variants)", expanded=False):
                 shortlist_df = filtered_df[download_cols].rename(columns=rename_map)
@@ -724,28 +709,32 @@ with tab2:
         default_radar_ids = [wt_id] + non_wt_survivors[:1] if non_wt_survivors else [wt_id]
         
         selected_ids = st.multiselect(
-            "Select Variants to Compare (Normalized 0 to 1, where 1 = Best in Cohort):", 
-            options=df['id'].tolist(), 
+            "Select Variants to Compare (Normalized 0 to 1, where 1 = Best in Cohort):",
+            options=df['id'].tolist(),
             default=default_radar_ids
         )
         
         if selected_ids:
             radar_fig = go.Figure()
-            
             # Dynamically build radar categories based on CamSol presence
             categories = [
-                'Stability (Janus ΔΔG)', 'Stability (PyRosetta ΔΔG)', 
-                'Affinity (Log10 Kd)', 'ESM-2 (ΔLL)', 'ESM-C (ΔLL)',
-                'AntiBERTy (ΔLL)', 'AbLang2 (ΔLL)', 
-                'ProtBERT (ΔLL)', 'Hydrophobicity (GRAVY)', 
-                'Charge Asymmetry', 'Colloidal (pI)'
+                'Stability (Janus ΔΔG)',
+                'Stability (PyRosetta ΔΔG)',
+                'Affinity (Log10 Kd)',
+                'ESM-2 (ΔLL)',
+                'ESM-C (ΔLL)',
+                'AntiBERTy (ΔLL)',
+                'AbLang2 (ΔLL)',
+                'ProtBERT (ΔLL)',
+                'Hydrophobicity (GRAVY)',
+                'Charge Asymmetry',
+                'Colloidal (pI)'
             ]
             if has_camsol:
                 categories.insert(0, 'Solubility (CamSol)')
-    
+
             for variant_id in selected_ids:
                 v_data = df[df['id'] == variant_id].iloc[0]
-                
                 values = [
                     v_data.get('janus_norm', 0.5),
                     v_data.get('pyrosetta_norm', 0.5),
@@ -761,22 +750,26 @@ with tab2:
                 ]
                 if has_camsol:
                     values.insert(0, v_data.get('camsol_norm', 0.5))
-                
                 values.append(values[0])
                 cat_closed = categories + [categories[0]]
                 
                 radar_fig.add_trace(go.Scatterpolar(
-                    r=values, theta=cat_closed,
-                    fill='toself', name=variant_id,
+                    r=values,
+                    theta=cat_closed,
+                    fill='toself',
+                    name=variant_id,
                     hoverinfo="text+name",
                     text=[f"{cat}: {val:.2f}" for cat, val in zip(cat_closed, values)]
                 ))
                 
             radar_fig.update_layout(
                 polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-                showlegend=True, legend=dict(orientation="h", y=-0.2),
-                margin=dict(l=40, r=40, t=20, b=20), height=500
+                showlegend=True,
+                legend=dict(orientation="h", y=-0.2),
+                margin=dict(l=40, r=40, t=20, b=20),
+                height=500
             )
             st.plotly_chart(radar_fig, use_container_width=True)
         else:
             st.info("Select a variant to view its developability footprint.")
+
