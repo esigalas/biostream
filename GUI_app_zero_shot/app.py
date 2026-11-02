@@ -401,26 +401,62 @@ with tab2:
             st.error("Could not find the Phase 1 FASTA file. Ensure your Run Name and Base Directory are correct.")
         else:
             os.makedirs(run_dir, exist_ok=True)
+            from Bio import SeqIO
+            fasta_records = list(SeqIO.parse(fasta_path, "fasta"))
+            wt_seq = str(fasta_records[0].seq)
+            fasta_ids = {
+                f"{p2_run_name}_WT" if i == 0 else rec.id
+                for i, rec in enumerate(fasta_records)
+            }
             
             # Save the uploaded CamSol file only if provided
+            camsol_path = os.path.join(run_dir, f"{p2_run_name}_camsol.txt")
             if camsol_upload is not None:
-                camsol_path = os.path.join(run_dir, f"{p2_run_name}_camsol.txt")
                 with open(camsol_path, "wb") as f:
                     f.write(camsol_upload.getbuffer())
                 st.success("CamSol data detected and integrated.")
+            elif os.path.exists(camsol_path):
+                st.info(f"Using existing CamSol file found in `{run_dir}`.")
             else:
                 st.info("No CamSol data provided. Proceeding without solubility scores.")
-                
-            # Dynamically fetch the Wild-Type sequence from the Phase 1 FASTA
-            from Bio import SeqIO
-            with open(fasta_path, "r") as f:
-                wt_seq = str(next(SeqIO.parse(f, "fasta")).seq)
+
+            # Check for extra or missing sequences in the CamSol file before/during scoring
+            if os.path.exists(camsol_path):
+                try:
+                    camsol_check_df = pd.read_csv(camsol_path, sep='\t')
+                    id_col = 'Name' if 'Name' in camsol_check_df.columns else camsol_check_df.columns[0]
+                    camsol_ids = set(camsol_check_df[id_col].astype(str).str.strip().str.lstrip(">"))
+                    
+                    extra_in_camsol = camsol_ids - fasta_ids
+                    missing_in_camsol = fasta_ids - camsol_ids
+                    
+                    if extra_in_camsol or missing_in_camsol:
+                        st.warning(
+                            f"⚠️ **CamSol / FASTA ID Mismatch Detected:** "
+                            f"`{len(fasta_ids & camsol_ids)}/{len(fasta_ids)}` FASTA variants matched. "
+                            f"Missing in CamSol: `{len(missing_in_camsol)}` (will be `NaN` and dropped by the CamSol filter) | "
+                            f"Extra sequences in CamSol file ignored: `{len(extra_in_camsol)}`."
+                        )
+                except Exception as ex:
+                    st.warning(f"⚠️ Could not pre-validate CamSol file format: {ex}")
             
             with st.spinner("Calculating biophysical and structural metrics..."):
                 try:
                     df = score_universal_variants(run_dir, p2_run_name, wt_seq)
                     st.session_state.scored_df = df
                     st.success("Scoring Complete!")
+                    
+                    # Warn if any active filter columns contain NaN values
+                    filter_check_cols = [
+                        c for c in ['pyrosetta_ddg', 'janus_ddg', 'camsol_score', 'gravy', 'ablang_fitness', 'esm_fitness']
+                        if c in df.columns
+                    ]
+                    nan_counts = {c: int(df[c].isna().sum()) for c in filter_check_cols if df[c].isna().any()}
+                    if nan_counts:
+                        st.warning(
+                            f"⚠️ **Missing (`NaN`) Metric Values Detected:** `{nan_counts}`. "
+                            f"Variants with `NaN` in an active filter column will be excluded by that filter slider/checkbox."
+                        )
                 except Exception as e:
                     st.error(f"Error during scoring: {e}")
 
@@ -519,6 +555,12 @@ with tab2:
         wt_rows = df[df['mutations'] == 'WT']
         wt_row = wt_rows.iloc[0] if not wt_rows.empty else df.iloc[0]
         
+        # Verify that WT actually has non-NaN baseline values before enabling relative checkboxes
+        wt_camsol_valid = has_camsol and pd.notna(wt_row.get('camsol_score'))
+        wt_gravy_valid  = 'gravy' in df.columns and pd.notna(wt_row.get('gravy'))
+        wt_kd_valid     = 'bindpred_kd' in df.columns and pd.notna(wt_row.get('bindpred_kd'))
+        wt_dipole_valid = 'charge_asymmetry' in df.columns and pd.notna(wt_row.get('charge_asymmetry'))
+        
         with st.expander("⚙️ Configure Anti-Aggregation Biophysical Gates (Filter Candidates)", expanded=True):
             st.markdown("Filter the ensemble using orthogonal constraints relative to your **Wild-Type (WT)** baseline:")
             f_col1, f_col2, f_col3 = st.columns(3)
@@ -530,30 +572,42 @@ with tab2:
                     min_value=-15.0, max_value=25.0, value=10.0, step=0.5,
                     help="In PyRosetta, negative (< 0) is stabilizing. Variants above 25.0 REU have severe steric clashes."
                 )
-                # FIX 1: Changed from max_janus (<=) to min_janus (>=) because raw JanusDDG is Positive = Stabilizing
                 min_janus = st.slider(
                     "Min Janus ΔΔG (kcal/mol) [Higher = Better]", 
                     min_value=-5.0, max_value=5.0, value=-0.5, step=0.1,
                     help="In raw JanusDDG, positive (> 0) is stabilizing. Setting to -0.5 keeps neutral and stabilizing variants."
                 )
-                strict_interface = st.checkbox(
-                    f"Require Equal/Better VH-VL Affinity (BINDPRED ≤ WT: {wt_row.get('bindpred_kd', 0):.2f})", value=False
-                )
+                if wt_kd_valid:
+                    strict_interface = st.checkbox(
+                        f"Require Equal/Better VH-VL Affinity (BINDPRED ≤ WT: {wt_row['bindpred_kd']:.2f})", value=False
+                    )
+                else:
+                    strict_interface = False
                 
             with f_col2:
                 st.markdown("**2. Colloidal & Electrostatic**")
-                improve_solubility = st.checkbox(
-                    f"Improve Hydrophobicity (GRAVY ≤ WT: {wt_row.get('gravy', 0):.2f})", value=True
-                )
-                if has_camsol:
+                if wt_gravy_valid:
+                    improve_solubility = st.checkbox(
+                        f"Improve Hydrophobicity (GRAVY ≤ WT: {wt_row['gravy']:.2f})", value=True
+                    )
+                else:
+                    improve_solubility = False
+
+                if wt_camsol_valid:
                     improve_camsol = st.checkbox(
-                        f"Improve Intrinsic Solubility (CamSol ≥ WT: {wt_row.get('camsol_score', 0):.2f})", value=True
+                        f"Improve Intrinsic Solubility (CamSol ≥ WT: {wt_row['camsol_score']:.2f})", value=True
                     )
                 else:
                     improve_camsol = False
-                reduce_dipole = st.checkbox(
-                    f"Reduce/Maintain VH-VL Charge Dipole (≤ WT: {wt_row.get('charge_asymmetry', 0):.2f})", value=False
-                )
+                    if has_camsol:
+                        st.caption("⚠️ *CamSol filter disabled (WT score is `NaN`).*")
+
+                if wt_dipole_valid:
+                    reduce_dipole = st.checkbox(
+                        f"Reduce/Maintain VH-VL Charge Dipole (≤ WT: {wt_row['charge_asymmetry']:.2f})", value=False
+                    )
+                else:
+                    reduce_dipole = False
                 
             with f_col3:
                 st.markdown("**3. Evolutionary Guardrails**")
